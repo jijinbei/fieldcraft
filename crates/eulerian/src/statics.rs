@@ -36,13 +36,17 @@
 //!   suffices.
 //! - **Krylov**: restarted GMRES, right-preconditioned (the operator is non-symmetric near the
 //!   surface), with the Eisenstat–Walker forcing term (choice 2).
-//! - **Preconditioner matrix by probing**: the residual's dependence is local, so its Jacobian
-//!   is assembled from s² × 2 evaluations (s = 5 by default): all unknowns of one colour (node
-//!   (i, j) with i mod s, j mod s fixed) are perturbed together in one component, and the
-//!   response at each row is attributed to the perturbed node nearest it. In the interior (a
-//!   3 × 3 stencil) this is the exact Jacobian; near the surface, where the surface values and
-//!   the band couple further, it lumps the far part of a column onto the nearest node (row sums
-//!   kept).
+//! - **Preconditioner matrix** ([`PreconditionerMatrix`]): by default *ghost cells*, assembled
+//!   in O(n) without residual evaluations: away from the surface it is the exact Jacobian of the
+//!   compact stencil (the tangent of each face flux with respect to its ∇ζ, by differences of
+//!   the constitutive law); at the surface every face with solid carries the same stencil times
+//!   its solid fraction, ζ at the band nodes expanded through the band fill, which ignores the
+//!   cut-cell geometry, the surface map and the surface values. The alternative *probes* the
+//!   rows near the surface: their Jacobian is local, so 2 s² evaluations (s = 5) perturb all
+//!   unknowns of one colour (node (i, j) with i mod s, j mod s fixed) at once and attribute each
+//!   row's response to the perturbed node nearest it (exact for a dependence within s/2 nodes,
+//!   the far part of a column lumped onto the nearest node beyond). Both give about the same
+//!   Krylov counts; the ghost cells make a rebuild after a topology change nearly free.
 //! - **Multigrid**: a V-cycle on Galerkin coarse operators ([`crate::multigrid`] states the
 //!   coarsening rule at the cut cells).
 //! - **Rigid motions**: a body held by no node is free in the plane. Its equilibrium is then
@@ -63,6 +67,21 @@ use crate::mapped::{CutState, Topology};
 use crate::multigrid::{Block, BlockMatrix, Multigrid, MultigridStats, gmres};
 use crate::solid::{Boundary, FillPlan, NodeKind, Solid};
 use std::sync::Arc;
+
+/// The approximate Jacobian the multigrid preconditioner is built on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PreconditionerMatrix {
+    /// Ghost cells: every face with solid on it carries the tangent of its compact-stencil flux
+    /// times its solid fraction, with ζ at the band nodes expanded through the band fill (a
+    /// linear map of the body nodes), and the dual cells' rows shared out to the control
+    /// volumes as the forces are. The cut-cell geometry, the surface map and the surface values
+    /// are not differentiated. O(n) to assemble, no residual evaluation.
+    Ghost,
+    /// Probed: interior rows from the tangent, rows near the surface from residual evaluations
+    /// with [`StaticSettings::probe`] colours ([`StaticSettings::local_probing`]). Closer to
+    /// the Jacobian at the surface, 2 s² residual evaluations per build.
+    Probed,
+}
 
 /// Settings of the static solve.
 #[derive(Debug, Clone, Copy)]
@@ -95,6 +114,8 @@ pub struct StaticSettings {
     /// Assemble the preconditioner's interior rows from the constitutive tangent and probe
     /// only the rows near the surface (else probe every row).
     pub local_probing: bool,
+    /// The matrix the multigrid hierarchy is built on.
+    pub matrix: PreconditionerMatrix,
     /// Topology changes allowed per increment before it counts as failed.
     pub max_topology_changes: usize,
     /// A clock in seconds for the timing counters (none: the times are zero). The crate itself
@@ -117,6 +138,7 @@ impl Default for StaticSettings {
             reuse_preconditioner: true,
             reuse_surface_lu: true,
             local_probing: true,
+            matrix: PreconditionerMatrix::Ghost,
             max_topology_changes: 30,
             clock: None,
         }
@@ -445,6 +467,9 @@ impl Solid {
                     }
                 }
                 Err(e) => {
+                    if std::env::var("STATIC_DEBUG").is_ok() {
+                        eprintln!("increment to {next} failed: {e}");
+                    }
                     run.report.failed_increments += 1;
                     (self.zeta, self.kind, self.phi, self.cut) = saved;
                     run.kept = None;
@@ -885,6 +910,12 @@ impl Solid {
 
     /// The assembled approximate Jacobian of [`Solid::build_preconditioner`].
     fn assemble_jacobian(&mut self, ctx: &Context, run: &mut Run) -> Result<BlockMatrix, Error> {
+        if run.set.matrix == PreconditionerMatrix::Ghost {
+            let t0 = run.now();
+            let a = self.assemble_ghost(ctx)?;
+            run.report.times.probing += run.now() - t0;
+            return Ok(a);
+        }
         let s = run.set.probe;
         let h = self.grid.h();
         let eps = 1e-7 * h;
@@ -965,6 +996,111 @@ impl Solid {
         let t1 = run.now();
         run.report.times.probing += t1 - t0;
         run.report.times.residual += t1 - t0;
+        Ok(BlockMatrix::from_rows(rows))
+    }
+
+    /// The ghost-cell approximation of the Jacobian (see [`PreconditionerMatrix::Ghost`]).
+    fn assemble_ghost(&self, ctx: &Context) -> Result<BlockMatrix, Error> {
+        use std::collections::HashMap;
+        let h = self.grid.h();
+        let n = self.grid.len();
+        let nu = ctx.unknowns.len();
+        // The unknown each body node moves with.
+        let mut unknown_of = vec![usize::MAX; n];
+        for (u, mem) in ctx.members.iter().enumerate() {
+            for &m in mem {
+                unknown_of[m] = u;
+            }
+        }
+        // Band nodes as combinations of unknowns, in fill order.
+        let mut expand: HashMap<usize, Vec<(usize, f64)>> = HashMap::new();
+        for (k, weights) in ctx.plan.band() {
+            let mut acc: HashMap<usize, f64> = HashMap::new();
+            for &(m, w) in weights {
+                if unknown_of[m] != usize::MAX {
+                    *acc.entry(unknown_of[m]).or_insert(0.0) += w;
+                } else if let Some(e) = expand.get(&m) {
+                    for &(u, wu) in e {
+                        *acc.entry(u).or_insert(0.0) += w * wu;
+                    }
+                }
+            }
+            expand.insert(*k, acc.into_iter().collect());
+        }
+        let columns = |m: usize| -> Vec<(usize, f64)> {
+            if unknown_of[m] != usize::MAX { vec![(unknown_of[m], 1.0)] } else { expand.get(&m).cloned().unwrap_or_default() }
+        };
+        let flux = |g: &crate::material::Tensor, d: usize| -> Result<[f64; 2], Error> {
+            let f = crate::solid::invert(&crate::solid::identity_plus(g)).ok_or_else(|| Error::Diverged("the reference map folded".into()))?;
+            let s = self.material.cauchy(&f)?;
+            Ok(if d == 0 { [s[0] * h, s[2] * h] } else { [s[2] * h, s[1] * h] })
+        };
+        // Raw rows (per dual cell node), then shared to the unknowns.
+        let mut raw: HashMap<usize, Vec<(usize, Block)>> = HashMap::new();
+        let step = 1e-7;
+        for (k, d, fraction) in ctx.cut.solid_faces(self) {
+            if !(fraction > 0.0) {
+                continue;
+            }
+            let Some(nodes) = self.compact_nodes(k, d) else {
+                continue;
+            };
+            let [b, ap, am, bp, bm] = nodes;
+            let z = &self.zeta;
+            let mut g = [[0.0; 2]; 2];
+            for r in 0..2 {
+                g[r][d] = (z[b][r] - z[k][r]) / h;
+                g[r][1 - d] = (z[ap][r] + z[bp][r] - z[am][r] - z[bm][r]) / (4.0 * h);
+            }
+            let f0 = flux(&g, d)?;
+            let mut sens = [[[0.0; 2]; 2]; 2];
+            for r in 0..2 {
+                for col in 0..2 {
+                    let mut gp = g;
+                    gp[r][col] += step;
+                    let f1 = flux(&gp, d)?;
+                    for comp in 0..2 {
+                        sens[comp][r][col] = fraction * (f1[comp] - f0[comp]) / step;
+                    }
+                }
+            }
+            let (wa, wc) = (1.0 / h, 1.0 / (4.0 * h));
+            for (m, a_w, c_w) in [(k, -wa, 0.0), (b, wa, 0.0), (ap, 0.0, wc), (bp, 0.0, wc), (am, 0.0, -wc), (bm, 0.0, -wc)] {
+                for (u, w) in columns(m) {
+                    let mut blk = [[0.0; 2]; 2];
+                    for comp in 0..2 {
+                        for c in 0..2 {
+                            blk[comp][c] = w * (sens[comp][c][d] * a_w + sens[comp][c][1 - d] * c_w);
+                        }
+                    }
+                    raw.entry(k).or_default().push((u, blk));
+                    raw.entry(b).or_default().push((u, blk.map(|row| row.map(|v| -v))));
+                }
+            }
+        }
+        let mut index = vec![usize::MAX; n];
+        for (u, &k) in ctx.unknowns.iter().enumerate() {
+            index[k] = u;
+        }
+        let mut rows: Vec<Vec<(usize, Block)>> = vec![Vec::new(); nu];
+        for (j, entries) in raw {
+            for (o, w) in ctx.cut.share(j).into_iter().flatten() {
+                if w == 0.0 || index[o] == usize::MAX {
+                    continue;
+                }
+                for &(u, blk) in &entries {
+                    rows[index[o]].push((u, blk.map(|row| row.map(|v| w * v))));
+                }
+            }
+        }
+        // A row left without a diagonal (a control volume no face reaches) keeps the identity
+        // scaled like its neighbours, so the smoother stays defined.
+        let scale = rows.iter().flatten().fold(0.0f64, |m, e| m.max(e.1[0][0].abs()));
+        for (u, row) in rows.iter_mut().enumerate() {
+            if !row.iter().any(|e| e.0 == u) {
+                row.push((u, [[scale, 0.0], [0.0, scale]]));
+            }
+        }
         Ok(BlockMatrix::from_rows(rows))
     }
 

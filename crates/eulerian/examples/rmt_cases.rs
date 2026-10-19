@@ -14,13 +14,13 @@
 //! - `solver=relax|static` (dynamic relaxation, default, or the Newton–Krylov static solve),
 //!   with `incs=` initial load increments, `probe=` colour spacing, `sweeps=`, `stol=`
 //!   tolerance, `reuse=all|none|pc|lu` (what is kept while the topology is unchanged),
-//!   `local=0` (probe every row of the preconditioner), `newton=1` (print every Newton step),
+//!   `local=0` (probe every row of the preconditioner), `pcm=ghost|probe` (preconditioner matrix), `newton=1` (print every Newton step),
 //! - `compare=1` (static: also relax a copy and report the largest difference of ζ).
 //!
 //! Prints one JSON line of metrics.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-use fieldcraft_eulerian::{Boundary, Grid, Limits, Material, NodeKind, Settings, Shape, Solid, StaticSettings};
+use fieldcraft_eulerian::{Boundary, Grid, Limits, Material, NodeKind, PreconditionerMatrix, Settings, Shape, Solid, StaticSettings};
 use std::collections::HashMap;
 use std::fmt::Write as _;
 
@@ -301,6 +301,7 @@ fn main() {
             reuse_preconditioner: reuse == "all" || reuse == "pc",
             reuse_surface_lu: reuse == "all" || reuse == "lu",
             local_probing: get("local", "1") == "1",
+            matrix: if get("pcm", "ghost") == "probe" { PreconditionerMatrix::Probed } else { PreconditionerMatrix::Ghost },
             clock: Some(clock),
             ..StaticSettings::default()
         };

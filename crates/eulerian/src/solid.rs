@@ -999,6 +999,13 @@ pub(crate) struct FillPlan {
     band: Vec<(usize, Vec<(usize, f64)>)>,
 }
 
+impl FillPlan {
+    /// The band nodes in fill order, each with the weights of the nodes it is filled from.
+    pub(crate) fn band(&self) -> &[(usize, Vec<(usize, f64)>)] {
+        &self.band
+    }
+}
+
 /// The plan of [`layered_fill`] with every node a target.
 fn layered_plan(grid: &Grid, source: &[bool], layers: usize) -> Vec<(usize, Vec<(usize, f64)>)> {
     let n = grid.len();

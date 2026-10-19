@@ -85,7 +85,7 @@ pub use material::Material;
 pub use multigrid::MultigridStats;
 pub use shape::Shape;
 pub use solid::{Boundary, NodeKind, Relaxation, Settings, Solid};
-pub use statics::{LinearTest, NewtonStep, StaticReport, StaticSettings, StaticTimes};
+pub use statics::{LinearTest, NewtonStep, PreconditionerMatrix, StaticReport, StaticSettings, StaticTimes};
 
 /// Errors of the Eulerian solver.
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]

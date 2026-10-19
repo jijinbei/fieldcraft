@@ -363,6 +363,39 @@ impl CutState {
         self.structure.faces.iter().filter_map(|&(k, d, f)| f.map(|nodes| (k, d, nodes)))
     }
 
+    /// How the solid of node k's dual cell is shared between control volumes.
+    pub(crate) fn share(&self, k: usize) -> Option<[(usize, f64); 2]> {
+        self.share.get(k).copied().flatten()
+    }
+
+    /// Every face with solid on it, (k, d, solid length / h).
+    pub(crate) fn solid_faces(&self, solid: &Solid) -> Vec<(usize, usize, f64)> {
+        let h = solid.grid.h();
+        self.structure
+            .faces
+            .iter()
+            .map(|&(k, d, full)| {
+                if full.is_some() {
+                    return (k, d, 1.0);
+                }
+                let lower = if d == 0 { solid.grid.neighbour(k, 0, -1).map(|c| (c, 2)) } else { solid.grid.neighbour(k, -1, 0).map(|c| (c, 1)) };
+                let mut len = 0.0;
+                for (c0, hf) in [lower, Some((k, if d == 0 { 0 } else { 3 }))].into_iter().flatten() {
+                    match self.class[c0] {
+                        CellClass::Empty => {}
+                        CellClass::Full => len += 0.5 * h,
+                        CellClass::Cut(i) => {
+                            for (a, b) in &self.cells[i].1.faces[hf] {
+                                len += (b[0] - a[0]).hypot(b[1] - a[1]);
+                            }
+                        }
+                    }
+                }
+                (k, d, len / h)
+            })
+            .collect()
+    }
+
     /// The counters of this state.
     pub(crate) fn stats(&self) -> &CutStats {
         &self.stats
