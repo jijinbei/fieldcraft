@@ -49,6 +49,45 @@ pub fn fit<const N: usize>(samples: &[([f64; 2], [f64; N])]) -> Option<[f64; N]>
     out.iter().all(|v| v.is_finite()).then_some(out)
 }
 
+/// The weights c of [`fit`] as a linear map: the fitted value is Σ cᵢ yᵢ over the samples at
+/// `offsets` (same weighting and the same degeneracy test); `None` when [`fit`] would refuse
+/// them. An offset at the target itself gets weight 0, as [`fit`] skips it.
+pub fn fit_weights(offsets: &[[f64; 2]]) -> Option<Vec<f64>> {
+    let mut m = [[0.0f64; 3]; 3];
+    for d in offsets {
+        let r2 = d[0] * d[0] + d[1] * d[1];
+        if !(r2 > 0.0) || !r2.is_finite() {
+            continue;
+        }
+        let w = 1.0 / r2;
+        let b = [1.0, d[0], d[1]];
+        for r in 0..3 {
+            for c in 0..3 {
+                m[r][c] += w * b[r] * b[c];
+            }
+        }
+    }
+    let det = det3(&m);
+    let scale = m[0][0] * m[1][1] * m[2][2];
+    if !(scale > 0.0) || !(det.abs() > 1.0e-9 * scale) {
+        return None;
+    }
+    // The cofactors of column 0: det(M with column 0 replaced by v) = Σ_r v_r C_r0.
+    let cof = [m[1][1] * m[2][2] - m[1][2] * m[2][1], -(m[0][1] * m[2][2] - m[0][2] * m[2][1]), m[0][1] * m[1][2] - m[0][2] * m[1][1]];
+    Some(
+        offsets
+            .iter()
+            .map(|d| {
+                let r2 = d[0] * d[0] + d[1] * d[1];
+                if !(r2 > 0.0) || !r2.is_finite() {
+                    return 0.0;
+                }
+                (cof[0] + cof[1] * d[0] + cof[2] * d[1]) / (r2 * det)
+            })
+            .collect(),
+    )
+}
+
 fn det3(a: &[[f64; 3]; 3]) -> f64 {
     a[0][0] * (a[1][1] * a[2][2] - a[1][2] * a[2][1]) - a[0][1] * (a[1][0] * a[2][2] - a[1][2] * a[2][0])
         + a[0][2] * (a[1][0] * a[2][1] - a[1][1] * a[2][0])
@@ -69,5 +108,10 @@ mod tests {
         assert!(fit(&line).is_none());
         assert!(fit::<2>(&[]).is_none());
         assert!(fit(&[([1.0, 0.0], [f64::NAN]), ([0.0, 1.0], [1.0]), ([1.0, 1.0], [1.0])]).is_none());
+        // The weights reproduce the fit.
+        let c = fit_weights(&pts).unwrap();
+        let w: f64 = pts.iter().zip(&c).map(|(&d, ci)| ci * f(d)[0]).sum();
+        assert!((w - v[0]).abs() < 1e-12, "{w} {}", v[0]);
+        assert!(fit_weights(&[[-1.0, 0.0], [-2.0, 0.0]]).is_none());
     }
 }

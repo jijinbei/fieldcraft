@@ -61,7 +61,8 @@
 use crate::Error;
 use crate::mapped::{CutState, Topology};
 use crate::multigrid::{Block, BlockMatrix, Multigrid, MultigridStats, gmres};
-use crate::solid::{Boundary, NodeKind, Solid};
+use crate::solid::{Boundary, FillPlan, NodeKind, Solid};
+use std::sync::Arc;
 
 /// Settings of the static solve.
 #[derive(Debug, Clone, Copy)]
@@ -235,6 +236,8 @@ struct Context {
     /// The raw residual at the linearisation point.
     r: Vec<f64>,
     rigid: Option<Rigid>,
+    /// The band fill of the held body node set.
+    plan: Arc<FillPlan>,
 }
 
 /// The rigid motions of a free body, for the projections Q and P.
@@ -434,7 +437,7 @@ impl Solid {
     fn finish(&mut self, ctx: Context) {
         self.kind = ctx.topo.kind.clone();
         self.zeta = ctx.base;
-        self.refill_frozen();
+        self.refill_planned(&ctx.plan);
         self.cut = Some(ctx.cut);
         self.v_live = self.kind.iter().map(|k| k.known()).collect();
         for v in self.v.iter_mut() {
@@ -471,7 +474,9 @@ impl Solid {
             // band nodes entered) is re-evaluated with the rebuilt topology.
             let mut alpha = 1.0;
             let mut accepted: Option<(Context, bool)> = None;
-            for _ in 0..12 {
+            // Seven halvings at most: a Newton direction that needs a shorter step means the held
+            // residual is not smooth there; the increment is retried smaller instead.
+            for _ in 0..7 {
                 let trial: Vec<f64> = delta.iter().map(|d| alpha * d).collect();
                 let t = run.now();
                 let flips = self.place(&ctx, &trial);
@@ -602,7 +607,8 @@ impl Solid {
     /// unknowns and the residual there. `warm` warm-starts the surface values.
     fn context(&mut self, warm: Option<&Context>, run: &mut Run) -> Result<Context, Error> {
         let t = run.now();
-        self.refill_frozen();
+        let plan = Arc::new(self.fill_plan());
+        self.refill_planned(&plan);
         let prev = warm.map(|c| &c.cut).or(self.cut.as_ref());
         let st0 = self.build_cut_with(prev, None, false, false)?;
         let topo = st0.topology(&self.kind);
@@ -653,7 +659,7 @@ impl Solid {
         let rigid = self.rigid(&unknowns, &cut);
         run.report.evaluations += 1;
         run.report.times.residual += run.now() - t;
-        Ok(Context { topo, unknowns, members, base: self.zeta.clone(), cut, r, rigid })
+        Ok(Context { topo, unknowns, members, base: self.zeta.clone(), cut, r, rigid, plan })
     }
 
     /// The rigid motions of a free body (none when a node is held).
@@ -714,7 +720,7 @@ impl Solid {
                 self.zeta[m] = [ctx.base[m][0] + d[0], ctx.base[m][1] + d[1]];
             }
         }
-        self.refill_frozen()
+        self.refill_planned(&ctx.plan)
     }
 
     /// The residual at the placed state with the context's topology held.
@@ -914,6 +920,7 @@ impl Context {
             cut: self.cut.clone(),
             r: Vec::new(),
             rigid: self.rigid.as_ref().map(|g| Rigid { phi: g.phi.clone(), mass: g.mass.clone(), gram_inv: g.gram_inv, centre: g.centre }),
+            plan: self.plan.clone(),
         }
     }
 }

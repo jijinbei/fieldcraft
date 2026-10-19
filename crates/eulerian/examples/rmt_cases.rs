@@ -379,6 +379,10 @@ fn main() {
                 Ok((_, conv, _)) => {
                     let (mut dz, mut zmax): (f64, f64) = (0.0, 0.0);
                     let mut differ = 0;
+                    // Differences ξ_static − ξ_relaxed at the common body nodes, then the best
+                    // rigid motion (a + ω × x) of that difference removed (the relaxed free body
+                    // may drift rigidly under its discrete net load).
+                    let mut diffs: Vec<([f64; 2], [f64; 2])> = Vec::new();
                     for k in 0..s.grid().len() {
                         let a_in = matches!(s.kind(k), Some(NodeKind::Solid));
                         let b_in = matches!(r.kind(k), Some(NodeKind::Solid));
@@ -390,8 +394,24 @@ fn main() {
                             let x = s.grid().position(k);
                             dz = dz.max((p[0] - q[0]).hypot(p[1] - q[1]));
                             zmax = zmax.max((p[0] - x[0]).hypot(p[1] - x[1]));
+                            diffs.push((x, [p[0] - q[0], p[1] - q[1]]));
                         }
                     }
+                    let nd = diffs.len() as f64;
+                    let c = diffs.iter().fold([0.0; 2], |a, (x, _)| [a[0] + x[0] / nd, a[1] + x[1] / nd]);
+                    let m = diffs.iter().fold([0.0; 2], |a, (_, d)| [a[0] + d[0] / nd, a[1] + d[1] / nd]);
+                    let (mut num, mut den) = (0.0, 0.0);
+                    for (x, d) in &diffs {
+                        let (dx, dy) = (x[0] - c[0], x[1] - c[1]);
+                        num += dx * (d[1] - m[1]) - dy * (d[0] - m[0]);
+                        den += dx * dx + dy * dy;
+                    }
+                    let w = num / den;
+                    let dz_free = diffs.iter().fold(0.0f64, |a, (x, d)| {
+                        let (dx, dy) = (x[0] - c[0], x[1] - c[1]);
+                        a.max((d[0] - m[0] + w * dy).hypot(d[1] - m[1] - w * dx))
+                    });
+                    write!(line, ",\"max_dzeta_nonrigid\":{dz_free:.3e},\"rigid_shift\":{:.3e},\"rigid_turn\":{w:.3e}", m[0].hypot(m[1])).unwrap();
                     write!(
                         line,
                         ",\"relax_steps\":{steps},\"relax_converged\":{conv},\"relax_wall\":{relax_wall:.3},\"relax_ur_def\":{:.6},\"max_dzeta\":{dz:.3e},\"max_u\":{zmax:.3e},\"kind_differs\":{differ}",

@@ -19,7 +19,7 @@
 //!    with φ < 0 (material that entered) become solid, and v is extrapolated to known nodes
 //!    that did not carry it.
 
-use crate::extrapolate::fit;
+use crate::extrapolate::{fit, fit_weights};
 use crate::grid::Grid;
 use crate::material::{Material, Stress, Tensor};
 use crate::shape::Shape;
@@ -864,35 +864,41 @@ impl Solid {
         }
     }
 
-    /// As [`Solid::rebuild`] with the node kinds held: φ at the body nodes, the band refilled
-    /// from them, and no node enters or leaves the body. Returns the number of nodes whose kind
-    /// no longer matches the sign of φ (body nodes with φ ≥ 0, band nodes with φ < 0), which a
-    /// static solve treats as a change of the cut topology.
-    pub(crate) fn refill_frozen(&mut self) -> usize {
-        let n = self.grid.len();
-        let mut flips = 0;
-        for k in 0..n {
-            if self.kind[k].source() {
-                self.phi[k] = self.shape.phi0(self.xi(k));
-                if self.kind[k] == NodeKind::Solid && !(self.phi[k] < 0.0) {
-                    flips += 1;
-                }
-            }
-        }
+    /// The band fill of the current node kinds as a linear map ([`FillPlan`]).
+    pub(crate) fn fill_plan(&self) -> FillPlan {
         let source: Vec<bool> = self.kind.iter().map(|k| k.source()).collect();
-        let target = vec![true; n];
-        let filled = layered_fill(&self.grid, &source, &target, self.settings.band_layers, &mut self.zeta);
-        if let Some(f) = &self.exterior {
-            for k in 0..n {
-                if filled[k] {
-                    self.zeta[k] = (f.0)(self.grid.position(k));
-                }
+        let sources = (0..self.grid.len()).filter(|&k| source[k]).collect();
+        let band = layered_plan(&self.grid, &source, self.settings.band_layers);
+        FillPlan { sources, band }
+    }
+
+    /// As [`Solid::rebuild`] with the node kinds held and the band refilled by a plan made for
+    /// them: φ at the body and band nodes, and no node enters or leaves the body. Returns the
+    /// number of nodes whose kind no longer matches the sign of φ (body nodes with φ ≥ 0, band
+    /// nodes with φ < 0), which a static solve treats as a change of the cut topology.
+    pub(crate) fn refill_planned(&mut self, plan: &FillPlan) -> usize {
+        let mut flips = 0;
+        for &k in &plan.sources {
+            self.phi[k] = self.shape.phi0(self.xi(k));
+            if self.kind[k] == NodeKind::Solid && !(self.phi[k] < 0.0) {
+                flips += 1;
             }
         }
-        for k in 0..n {
-            if self.kind[k] == NodeKind::Band {
-                self.phi[k] = self.shape.phi0(self.xi(k));
-                if self.phi[k] < 0.0 {
+        for (k, weights) in &plan.band {
+            let mut z = [0.0; 2];
+            for &(m, w) in weights {
+                z[0] += w * self.zeta[m][0];
+                z[1] += w * self.zeta[m][1];
+            }
+            self.zeta[*k] = match &self.exterior {
+                Some(f) => (f.0)(self.grid.position(*k)),
+                None => z,
+            };
+        }
+        for (k, _) in &plan.band {
+            if self.kind[*k] == NodeKind::Band {
+                self.phi[*k] = self.shape.phi0(self.xi(*k));
+                if self.phi[*k] < 0.0 {
                     flips += 1;
                 }
             }
@@ -966,6 +972,80 @@ fn layered_fill(grid: &Grid, source: &[bool], target: &[bool], layers: usize, fi
         }
     }
     filled
+}
+
+/// The band fill of [`layered_fill`] for fixed source nodes, as a linear map: the band nodes in
+/// ring order, each with the weights of its samples (nodes of the body or of earlier rings).
+/// The fit's weights depend only on which nodes are known, so while the body's node set is
+/// held, refilling the band is one sparse product per band node.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct FillPlan {
+    sources: Vec<usize>,
+    band: Vec<(usize, Vec<(usize, f64)>)>,
+}
+
+/// The plan of [`layered_fill`] with every node a target.
+fn layered_plan(grid: &Grid, source: &[bool], layers: usize) -> Vec<(usize, Vec<(usize, f64)>)> {
+    let n = grid.len();
+    let mut have = source.to_vec();
+    let mut out = Vec::new();
+    // Candidates of the next ring: the unknown 8-neighbours of the nodes known so far, starting
+    // from the body's own boundary.
+    let mut frontier: Vec<usize> = (0..n).filter(|&k| have[k]).collect();
+    let mut offsets = Vec::with_capacity(81);
+    let mut nodes = Vec::with_capacity(81);
+    for _ in 0..layers {
+        let mut ring: Vec<usize> = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for &k in &frontier {
+            for dj in -1..=1 {
+                for di in -1..=1 {
+                    if let Some(m) = grid.neighbour(k, di, dj)
+                        && !have[m]
+                        && seen.insert(m)
+                    {
+                        ring.push(m);
+                    }
+                }
+            }
+        }
+        ring.sort_unstable();
+        if ring.is_empty() {
+            break;
+        }
+        let mut entries = Vec::with_capacity(ring.len());
+        for &k in &ring {
+            let mut entry = None;
+            for r in 2..=MAX_WINDOW {
+                offsets.clear();
+                nodes.clear();
+                for dj in -r..=r {
+                    for di in -r..=r {
+                        if let Some(m) = grid.neighbour(k, di, dj)
+                            && have[m]
+                        {
+                            offsets.push([di as f64, dj as f64]);
+                            nodes.push(m);
+                        }
+                    }
+                }
+                if let Some(w) = fit_weights(&offsets) {
+                    entry = Some(nodes.iter().copied().zip(w).filter(|e| e.1 != 0.0).collect::<Vec<_>>());
+                    break;
+                }
+            }
+            entries.push(entry);
+        }
+        frontier.clear();
+        for (&k, entry) in ring.iter().zip(entries) {
+            if let Some(e) = entry {
+                have[k] = true;
+                frontier.push(k);
+                out.push((k, e));
+            }
+        }
+    }
+    out
 }
 
 /// The smoothed Heaviside of Rycroft et al. (2020): 0 for φ ≤ −ε, 1 for φ ≥ ε.
