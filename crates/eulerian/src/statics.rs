@@ -60,7 +60,9 @@
 //!   needs more than twice the iterations it took right after the build, or does not converge).
 //!   The factorised Jacobian of each surface chain is kept the same way, so the surface solve
 //!   inside each residual evaluation is a chord iteration (refactorised when it contracts
-//!   slowly).
+//!   slowly). A topology change always rebuilds: a kept hierarchy adapted to the new unknowns
+//!   (matched by node, the new ones on their diagonal blocks) cost several times the GMRES
+//!   iterations of a fresh one in our tests.
 
 use crate::Error;
 use crate::mapped::{CutState, Topology};
@@ -202,7 +204,7 @@ pub struct NewtonStep {
 pub struct StaticTimes {
     /// All residual evaluations (Newton states, line search, Krylov products, probing).
     pub residual: f64,
-    /// Of which the probing evaluations.
+    /// Assembling the preconditioner's matrix (the probing evaluations included).
     pub probing: f64,
     /// Multigrid setup (Galerkin products, coarsest factorisation).
     pub setup: f64,
