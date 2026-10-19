@@ -298,7 +298,7 @@ impl GpuSolid {
                 self.check()?;
                 self.timings.checks += t.elapsed().as_secs_f64();
             }
-            let chunk = if all { left.min(CHUNK) } else { 1 };
+            let chunk = if all && self.solid.next_kick() == self.solid.dt() { left.min(CHUNK) } else { 1 };
             self.step(chunk, !all)?;
             left -= chunk;
             self.since_check += chunk;
@@ -321,15 +321,13 @@ impl GpuSolid {
             }
             self.queue.write_buffer(&split.upload_values, 0, &bytes_f32(&values));
         }
+        // One uniform for the chunk: its kick is the same in every step of it (the caller takes
+        // the very first step, with half the kick, on its own).
+        self.queue.write_buffer(&self.params, 0, &self.params_bytes(self.solid.next_kick(), split)?);
         let mut enc = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("eulerian steps") });
-        let mut kick = self.solid.next_kick();
-        let dt = self.solid.dt();
-        for _ in 0..count {
-            // The uniform (its kick is Δt/2 in the very first step) is written before the
-            // submission that uses it.
-            self.queue.write_buffer(&self.params, 0, &self.params_bytes(kick, split)?);
-            {
-                let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("eulerian step"), timestamp_writes: None });
+        {
+            let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("eulerian steps"), timestamp_writes: None });
+            for _ in 0..count {
                 let bind = split.bind.get(self.current).ok_or_else(|| gpu_error("no bind group"))?;
                 pass.set_bind_group(0, bind, &[]);
                 if exchange && !split.upload.is_empty() {
@@ -341,17 +339,8 @@ impl GpuSolid {
                 if exchange && !split.download.is_empty() {
                     self.dispatch(&mut pass, "download", split.download_groups)?;
                 }
+                self.current ^= 1;
             }
-            if count > 1 {
-                // Each step is its own submission, after its uniform.
-                let done = std::mem::replace(
-                    &mut enc,
-                    self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("eulerian steps") }),
-                );
-                self.queue.submit([done.finish()]);
-            }
-            self.current ^= 1;
-            kick = dt;
         }
         let bytes = 16 * split.download.len() as u64;
         if exchange && bytes > 0 {
