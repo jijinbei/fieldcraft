@@ -148,6 +148,7 @@ fn name(surface: Mode) -> &'static str {
         (Boundary::BlurredBody, _) => "blend-sm",
         (Boundary::Ghost, 2) => "ghost-quadratic",
         (Boundary::Ghost, _) => "ghost",
+        (Boundary::Mapped, _) => "mapped",
     }
 }
 

@@ -13,6 +13,8 @@
 //! - [`extrapolate`]: weighted least-squares linear extrapolation into the band outside the solid.
 //! - `sharp`: a sharp traction boundary by traction-constrained ghost values, [`Boundary::Ghost`].
 //! - [`solid`]: the state and the explicit time step.
+//! - [`cut`] and [`mapped`]: the sharp boundary — cut cells with the traction imposed on the
+//!   curved surface and the deformation gradient near it from a surface-fitted map.
 //!
 //! The scheme, in our own implementation from the published equations:
 //! - fields at nodes (the nodes a lattice Boltzmann fluid will share later): the reference map
@@ -63,12 +65,14 @@
 pub mod cut;
 pub mod extrapolate;
 pub mod grid;
+pub mod mapped;
 pub mod material;
 pub mod shape;
 mod sharp;
 pub mod solid;
 
 pub use grid::Grid;
+pub use mapped::{CutStats, CutView, SurfaceSample};
 pub use material::Material;
 pub use shape::Shape;
 pub use solid::{Boundary, NodeKind, Relaxation, Settings, Solid};

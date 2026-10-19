@@ -38,10 +38,10 @@ pub enum NodeKind {
 }
 
 impl NodeKind {
-    fn known(self) -> bool {
+    pub(crate) fn known(self) -> bool {
         self != NodeKind::Empty
     }
-    fn source(self) -> bool {
+    pub(crate) fn source(self) -> bool {
         matches!(self, NodeKind::Solid | NodeKind::Fixed)
     }
 }
@@ -85,6 +85,10 @@ pub enum Boundary {
     /// holds at the surface (module `sharp`), the momentum at the body's nodes only. Kept for
     /// comparison studies.
     Ghost,
+    /// Sharp cut cells (`crate::mapped`): momentum only at nodes inside the body, each over the
+    /// solid part of its dual cell, the traction imposed on the curved surface, and the
+    /// deformation gradient near the surface from a surface-fitted map.
+    Mapped,
 }
 
 impl Boundary {
@@ -126,7 +130,7 @@ impl Settings {
         if !(2..=3).contains(&self.ghost_degree) {
             return Err(Error::Invalid(format!("ghost_degree must be 2 or 3, got {}", self.ghost_degree)));
         }
-        if (self.band_layers as f64) < self.blur + 2.0 {
+        if self.boundary.blends() && (self.band_layers as f64) < self.blur + 2.0 {
             return Err(Error::Invalid("the band must reach past the blur zone by two layers".into()));
         }
         Ok(())
@@ -154,30 +158,46 @@ const MAX_WINDOW: isize = 4;
 /// An Eulerian solid on a grid.
 #[derive(Debug, Clone)]
 pub struct Solid {
-    grid: Grid,
-    material: Material,
-    shape: Shape,
-    settings: Settings,
-    limits: Limits,
-    zeta: Vec<[f64; 2]>,
-    v: Vec<[f64; 2]>,
-    phi: Vec<f64>,
-    kind: Vec<NodeKind>,
+    pub(crate) grid: Grid,
+    pub(crate) material: Material,
+    pub(crate) shape: Shape,
+    pub(crate) settings: Settings,
+    pub(crate) limits: Limits,
+    pub(crate) zeta: Vec<[f64; 2]>,
+    pub(crate) v: Vec<[f64; 2]>,
+    pub(crate) phi: Vec<f64>,
+    pub(crate) kind: Vec<NodeKind>,
     /// Whether v at the node was integrated (or held) in the last step.
-    v_live: Vec<bool>,
-    ambient: Vec<[f64; 3]>,
-    dt: f64,
-    time: f64,
+    pub(crate) v_live: Vec<bool>,
+    pub(crate) ambient: Vec<[f64; 3]>,
+    pub(crate) dt: f64,
+    pub(crate) time: f64,
     /// Whether a dynamic step was taken (the first one advances v by half a step).
-    started: bool,
+    pub(crate) started: bool,
+    /// The ambient stress as a function of position, when given as one (the mapped boundary
+    /// evaluates it at the surface's Gauss points; else it interpolates the node values).
+    pub(crate) ambient_field: Option<Field<[f64; 3]>>,
     /// Body force per unit current volume, as a function of position.
-    body: Option<Field<[f64; 2]>>,
+    pub(crate) body: Option<Field<[f64; 2]>>,
     /// ζ prescribed outside the body instead of extrapolated (verification only).
-    exterior: Option<Field<[f64; 2]>>,
+    pub(crate) exterior: Option<Field<[f64; 2]>>,
+    /// The cut cells and the surface of the last mapped step (for the stress accessors).
+    pub(crate) cut: Option<crate::mapped::CutState>,
     /// Ghost nodes of the last rebuild that the ghost fill could not constrain.
-    fallbacks: usize,
+    pub(crate) fallbacks: usize,
     /// Ghost nodes of the last rebuild filled by the linear constrained fit.
-    linear_fills: usize,
+    pub(crate) linear_fills: usize,
+}
+
+/// The stresses at the middle of an edge.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct EdgeStress {
+    /// The solid's Cauchy stress (σxx, σyy, σxy).
+    pub(crate) stress: [f64; 3],
+    /// The artificial viscous stress.
+    pub(crate) viscous: [f64; 3],
+    /// det ∇ξ.
+    pub(crate) det: f64,
 }
 
 /// A field given as a function of position.
@@ -225,11 +245,16 @@ impl Solid {
             dt,
             time: 0.0,
             started: false,
+            ambient_field: None,
             body: None,
             exterior: None,
+            cut: None,
             fallbacks: 0,
             linear_fills: 0,
         };
+        if settings.boundary == Boundary::Mapped && (s.grid.periodic()[0] || s.grid.periodic()[1]) && shape != Shape::Everywhere {
+            return Err(Error::Invalid("not supported yet: a mapped surface on a periodic grid".into()));
+        }
         for k in 0..n {
             if shape.phi0(s.grid.position(k)) < 0.0 {
                 s.kind[k] = NodeKind::Solid;
@@ -265,6 +290,7 @@ impl Solid {
         self.v_live = self.kind.iter().map(|k| k.source()).collect();
         self.extrapolate_velocity();
         self.started = false;
+        self.cut = None;
         Ok(())
     }
 
@@ -287,10 +313,23 @@ impl Solid {
         Ok(())
     }
 
+    /// Sets the stress outside the body as a function of position, kept for evaluation at any
+    /// point (the mapped boundary integrates the traction σ_ambient·n along the curved surface);
+    /// the node values are set from it as by [`Solid::set_ambient`].
+    pub fn set_ambient_field(&mut self, stress: impl Fn([f64; 2]) -> [f64; 3] + Send + Sync + 'static) -> Result<(), Error> {
+        let f: Arc<dyn Fn([f64; 2]) -> [f64; 3] + Send + Sync> = Arc::new(stress);
+        let g = f.clone();
+        self.set_ambient(move |x| g(x))?;
+        self.ambient_field = Some(Field(f));
+        self.cut = None;
+        Ok(())
+    }
+
     /// Sets a body force f per unit current volume as a function of the grid position (a
     /// centrifugal load ρω²x, gravity ρg). Zero by default. The blurred surface applies it at
     /// the nodes weighted by the material's share 1 − H(φ) (as the LBRMT weights the solid's
-    /// external force).
+    /// external force); the mapped boundary integrates it over each control volume (at its
+    /// centroid).
     pub fn set_body_force(&mut self, force: impl Fn([f64; 2]) -> [f64; 2] + Send + Sync + 'static) -> Result<(), Error> {
         for k in 0..self.grid.len() {
             let b = force(self.grid.position(k));
@@ -373,7 +412,10 @@ impl Solid {
     /// (one-sided next to unknown nodes).
     pub fn stress(&self, k: usize) -> Option<Stress> {
         self.kind(k).filter(|k| k.source())?;
-        let g = self.node_gradient(k)?;
+        let g = match &self.cut {
+            Some(cut) if self.settings.boundary == Boundary::Mapped => cut.node_gradient(self, k).or_else(|| self.node_gradient(k))?,
+            _ => self.node_gradient(k)?,
+        };
         let f = invert(&identity_plus(&g))?;
         self.material.cauchy(&f).ok()
     }
@@ -453,6 +495,9 @@ impl Solid {
 
     /// One dynamic step.
     fn step(&mut self) -> Result<(), Error> {
+        if self.settings.boundary == Boundary::Mapped {
+            return self.step_mapped();
+        }
         let n = self.grid.len();
         let (_, _, rho0) = self.material.constants();
         let h = self.grid.h();
@@ -554,7 +599,7 @@ impl Solid {
     }
 
     /// ζ ← ζ − Δt (v + (v·∇)ζ) at the solid nodes.
-    fn advect_reference(&mut self) -> Result<(), Error> {
+    pub(crate) fn advect_reference(&mut self) -> Result<(), Error> {
         let n = self.grid.len();
         let mut z_new = self.zeta.clone();
         for k in 0..n {
@@ -573,7 +618,7 @@ impl Solid {
 
     /// (v·∇)a at node k by second-order one-sided upwind differences of the field `a`, first
     /// order next to unknown nodes.
-    fn upwind_dot(&self, k: usize, v: [f64; 2], a: impl Fn(usize) -> f64) -> f64 {
+    pub(crate) fn upwind_dot(&self, k: usize, v: [f64; 2], a: impl Fn(usize) -> f64) -> f64 {
         let h = self.grid.h();
         let known = |m: Option<usize>| m.filter(|&m| self.kind[m].known());
         let mut sum = 0.0;
@@ -608,7 +653,7 @@ impl Solid {
 
     /// The stress on edge d of node k and det ∇ξ there (NaN without a solid stress).
     fn edge_stress(&self, k: usize, d: usize, eps: f64, mu_e: f64) -> Result<([f64; 3], f64), Error> {
-        let (ei, ej, ti, tj) = if d == 0 { (1, 0, 0, 1) } else { (0, 1, 1, 0) };
+        let (ei, ej) = if d == 0 { (1, 0) } else { (0, 1) };
         let Some(b) = self.grid.neighbour(k, ei, ej) else {
             return Ok((self.ambient[k], f64::NAN));
         };
@@ -630,9 +675,26 @@ impl Solid {
         if hv >= 1.0 {
             return Ok((amb, f64::NAN));
         }
+        let Some(e) = self.compact_edge(k, d, mu_e)? else {
+            return Ok((amb, f64::NAN));
+        };
+        let w = 1.0 - hv;
+        let (s, visc) = (e.stress, e.viscous);
+        let out = [w * (s[0] + visc[0]) + hv * amb[0], w * (s[1] + visc[1]) + hv * amb[1], w * (s[2] + visc[2]) + hv * amb[2]];
+        Ok((out, e.det))
+    }
+
+    /// The solid and viscous stress at the middle of edge d of node k from the compact stencil
+    /// (the two nodes of the edge and their four transverse neighbours); `None` when one of
+    /// them is unknown.
+    pub(crate) fn compact_edge(&self, k: usize, d: usize, mu_e: f64) -> Result<Option<EdgeStress>, Error> {
+        let (ei, ej, ti, tj) = if d == 0 { (1, 0, 0, 1) } else { (0, 1, 1, 0) };
+        let Some(b) = self.grid.neighbour(k, ei, ej).filter(|&b| self.kind[b].known() && self.kind[k].known()) else {
+            return Ok(None);
+        };
         let side = |m: usize, s: isize| self.grid.neighbour(m, s * ti, s * tj).filter(|&q| self.kind[q].known());
         let (Some(ap), Some(am), Some(bp), Some(bm)) = (side(k, 1), side(k, -1), side(b, 1), side(b, -1)) else {
-            return Ok((amb, f64::NAN));
+            return Ok(None);
         };
         let h = self.grid.h();
         // Gradients at the edge: along the edge direction from (k, b), across it from the four
@@ -654,14 +716,12 @@ impl Solid {
             invert(&jinv).ok_or_else(|| Error::Diverged(format!("the reference map folded at node {k} (det ∇ξ = {det}) at t = {}", self.time)))?;
         let s = self.material.cauchy(&f).map_err(|e| Error::Diverged(format!("{e} at node {k}, t = {}", self.time)))?;
         let gv = grad(&|m| self.v[m]);
-        let visc = [2.0 * mu_e * gv[0][0], 2.0 * mu_e * gv[1][1], mu_e * (gv[0][1] + gv[1][0])];
-        let w = 1.0 - hv;
-        let out = [w * (s[0] + visc[0]) + hv * amb[0], w * (s[1] + visc[1]) + hv * amb[1], w * (s[2] + visc[2]) + hv * amb[2]];
-        Ok((out, det))
+        let viscous = [2.0 * mu_e * gv[0][0], 2.0 * mu_e * gv[1][1], mu_e * (gv[0][1] + gv[1][0])];
+        Ok(Some(EdgeStress { stress: [s[0], s[1], s[2]], viscous, det }))
     }
 
     /// ∇ζ at node k by central differences, one-sided next to unknown nodes.
-    fn node_gradient(&self, k: usize) -> Option<Tensor> {
+    pub(crate) fn node_gradient(&self, k: usize) -> Option<Tensor> {
         let h = self.grid.h();
         let known = |m: Option<usize>| m.filter(|&m| self.kind[m].known());
         let mut g = [[0.0; 2]; 2];
@@ -682,7 +742,7 @@ impl Solid {
     }
 
     /// Updates φ, drops nodes that left the body, rebuilds the band and admits entering material.
-    fn rebuild(&mut self) -> Result<(), Error> {
+    pub(crate) fn rebuild(&mut self) -> Result<(), Error> {
         let n = self.grid.len();
         for k in 0..n {
             match self.kind[k] {
@@ -778,7 +838,7 @@ impl Solid {
     }
 
     /// Extrapolates v from the nodes that carry it to the other known nodes.
-    fn extrapolate_velocity(&mut self) {
+    pub(crate) fn extrapolate_velocity(&mut self) {
         let n = self.grid.len();
         let source: Vec<bool> = (0..n).map(|k| self.v_live[k] && self.kind[k].known()).collect();
         let target: Vec<bool> = (0..n).map(|k| self.kind[k].known()).collect();
@@ -791,7 +851,7 @@ impl Solid {
         }
     }
 
-    fn xi(&self, k: usize) -> [f64; 2] {
+    pub(crate) fn xi(&self, k: usize) -> [f64; 2] {
         let x = self.grid.position(k);
         [x[0] + self.zeta[k][0], x[1] + self.zeta[k][1]]
     }
@@ -856,11 +916,11 @@ pub fn heaviside(phi: f64, eps: f64) -> f64 {
     }
 }
 
-fn identity_plus(g: &Tensor) -> Tensor {
+pub(crate) fn identity_plus(g: &Tensor) -> Tensor {
     [[1.0 + g[0][0], g[0][1]], [g[1][0], 1.0 + g[1][1]]]
 }
 
-fn invert(a: &Tensor) -> Option<Tensor> {
+pub(crate) fn invert(a: &Tensor) -> Option<Tensor> {
     let det = a[0][0] * a[1][1] - a[0][1] * a[1][0];
     if !(det > 0.0) || !det.is_finite() {
         return None;
