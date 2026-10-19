@@ -341,6 +341,26 @@ impl CutState {
         cv
     }
 
+    /// Nodes where the discretisation departs from the interior stencil: corners of cut cells,
+    /// nodes behind surface points, outside nodes whose solid is shared out, merged nodes and
+    /// the nodes they joined.
+    pub(crate) fn special_nodes(&self) -> Vec<bool> {
+        let mut out: Vec<bool> = self.near.iter().zip(&self.structure.near_cells).map(|(a, b)| *a || *b).collect();
+        for &k in &self.structure.orphans {
+            out[k] = true;
+        }
+        for &(k, m) in &self.merges {
+            out[k] = true;
+            out[m] = true;
+        }
+        out
+    }
+
+    /// The faces between two full cells with their compact stencil nodes [b, k₊, k₋, b₊, b₋].
+    pub(crate) fn full_faces(&self) -> impl Iterator<Item = (usize, usize, [usize; 5])> + '_ {
+        self.structure.faces.iter().filter_map(|&(k, d, f)| f.map(|nodes| (k, d, nodes)))
+    }
+
     /// The counters of this state.
     pub(crate) fn stats(&self) -> &CutStats {
         &self.stats
@@ -1339,6 +1359,13 @@ impl Solid {
     /// The net force on every control volume (at the node that holds it): fluxes through the faces,
     /// the traction on the curved surface and the body force.
     pub(crate) fn mapped_forces(&self, st: &mut CutState, mu_e: f64) -> Result<Vec<[f64; 2]>, Error> {
+        self.mapped_forces_on(st, mu_e, None)
+    }
+
+    /// As [`Solid::mapped_forces`], with only the faces that touch a node of `mask` (when given):
+    /// the forces are then exact at the control volumes whose own node and whose sharing
+    /// neighbours all lie in the mask.
+    pub(crate) fn mapped_forces_on(&self, st: &mut CutState, mu_e: f64, mask: Option<&[bool]>) -> Result<Vec<[f64; 2]>, Error> {
         let n = self.grid.len();
         // Net force on the solid of each node's dual cell, then shared out to the control
         // volumes that hold it.
@@ -1350,6 +1377,12 @@ impl Solid {
         let h = self.grid.h();
         let structure = st.structure.clone();
         for &(k, d, full) in &structure.faces {
+            if let Some(m) = mask
+                && !m[k]
+                && self.along(k, d, 1).is_none_or(|b| !m[b])
+            {
+                continue;
+            }
             let Some(nodes) = full else {
                 self.face_force(st, k, d, mu_e, &mut raw, &mut stats)?;
                 continue;

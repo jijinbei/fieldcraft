@@ -14,7 +14,7 @@
 //! - `solver=relax|static` (dynamic relaxation, default, or the Newton–Krylov static solve),
 //!   with `incs=` initial load increments, `probe=` colour spacing, `sweeps=`, `stol=`
 //!   tolerance, `reuse=all|none|pc|lu` (what is kept while the topology is unchanged),
-//!   `newton=1` (print every Newton step),
+//!   `local=0` (probe every row of the preconditioner), `newton=1` (print every Newton step),
 //! - `compare=1` (static: also relax a copy and report the largest difference of ζ).
 //!
 //! Prints one JSON line of metrics.
@@ -300,6 +300,7 @@ fn main() {
             tolerance: get("stol", "1e-9").parse().unwrap(),
             reuse_preconditioner: reuse == "all" || reuse == "pc",
             reuse_surface_lu: reuse == "all" || reuse == "lu",
+            local_probing: get("local", "1") == "1",
             clock: Some(clock),
             ..StaticSettings::default()
         };

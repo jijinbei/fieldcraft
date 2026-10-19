@@ -90,6 +90,9 @@ pub struct StaticSettings {
     pub reuse_preconditioner: bool,
     /// Keep the surface chains' factorised Jacobians (chord iteration).
     pub reuse_surface_lu: bool,
+    /// Assemble the preconditioner's interior rows from the constitutive tangent and probe
+    /// only the rows near the surface (else probe every row).
+    pub local_probing: bool,
     /// Topology changes allowed per increment before it counts as failed.
     pub max_topology_changes: usize,
     /// A clock in seconds for the timing counters (none: the times are zero). The crate itself
@@ -111,6 +114,7 @@ impl Default for StaticSettings {
             sweeps: 2,
             reuse_preconditioner: true,
             reuse_surface_lu: true,
+            local_probing: true,
             max_topology_changes: 30,
             clock: None,
         }
@@ -290,6 +294,17 @@ fn dot(a: &[f64], b: &[f64]) -> f64 {
 
 fn norm2(a: &[f64]) -> f64 {
     dot(a, a).sqrt()
+}
+
+/// The nodes within Chebyshev distance r of a node of `mask`.
+fn dilate(grid: &crate::Grid, mask: &[bool], r: usize) -> Vec<bool> {
+    let r = r as isize;
+    let pass = |m: &[bool], along_x: bool| -> Vec<bool> {
+        (0..m.len())
+            .map(|k| (-r..=r).any(|o| if along_x { grid.neighbour(k, o, 0) } else { grid.neighbour(k, 0, o) }.is_some_and(|q| m[q])))
+            .collect()
+    };
+    pass(&pass(mask, true), false)
 }
 
 fn norm_inf(a: &[f64]) -> f64 {
@@ -733,13 +748,18 @@ impl Solid {
 
     /// The residual at the placed state with the context's topology held.
     fn held(&mut self, ctx: &Context, flips: usize, reuse_lu: bool, run: &mut Run) -> Result<Eval, Error> {
+        self.held_on(ctx, flips, reuse_lu, None, run)
+    }
+
+    /// As [`Solid::held`] with the forces only on the faces touching `faces` (when given).
+    fn held_on(&mut self, ctx: &Context, flips: usize, reuse_lu: bool, faces: Option<&[bool]>, run: &mut Run) -> Result<Eval, Error> {
         run.report.evaluations += 1;
         let t0 = run.now();
         let mut cut = self.build_cut_with(Some(&ctx.cut), Some(&ctx.topo), reuse_lu, true)?;
         let t1 = run.now();
         run.report.surface_factorizations += cut.stats().factorizations;
         run.report.surface_traction_evals += cut.stats().traction_evals;
-        let force = self.mapped_forces(&mut cut, 0.0)?;
+        let force = self.mapped_forces_on(&mut cut, 0.0, faces)?;
         run.report.times.cut += t1 - t0;
         run.report.times.forces += run.now() - t1;
         let r: Vec<f64> = ctx.unknowns.iter().flat_map(|&k| force[k]).collect();
@@ -762,25 +782,48 @@ impl Solid {
         Ok(true)
     }
 
-    /// The probed Jacobian at the context and its multigrid hierarchy.
+    /// The Jacobian at the context for the preconditioner, and its multigrid hierarchy.
+    ///
+    /// Rows more than two nodes from the surface (from any cut cell, surface point, shared or
+    /// merged control volume) are the compact stencil's fluxes; their blocks come from the
+    /// tangent of each face's flux with respect to its ∇ζ (by differences of the constitutive
+    /// law), exact up to O(ε). The rows near the surface are probed: the unknowns within two
+    /// nodes of them are perturbed one colour at a time, and the forces are evaluated only on
+    /// the faces those rows need. With `local_probing` off, every row is probed (the reference
+    /// for checking the local assembly).
     fn build_preconditioner(&mut self, ctx: &Context, run: &mut Run) -> Result<Multigrid, Error> {
         let s = run.set.probe;
         let h = self.grid.h();
         let eps = 1e-7 * h;
         let nu = ctx.unknowns.len();
-        let mut index = vec![usize::MAX; self.grid.len()];
+        let n = self.grid.len();
+        let mut index = vec![usize::MAX; n];
         for (u, &k) in ctx.unknowns.iter().enumerate() {
             index[k] = u;
         }
+        let local = run.set.local_probing;
+        // Rows near the surface, the unknowns they depend on, and the nodes whose faces their
+        // forces need.
+        let (near_rows, columns, faces) = if local {
+            let special = ctx.cut.special_nodes();
+            let near_rows = dilate(&self.grid, &special, 2);
+            (near_rows.clone(), dilate(&self.grid, &near_rows, 2), Some(dilate(&self.grid, &near_rows, 1)))
+        } else {
+            (vec![true; n], vec![true; n], None)
+        };
         let mut rows: Vec<Vec<(usize, Block)>> = vec![Vec::new(); nu];
-        let half = (s / 2) as isize;
         let t0 = run.now();
+        if local {
+            self.assemble_interior(ctx, &index, &near_rows, &mut rows)?;
+        }
+        let half = (s / 2) as isize;
         for ci in 0..s {
             for cj in 0..s {
                 let colour: Vec<usize> = (0..nu)
                     .filter(|&u| {
-                        let (i, j) = self.grid.ij(ctx.unknowns[u]);
-                        i % s == ci && j % s == cj
+                        let k = ctx.unknowns[u];
+                        let (i, j) = self.grid.ij(k);
+                        columns[k] && i % s == ci && j % s == cj
                     })
                     .collect();
                 if colour.is_empty() {
@@ -791,24 +834,29 @@ impl Solid {
                     for &u in &colour {
                         delta[2 * u + c] = eps;
                     }
-                    let e = self.eval(ctx, &delta, run.set.reuse_surface_lu, run)?;
+                    let flips = self.place(ctx, &delta, run);
+                    let e = self.held_on(ctx, flips, run.set.reuse_surface_lu, faces.as_deref(), run)?;
                     run.report.probe_evaluations += 1;
                     for (w, row) in rows.iter_mut().enumerate() {
+                        let k = ctx.unknowns[w];
+                        if !near_rows[k] {
+                            continue;
+                        }
                         let d = [(e.r[2 * w] - ctx.r[2 * w]) / eps, (e.r[2 * w + 1] - ctx.r[2 * w + 1]) / eps];
                         if d[0] == 0.0 && d[1] == 0.0 {
                             continue;
                         }
                         // The perturbed node of this colour nearest the row's node.
-                        let (i, j) = self.grid.ij(ctx.unknowns[w]);
+                        let (i, j) = self.grid.ij(k);
                         let off = |a: usize, col: usize| -> isize {
                             let r = ((col as isize - a as isize) % s as isize + s as isize) % s as isize;
                             if r > half { r - s as isize } else { r }
                         };
-                        let Some(q) = self.grid.neighbour(ctx.unknowns[w], off(i, ci), off(j, cj)) else {
+                        let Some(q) = self.grid.neighbour(k, off(i, ci), off(j, cj)) else {
                             continue;
                         };
                         let col = index[q];
-                        if col == usize::MAX {
+                        if col == usize::MAX || !columns[q] {
                             continue;
                         }
                         let mut b = [[0.0; 2]; 2];
@@ -820,7 +868,7 @@ impl Solid {
             }
         }
         // Back to the base state.
-        self.eval(ctx, &vec![0.0; 2 * nu], run.set.reuse_surface_lu, run)?;
+        self.place(ctx, &vec![0.0; 2 * nu], run);
         let t1 = run.now();
         run.report.times.probing += t1 - t0;
         run.report.times.residual += t1 - t0;
@@ -830,6 +878,70 @@ impl Solid {
             Multigrid::new(a, ij, (self.grid.nx(), self.grid.ny()), self.grid.position(0), h, ctx.rigid.as_ref().map(|r| r.centre), run.set.sweeps)?;
         run.report.times.setup += run.now() - t1;
         Ok(mg)
+    }
+
+    /// The rows of the unknowns away from the surface: each full face's flux f = σ(F)·n h with
+    /// ∇ζ from its six stencil nodes; ∂f/∂(∇ζ) by forward differences of the law (step 10⁻⁷
+    /// in ∇ζ), times the stencil weights, added to the face's two nodes (+ at k, − at b).
+    fn assemble_interior(&self, ctx: &Context, index: &[usize], near_rows: &[bool], rows: &mut [Vec<(usize, Block)>]) -> Result<(), Error> {
+        let h = self.grid.h();
+        let flux = |g: &crate::material::Tensor, d: usize| -> Result<[f64; 2], Error> {
+            let f = crate::solid::invert(&crate::solid::identity_plus(g)).ok_or_else(|| Error::Diverged("the reference map folded".into()))?;
+            let s = self.material.cauchy(&f)?;
+            Ok(if d == 0 { [s[0] * h, s[2] * h] } else { [s[2] * h, s[1] * h] })
+        };
+        let step = 1e-7;
+        for (k, d, nodes) in ctx.cut.full_faces() {
+            let [b, ap, am, bp, bm] = nodes;
+            let rk = (index[k] != usize::MAX && !near_rows[k]).then_some(index[k]);
+            let rb = (index[b] != usize::MAX && !near_rows[b]).then_some(index[b]);
+            if rk.is_none() && rb.is_none() {
+                continue;
+            }
+            let z = &self.zeta;
+            let mut g = [[0.0; 2]; 2];
+            for r in 0..2 {
+                g[r][d] = (z[b][r] - z[k][r]) / h;
+                g[r][1 - d] = (z[ap][r] + z[bp][r] - z[am][r] - z[bm][r]) / (4.0 * h);
+            }
+            let f0 = flux(&g, d)?;
+            // sens[comp][r][col] = ∂f_comp / ∂g[r][col].
+            let mut sens = [[[0.0; 2]; 2]; 2];
+            for r in 0..2 {
+                for col in 0..2 {
+                    let mut gp = g;
+                    gp[r][col] += step;
+                    let f1 = flux(&gp, d)?;
+                    for comp in 0..2 {
+                        sens[comp][r][col] = (f1[comp] - f0[comp]) / step;
+                    }
+                }
+            }
+            // Stencil weights of each node in the along (d) and across (1 − d) derivatives.
+            let w_along = 1.0 / h;
+            let w_across = 1.0 / (4.0 * h);
+            let entries =
+                [(k, -w_along, 0.0), (b, w_along, 0.0), (ap, 0.0, w_across), (bp, 0.0, w_across), (am, 0.0, -w_across), (bm, 0.0, -w_across)];
+            for (m, wa, wc) in entries {
+                let col = index[m];
+                if col == usize::MAX {
+                    continue;
+                }
+                let mut blk = [[0.0; 2]; 2];
+                for comp in 0..2 {
+                    for c in 0..2 {
+                        blk[comp][c] = sens[comp][c][d] * wa + sens[comp][c][1 - d] * wc;
+                    }
+                }
+                if let Some(r) = rk {
+                    rows[r].push((col, blk));
+                }
+                if let Some(r) = rb {
+                    rows[r].push((col, blk.map(|row| row.map(|v| -v))));
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Solves QJP δ = −QR by GMRES with the kept V-cycle; returns P δ, the iterations and the
