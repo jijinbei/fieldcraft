@@ -60,6 +60,7 @@
 // Small fixed-size tensor kernels read as the textbook formulas with index loops.
 #![allow(clippy::needless_range_loop)]
 
+pub mod cut;
 pub mod extrapolate;
 pub mod grid;
 pub mod material;

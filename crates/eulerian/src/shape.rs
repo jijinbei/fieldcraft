@@ -16,6 +16,8 @@ pub enum Shape {
     Rectangle { min: [f64; 2], max: [f64; 2] },
     /// A ring between two concentric circles.
     Annulus { center: [f64; 2], inner: f64, outer: f64 },
+    /// A disc.
+    Disc { center: [f64; 2], radius: f64 },
 }
 
 impl Shape {
@@ -40,6 +42,12 @@ impl Shape {
                 positive("annulus outer radius", outer)?;
                 if inner < outer { Ok(()) } else { Err(Error::Invalid("the annulus needs inner < outer".into())) }
             }
+            Shape::Disc { center, radius } => {
+                finite("disc centre x", center[0])?;
+                finite("disc centre y", center[1])?;
+                positive("disc radius", radius)?;
+                Ok(())
+            }
         }
     }
 
@@ -59,6 +67,7 @@ impl Shape {
                 let r = (x[0] - center[0]).hypot(x[1] - center[1]);
                 (inner - r).max(r - outer)
             }
+            Shape::Disc { center, radius } => (x[0] - center[0]).hypot(x[1] - center[1]) - radius,
         }
     }
 }
@@ -77,6 +86,9 @@ mod tests {
         assert_eq!(a.phi0([1.5, 0.0]), -0.5);
         assert_eq!(a.phi0([0.25, 0.0]), 0.75);
         assert!(Shape::Annulus { center: [0.0, 0.0], inner: 2.0, outer: 1.0 }.validate().is_err());
+        let d = Shape::Disc { center: [1.0, 0.0], radius: 2.0 };
+        assert_eq!(d.phi0([1.0, 0.5]), -1.5);
+        assert!(Shape::Disc { center: [0.0, 0.0], radius: 0.0 }.validate().is_err());
         assert!(Shape::Rectangle { min: [0.0, f64::NAN], max: [1.0, 1.0] }.validate().is_err());
     }
 }
