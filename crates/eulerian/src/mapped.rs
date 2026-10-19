@@ -333,13 +333,9 @@ impl Solid {
         if d == 0 { self.grid.neighbour(k, o, 0) } else { self.grid.neighbour(k, 0, o) }
     }
 
-    /// The corners c0..c3 of the cell whose lower-left node is c0.
+    /// The corners c0..c3 of the cell whose lower-left node is c0 (wrapping periodic axes).
     fn cell_corners(&self, c0: usize) -> Option<[usize; 4]> {
-        let (i, j) = self.grid.ij(c0);
-        if i + 1 >= self.grid.nx() || j + 1 >= self.grid.ny() {
-            return None;
-        }
-        Some([c0, self.grid.index(i + 1, j), self.grid.index(i + 1, j + 1), self.grid.index(i, j + 1)])
+        Some([c0, self.grid.neighbour(c0, 1, 0)?, self.grid.neighbour(c0, 1, 1)?, self.grid.neighbour(c0, 0, 1)?])
     }
 
     /// Where the surface crosses the edge from a to b = a + e_d, as a fraction from a: the root
@@ -415,11 +411,15 @@ impl Solid {
     /// Builds the cut cells, the control volumes and the surface, and solves the surface
     /// values.
     pub(crate) fn build_cut(&self) -> Result<CutState, Error> {
+        self.build_cut_from(self.cut.as_ref())
+    }
+
+    /// As [`Solid::build_cut`], warm-starting the surface values from `prev`.
+    fn build_cut_from(&self, prev: Option<&CutState>) -> Result<CutState, Error> {
         let n = self.grid.len();
         let h = self.grid.h();
         let mut stats = CutStats::default();
 
-        let tb0 = std::time::Instant::now();
         // Crossings on every grid edge between an inside and an outside node.
         let mut cross = vec![[None::<f64>; 2]; n];
         for k in 0..n {
@@ -564,7 +564,7 @@ impl Solid {
             let (z1, z2) = (self.zeta[n1], self.zeta[n2]);
             [z1[0] + s * (z1[0] - z2[0]), z1[1] + s * (z1[1] - z2[1])]
         };
-        let previous: HashMap<(usize, usize, bool), P2> = match &self.cut {
+        let previous: HashMap<(usize, usize, bool), P2> = match prev {
             Some(prev) => prev.points.iter().map(|p| ((p.n1, p.d, p.sigma > 0.0), p.deviation)).collect(),
             None => HashMap::new(),
         };
@@ -675,7 +675,6 @@ impl Solid {
         }
         stats.valid_points = points.iter().filter(|p| p.valid).count();
 
-        let tb1 = std::time::Instant::now();
         // Surface values from the traction condition: Newton on the coupled conditions of each
         // chain of matched points (one family's points on consecutive lines), the Jacobian by
         // finite differences, banded (a point's condition involves the points up to two lines
@@ -760,9 +759,6 @@ impl Solid {
             pt.deviation = [pt.zeta[0] - lin[0], pt.zeta[1] - lin[1]];
         }
 
-        if std::env::var("MAPPED_TIMING").is_ok() {
-            eprintln!("TIMING geometry+points {:.3} surface solve {:.3} ms", (tb1 - tb0).as_secs_f64() * 1e3, tb1.elapsed().as_secs_f64() * 1e3);
-        }
         Ok(CutState { class, cells, points, lines, owner, share, area, moment, near, stats })
     }
 
@@ -988,11 +984,13 @@ impl Solid {
         self.started = true;
         let mu_e = self.settings.viscosity * rho0 * self.material.p_wave_speed() * h;
 
-        let t0 = std::time::Instant::now();
-        let mut st = self.build_cut()?;
-        let t1 = std::time::Instant::now();
+        // The cut state of the current configuration: kept from the end of the last step, or
+        // built now after a change from outside.
+        let mut st = match self.cut.take() {
+            Some(st) => st,
+            None => self.build_cut()?,
+        };
         let force = self.mapped_forces(&mut st, mu_e)?;
-        let t2 = std::time::Instant::now();
         // 3. Momentum of each control volume (lumped: ρ times its solid area).
         let mut cv = vec![0.0; n];
         for k in 0..n {
@@ -1034,7 +1032,6 @@ impl Solid {
             }
         }
         self.v = v_new;
-        self.cut = Some(st);
 
         // 4. Reference map, body, band and velocities as for the blurred boundary.
         self.advect_reference()?;
@@ -1047,15 +1044,11 @@ impl Solid {
                 return Err(Error::Diverged(format!("non-finite value at node {k} at t = {}", self.time)));
             }
         }
-        if std::env::var("MAPPED_TIMING").is_ok() {
-            let t3 = std::time::Instant::now();
-            eprintln!(
-                "TIMING build {:.3} forces {:.3} rest {:.3} ms",
-                (t1 - t0).as_secs_f64() * 1e3,
-                (t2 - t1).as_secs_f64() * 1e3,
-                (t3 - t2).as_secs_f64() * 1e3
-            );
-        }
+        // The cut state of the new configuration, for the next step and the accessors.
+        let mut next = self.build_cut_from(Some(&st))?;
+        next.stats.mapped_faces = st.stats.mapped_faces;
+        next.stats.fallback_points = st.stats.fallback_points;
+        self.cut = Some(next);
         Ok(())
     }
 
@@ -1378,17 +1371,24 @@ mod tests {
 }
 
 #[cfg(test)]
-mod probe {
+mod spectrum {
     use super::*;
     use crate::solid::Boundary;
     use crate::{Grid, Limits, Material, Settings, Shape};
+    use std::fmt::Write as _;
 
+    /// Research diagnostic: writes the Jacobian of the control-volume forces with respect to
+    /// the nodal displacements of the Lamé cylinder (mapped boundary, linear elastic, at rest
+    /// or after `SPECTRUM_STEPS` steps) for an eigenvalue analysis of the explicit step.
+    /// `SPECTRUM_H=1 SPECTRUM_OUT=jac.txt cargo test --release -p fieldcraft-eulerian
+    /// spectrum -- --ignored`.
     #[test]
-    #[ignore = "diagnostic"]
-    fn dump_jacobian() {
-        let h: f64 = std::env::var("PROBE_H").ok().and_then(|v| v.parse().ok()).unwrap_or(2.0);
-        let steps: usize = std::env::var("PROBE_STEPS").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
-        let n = (2.0 * 25.0 / h).round() as usize + 1;
+    #[ignore = "research diagnostic"]
+    fn force_jacobian() {
+        let env = |k: &str, d: f64| std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d);
+        let h = env("SPECTRUM_H", 2.0);
+        let steps = env("SPECTRUM_STEPS", 0.0) as usize;
+        let n = (50.0 / h).round() as usize + 1;
         let o = -0.5 * (n as f64 - 1.0) * h;
         let g = Grid::new(n, n, h, [o, o], [false; 2], &Limits::default()).unwrap();
         let m = Material::linear_elastic(210_000.0, 0.3, 1.0).unwrap();
@@ -1396,21 +1396,18 @@ mod probe {
         let set = Settings { damping: 0.5 * c / 20.0, boundary: Boundary::Mapped, viscosity: 0.0, ..Settings::default() };
         let mut s = Solid::new(g, m, Shape::Annulus { center: [0.0, 0.0], inner: 10.0, outer: 20.0 }, set, Limits::default()).unwrap();
         s.set_ambient_field(|x| if x[0].hypot(x[1]) < 15.0 { [-100.0, -100.0, 0.0] } else { [0.0; 3] }).unwrap();
-        if steps > 0 {
-            s.run(steps).unwrap();
-        }
+        s.run(steps).unwrap();
         s.v.iter_mut().for_each(|v| *v = [0.0; 2]);
         let mut st = s.build_cut().unwrap();
         let f0 = s.mapped_forces(&mut st, 0.0).unwrap();
-        let ks: Vec<usize> = (0..s.grid.len()).filter(|&k| s.kind[k].source() && st.owner[k] == Some(k)).collect();
         let mut cv = vec![0.0; s.grid.len()];
         for k in 0..s.grid.len() {
-            if let Some(o) = st.owner[k] {
-                cv[o] += st.area[k];
+            for (o, w) in st.share[k].into_iter().flatten() {
+                cv[o] += w * st.area[k];
             }
         }
+        let ks: Vec<usize> = (0..s.grid.len()).filter(|&k| s.kind[k].source() && st.owner[k] == Some(k)).collect();
         let mut out = String::new();
-        use std::fmt::Write as _;
         for &k in &ks {
             let x = s.grid.position(k);
             writeln!(out, "node {k} {} {} {} {}", x[0], x[1], cv[k], s.phi[k]).unwrap();
@@ -1419,7 +1416,7 @@ mod probe {
         for &k in &ks {
             for comp in 0..2 {
                 let mut t = s.clone();
-                // u = −ζ: perturb the displacement of node k and of the nodes it owns.
+                // Displace node k and the inside nodes merged into it (u = −ζ).
                 for m in 0..t.grid.len() {
                     if st.owner[m] == Some(k) && t.kind[m].source() {
                         t.zeta[m][comp] -= eps;
@@ -1432,267 +1429,6 @@ mod probe {
                 writeln!(out, "col {k} {comp} {}", col.join(" ")).unwrap();
             }
         }
-        std::fs::write(std::env::var("PROBE_OUT").unwrap_or("/tmp/jac.txt".into()), out).unwrap();
-    }
-
-    #[test]
-    #[ignore = "diagnostic"]
-    fn surface_sensitivity() {
-        let h: f64 = std::env::var("PROBE_H").ok().and_then(|v| v.parse().ok()).unwrap_or(2.0);
-        let n = (2.0 * 25.0 / h).round() as usize + 1;
-        let o = -0.5 * (n as f64 - 1.0) * h;
-        let g = Grid::new(n, n, h, [o, o], [false; 2], &Limits::default()).unwrap();
-        let m = Material::linear_elastic(210_000.0, 0.3, 1.0).unwrap();
-        let set = Settings { boundary: Boundary::Mapped, viscosity: 0.0, ..Settings::default() };
-        let mut s = Solid::new(g, m, Shape::Annulus { center: [0.0, 0.0], inner: 10.0, outer: 20.0 }, set, Limits::default()).unwrap();
-        s.set_ambient_field(|x| if x[0].hypot(x[1]) < 15.0 { [-100.0, -100.0, 0.0] } else { [0.0; 3] }).unwrap();
-        let st = s.build_cut().unwrap();
-        let ks: Vec<usize> = (0..s.grid.len()).filter(|&k| s.kind[k].source()).collect();
-        let eps = 1e-7;
-        let mut worst = vec![(0.0f64, 0usize); st.points.len()];
-        for &k in &ks {
-            let mut t = s.clone();
-            t.zeta[k][0] += eps;
-            t.cut = Some(st.clone());
-            let st2 = t.build_cut().unwrap();
-            for p in 0..st.points.len() {
-                if !st.points[p].valid {
-                    continue;
-                }
-                let dz = (st2.points[p].zeta[0] - st.points[p].zeta[0]).hypot(st2.points[p].zeta[1] - st.points[p].zeta[1]) / eps;
-                if dz > worst[p].0 {
-                    worst[p] = (dz, k);
-                }
-            }
-        }
-        for (p, pt) in st.points.iter().enumerate() {
-            if !pt.valid || pt.line > 1000 {
-                continue;
-            }
-            let x = pt.position();
-            if x[0] < 0.0 || x[1] > 0.0 || x[0].hypot(x[1]) > 15.0 {
-                continue;
-            }
-            eprintln!(
-                "pt d{} at ({:.2},{:.2}) s {:.3} n ({:.3},{:.3}) nb {:?} max dζS/dζ {:.3e} from {:?}",
-                pt.d,
-                x[0],
-                x[1],
-                pt.s,
-                pt.normal[0],
-                pt.normal[1],
-                pt.nb.map(|q| q.is_some() as u8),
-                worst[p].0,
-                s.grid.position(worst[p].1)
-            );
-        }
-    }
-
-    #[test]
-    #[ignore = "diagnostic"]
-    fn gauss_sensitivity() {
-        let h: f64 = std::env::var("PROBE_H").ok().and_then(|v| v.parse().ok()).unwrap_or(2.0);
-        let n = (2.0 * 25.0 / h).round() as usize + 1;
-        let o = -0.5 * (n as f64 - 1.0) * h;
-        let g = Grid::new(n, n, h, [o, o], [false; 2], &Limits::default()).unwrap();
-        let m = Material::linear_elastic(210_000.0, 0.3, 1.0).unwrap();
-        let set = Settings { boundary: Boundary::Mapped, viscosity: 0.0, ..Settings::default() };
-        let mut s = Solid::new(g, m, Shape::Annulus { center: [0.0, 0.0], inner: 10.0, outer: 20.0 }, set, Limits::default()).unwrap();
-        s.set_ambient_field(|x| if x[0].hypot(x[1]) < 15.0 { [-100.0, -100.0, 0.0] } else { [0.0; 3] }).unwrap();
-        let st = s.build_cut().unwrap();
-        // Gauss points of all mapped faces near the lower-right bore.
-        let mut pts = Vec::new();
-        for (c0, cell) in &st.cells {
-            let oo = s.grid.position(*c0);
-            for f in 0..4 {
-                for (a, b) in &cell.faces[f] {
-                    for (t, _) in GAUSS2 {
-                        let x = lerp([oo[0] + a[0], oo[1] + a[1]], [oo[0] + b[0], oo[1] + b[1]], t);
-                        if x[0] > 0.0 && x[1] < 0.0 && x[0].hypot(x[1]) < 15.0 {
-                            pts.push(x);
-                        }
-                    }
-                }
-            }
-        }
-        let g0: Vec<Option<Tensor>> = pts.iter().map(|&x| s.reconstruct(&st, x)).collect();
-        let ks: Vec<usize> = (0..s.grid.len()).filter(|&k| s.kind[k].source()).collect();
-        let eps = 1e-6;
-        let mut worst = vec![(0.0f64, 0usize); pts.len()];
-        for &k in &ks {
-            let mut t = s.clone();
-            t.zeta[k][0] += eps;
-            t.cut = Some(st.clone());
-            let st2 = t.build_cut().unwrap();
-            for (i, &x) in pts.iter().enumerate() {
-                if let (Some(a), Some(b)) = (g0[i], t.reconstruct(&st2, x)) {
-                    let d = (0..2).flat_map(|r| (0..2).map(move |c| (r, c))).map(|(r, c)| (b[r][c] - a[r][c]).abs()).fold(0.0, f64::max) / eps * h;
-                    if d > worst[i].0 {
-                        worst[i] = (d, k);
-                    }
-                }
-            }
-        }
-        if let Ok(v) = std::env::var("EXPLAIN") {
-            let c: Vec<f64> = v.split(',').filter_map(|z| z.parse().ok()).collect();
-            if let Some(i) = pts.iter().position(|x| (x[0] - c[0]).abs() < 0.02 && (x[1] - c[1]).abs() < 0.02) {
-                let x = pts[i];
-                let a = g0[i].unwrap();
-                eprintln!("grad {a:?}");
-                for q in 0..st.points.len() {
-                    if !st.points[q].valid {
-                        continue;
-                    }
-                    let mut st2 = st.clone();
-                    st2.points[q].zeta[0] += 1e-6;
-                    if let Some(b) = s.reconstruct(&st2, x) {
-                        let d =
-                            (0..2).flat_map(|r| (0..2).map(move |c| (r, c))).map(|(r, c)| (b[r][c] - a[r][c]).abs()).fold(0.0, f64::max) / 1e-6 * h;
-                        if d > 1e-9 {
-                            eprintln!("  dζS({:?}) -> {d:.3e}", st.points[q].position());
-                        }
-                    }
-                }
-                for &k in &ks {
-                    let mut t = s.clone();
-                    t.zeta[k][0] += 1e-6;
-                    if let Some(b) = t.reconstruct(&st, x) {
-                        let d =
-                            (0..2).flat_map(|r| (0..2).map(move |c| (r, c))).map(|(r, c)| (b[r][c] - a[r][c]).abs()).fold(0.0, f64::max) / 1e-6 * h;
-                        if d > 1e-9 {
-                            eprintln!("  dζ({:?}) direct -> {d:.3e}", s.grid.position(k));
-                        }
-                    }
-                }
-            }
-        }
-        for (i, x) in pts.iter().enumerate() {
-            eprintln!(
-                "gauss ({:.2},{:.2}) {} max h·d∇ζ/dζ {:.3e} from {:?}",
-                x[0],
-                x[1],
-                if g0[i].is_some() { "map" } else { "NONE" },
-                worst[i].0,
-                s.grid.position(worst[i].1)
-            );
-        }
-    }
-
-    #[test]
-    #[ignore = "diagnostic"]
-    fn discrete_switches() {
-        let h: f64 = std::env::var("PROBE_H").ok().and_then(|v| v.parse().ok()).unwrap_or(1.0);
-        let warm: usize = std::env::var("PROBE_STEPS").ok().and_then(|v| v.parse().ok()).unwrap_or(1500);
-        let n = (2.0 * 25.0 / h).round() as usize + 1;
-        let o = -0.5 * (n as f64 - 1.0) * h;
-        let g = Grid::new(n, n, h, [o, o], [false; 2], &Limits::default()).unwrap();
-        let m = Material::neo_hookean(210_000.0, 0.3, 1.0).unwrap();
-        let c = m.p_wave_speed();
-        let set = Settings { damping: 0.5 * c / 20.0, boundary: Boundary::Mapped, ..Settings::default() };
-        let mut s = Solid::new(g, m, Shape::Annulus { center: [0.0, 0.0], inner: 10.0, outer: 20.0 }, set, Limits::default()).unwrap();
-        s.set_ambient_field(|x| if x[0].hypot(x[1]) < 15.0 { [-100.0, -100.0, 0.0] } else { [0.0; 3] }).unwrap();
-        s.run(warm).unwrap();
-        let sig = |s: &Solid, st: &CutState| -> Vec<String> {
-            let mut out = Vec::new();
-            for (c0, cell) in &st.cells {
-                let x = s.grid.position(*c0);
-                out.push(format!(
-                    "cell ({},{}) arcs {} faces {:?} qarcs {:?}",
-                    x[0],
-                    x[1],
-                    cell.arcs.len(),
-                    cell.faces.iter().map(|f| f.len()).collect::<Vec<_>>(),
-                    cell.quarter_arcs.iter().map(|f| f.len()).collect::<Vec<_>>()
-                ));
-            }
-            for p in &st.points {
-                out.push(format!("pt {:?} d{} valid {} nb {:?}", s.grid.position(p.n1), p.d, p.valid, p.nb));
-            }
-            for k in 0..s.grid.len() {
-                if st.owner[k].is_some() && st.owner[k] != Some(k) {
-                    out.push(format!("owner {:?} -> {:?}", s.grid.position(k), st.owner[k].map(|o| s.grid.position(o))));
-                }
-            }
-            out
-        };
-        let mut prev: Option<Vec<String>> = None;
-        for step in 0..400 {
-            let st = match s.build_cut() {
-                Ok(st) => st,
-                Err(e) => {
-                    eprintln!("step {step}: {e}");
-                    break;
-                }
-            };
-            let now = sig(&s, &st);
-            if let Some(p) = &prev {
-                for (a, b) in p.iter().zip(now.iter()) {
-                    if a != b {
-                        eprintln!("step {step}: {a}  =>  {b}");
-                    }
-                }
-                if p.len() != now.len() {
-                    eprintln!("step {step}: length {} -> {}", p.len(), now.len());
-                }
-            }
-            prev = Some(now);
-            if let Err(e) = s.run(1) {
-                eprintln!("step {step}: {e}");
-                break;
-            }
-        }
-    }
-
-    #[test]
-    #[ignore = "diagnostic"]
-    fn probe_drift() {
-        let h = 1.0;
-        let n = (2.0 * 25.0 / h) as usize + 1;
-        let o = -0.5 * (n as f64 - 1.0) * h;
-        let g = Grid::new(n, n, h, [o, o], [false; 2], &Limits::default()).unwrap();
-        let m = Material::neo_hookean(210_000.0, 0.3, 1.0).unwrap();
-        let c = m.p_wave_speed();
-        let set = Settings { damping: 0.5 * c / 20.0, boundary: Boundary::Mapped, ..Settings::default() };
-        let mut s = Solid::new(g, m, Shape::Annulus { center: [0.0, 0.0], inner: 10.0, outer: 20.0 }, set, Limits::default()).unwrap();
-        s.set_ambient_field(|x| if x[0].hypot(x[1]) < 15.0 { [-100.0, -100.0, 0.0] } else { [0.0; 3] }).unwrap();
-        s.run(2500).unwrap();
-        let k = (0..s.grid.len())
-            .filter(|&k| s.kind[k].source())
-            .max_by(|&a, &b| s.v[a][0].hypot(s.v[a][1]).total_cmp(&s.v[b][0].hypot(s.v[b][1])))
-            .unwrap();
-        eprintln!("fastest node {:?} v {:?}", s.grid.position(k), s.v[k]);
-        let mut st = s.build_cut().unwrap();
-        let f0 = s.mapped_forces(&mut st, 0.0).unwrap();
-        eprintln!("force {:?} area {} owner {:?}", f0[k], st.area[k], st.owner[k]);
-        let ks: Vec<usize> = (0..s.grid.len()).filter(|&m| s.kind[m].source()).collect();
-        for c in 0..2 {
-            let mut t = s.clone();
-            t.zeta[k][c] += 1e-6;
-            let mut st2 = t.build_cut().unwrap();
-            let f1 = t.mapped_forces(&mut st2, 0.0).unwrap();
-            let mut big: Vec<(f64, usize)> = ks.iter().map(|&m| (((f1[m][0] - f0[m][0]).hypot(f1[m][1] - f0[m][1])) / 1e-6, m)).collect();
-            big.sort_by(|a, b| b.0.total_cmp(&a.0));
-            eprintln!("dζ{c}: own dF {:?}", [(f1[k][0] - f0[k][0]) / 1e-6, (f1[k][1] - f0[k][1]) / 1e-6]);
-            for (v, m) in big.iter().take(6) {
-                eprintln!("   |dF| {v:.3e} at {:?}", s.grid.position(*m));
-            }
-        }
-        // Reverse: which ζ influence F at k.
-        let mut infl = Vec::new();
-        for &m in &ks {
-            let x = s.grid.position(m);
-            let xk = s.grid.position(k);
-            if (x[0] - xk[0]).abs() > 3.5 || (x[1] - xk[1]).abs() > 3.5 {
-                continue;
-            }
-            let mut t = s.clone();
-            t.zeta[m][0] += 1e-6;
-            let mut st2 = t.build_cut().unwrap();
-            let f1 = t.mapped_forces(&mut st2, 0.0).unwrap();
-            infl.push((x, (f1[k][0] - f0[k][0]) / 1e-6, (f1[k][1] - f0[k][1]) / 1e-6));
-        }
-        for (x, a, b) in infl {
-            eprintln!("  dF_k/dζx({:?}) = [{a:.3e}, {b:.3e}]", x);
-        }
+        std::fs::write(std::env::var("SPECTRUM_OUT").unwrap_or_else(|_| "jacobian.txt".into()), out).unwrap();
     }
 }

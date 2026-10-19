@@ -133,7 +133,8 @@ fn main() {
     let o = -0.5 * (n as f64 - 1.0) * h;
     let g = Grid::new(n, n, h, [o, o], [false; 2], &Limits::default()).unwrap();
     let c = mat.p_wave_speed();
-    let settings = Settings { damping: damp * 0.5 * c / b, cfl, viscosity: visc, boundary, ..Settings::default() };
+    let layers: usize = get("layers", "4").parse().unwrap();
+    let settings = Settings { damping: damp * 0.5 * c / b, cfl, viscosity: visc, boundary, band_layers: layers, ..Settings::default() };
     let mut s = Solid::new(g, mat, Shape::Annulus { center: [0.0, 0.0], inner: a, outer: b }, settings, Limits::default()).unwrap();
     match case.as_str() {
         "disc" => s.set_body_force(move |x| [load * RW2 * x[0], load * RW2 * x[1]]).unwrap(),
@@ -225,6 +226,8 @@ fn main() {
     let mut first_a = (f64::NAN, f64::NAN);
     let mut nodes_csv = String::from("x,y,kind,phi,ux,uy,sxx,syy,sxy\n");
     let mut kirsch_node_err: f64 = 0.0;
+    // σθ at the first solid node above the hole on the y axis (θ = 90°).
+    let mut kirsch_node_peak = (f64::NAN, f64::NAN, f64::NAN);
     for k in 0..s.grid().len() {
         let x = s.grid().position(k);
         let kind = s.kind(k);
@@ -263,6 +266,11 @@ fn main() {
         if (r - 15.0).abs() < 0.5 * h {
             hoop += stt;
             nh += 1.0;
+        }
+        if case == "kirsch" && x[0].abs() < 1e-9 && x[1] > 0.0 && (kirsch_node_peak.0.is_nan() || r < kirsch_node_peak.0) {
+            let ex = kirsch_stress(x);
+            let (_, et, _) = polar([ex[0], ex[1], ex[2], 0.0], x);
+            kirsch_node_peak = (r, stt, et);
         }
         if case == "kirsch" && r < a + 1.5 * h {
             let ex = kirsch_stress(x);
@@ -362,11 +370,14 @@ fn main() {
     if case == "kirsch" {
         write!(
             out,
-            ",\"kirsch_peak\":{:.4},\"kirsch_peak_err\":{:.5},\"kirsch_rms\":{:.5},\"kirsch_node_maxerr\":{:.5}",
+            ",\"kirsch_peak\":{:.4},\"kirsch_peak_err\":{:.5},\"kirsch_rms\":{:.5},\"kirsch_node_maxerr\":{:.5},\"kirsch_node_r\":{:.4},\"kirsch_node_stt\":{:.4},\"kirsch_node_exact\":{:.4}",
             kirsch_peak.1,
             100.0 * (kirsch_peak.1 - 3.0 * S_FAR) / (3.0 * S_FAR),
             (kirsch_rms.0 / kirsch_rms.1.max(1.0)).sqrt() / (3.0 * S_FAR) * 100.0,
-            100.0 * kirsch_node_err
+            100.0 * kirsch_node_err,
+            kirsch_node_peak.0,
+            kirsch_node_peak.1,
+            kirsch_node_peak.2
         )
         .unwrap();
     }

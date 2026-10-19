@@ -310,6 +310,7 @@ impl Solid {
             self.linear_fills = 0;
             self.sharp_fill();
         }
+        self.cut = None;
         Ok(())
     }
 
@@ -344,6 +345,7 @@ impl Solid {
     /// extrapolating it, to measure how much a result depends on the extrapolation.
     pub fn set_exterior_map(&mut self, zeta: impl Fn([f64; 2]) -> [f64; 2] + Send + Sync + 'static) -> Result<(), Error> {
         self.exterior = Some(Field(Arc::new(zeta)));
+        self.cut = None;
         self.rebuild()
     }
 
@@ -355,6 +357,7 @@ impl Solid {
                 self.v_live[k] = true;
             }
         }
+        self.cut = None;
     }
 
     /// The grid.
@@ -478,6 +481,7 @@ impl Solid {
             self.advect_reference()?;
             self.time += self.dt;
             self.rebuild()?;
+            self.cut = None;
             // The velocity is prescribed everywhere known.
             for k in 0..self.grid.len() {
                 self.v_live[k] = self.kind[k].known();
