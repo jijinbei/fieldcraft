@@ -168,6 +168,58 @@ keeps velocity and ξ at grid nodes for that reason.
   dynamic relaxation to reach a static answer; it is not a substitute for the FEM solver for
   statics, only a route to FSI with large solid motion.
 
+## 7. The prototype and its verification
+
+`crates/eulerian` (`fieldcraft-eulerian`, layer 2, no command yet): 2D plane strain on a
+regular grid, f64, sequential and deterministic, no panics, capped sizes and step counts.
+
+- Nodes carry ζ = ξ − x (periodic when the motion is) and v — the nodes a lattice will share.
+- F on cell edges from compact differences; ∇·σ at nodes from the four edges.
+- Blurred surface (ε = 1.5 h, the smoothed Heaviside of the 2020 paper); outside the body a
+  prescribed *ambient stress* (0 for a free surface, −p I in a pressurised bore, any field), so
+  surface tractions are σ_ambient·n with no surface tracking.
+- φ = φ₀(ξ) (Valkov et al.), band of four 8-neighbour rings rebuilt each step by a weighted
+  linear least-squares fit using only earlier rings (independent of node order, mirror
+  symmetric). Band nodes with φ < 0 become solid (material entering a cell).
+- Second-order one-sided upwind advection (first order next to unknown nodes); central
+  differences in time (v at half steps), Δt = 0.4 h / c_P; artificial viscosity
+  μ_e = κ ρ c_P h (κ = 0.1 by default); implicit mass-proportional damping for statics.
+- Compressible neo-Hookean (Bonet & Wood) and small-strain linear elasticity.
+
+Verification (`crates/eulerian/tests/verification.rs`):
+
+| check | reference | resolution | result | tolerance |
+|---|---|---|---|---|
+| rigid translation, body crossing > 5 cells | ξ = x − vt, σ = 0 | h = 0.05 | ξ, v exact to 1e-11, ‖σ‖ < 1e-8 | 1e-11 / 1e-8 |
+| rigid rotation by π/4 (prescribed velocity) | ξ = R(−θ)x, σ = 0 | h = 0.05 / 0.025 | max ‖ξ error‖ 4.7e-4 → 2.4e-4; max ‖σ‖/μ 3.4e-3 → 1.7e-3 (first order: the explicit update of ξ) | < 2e-3, ratio < 0.6 |
+| uniaxial stretch s = 1.25, neo-Hookean | σxx = μ(s²−1)/s + λ ln s/s, σyy = λ ln s/s | h = 0.05 | exact to 1e-9 relative, block stays at rest | 1e-9 |
+| simple shear γ = 0.3, neo-Hookean | σxx = μγ², σxy = μγ, σyy = 0 | h = 0.05 | exact to 1e-9, at rest | 1e-9 |
+| free block under traction T, T/E = 1e-4 | εxx = T(1−ν²)/E, εyy = −Tν(1+ν)/E | h = 0.1 | linear: 9.0992e-5 / −3.9002e-5 (exact 9.1e-5 / −3.9e-5); neo-Hookean within 5.2e-5 relative | 1e-4 / 5e-4 |
+| P-wave, periodic standing wave | √((λ+2μ)/ρ) = 11.6024 | 16 / 32 nodes per wavelength | 11.5395 / 11.5867 (−0.54 % / −0.14 %, second order) | 1 % / 0.25 %, ratio < 0.35 |
+| S-wave | √(μ/ρ) = 6.2017 | 16 / 32 | 6.1638 / 6.1922 (−0.61 % / −0.15 %) | same |
+| thick cylinder, plane strain (a = 10, b = 20, p = 100, E = 210000, ν = 0.3) | Lamé; FieldCraft FEM (quad8, oracle `lame-cylinder-plane-strain`) u_r(a) = 0.0090793 | h = 1 / 0.5 (10 / 20 nodes across the wall) | u_r(a) 0.008088 / 0.008789 (−10.9 % / −3.2 %); u_r(15) −11.2 % / −3.3 %; σθ(15) 81.9 / 89.3 vs 92.6 (−11.6 % / −3.5 %) | 15 % / 4 %, ratio < 0.4 |
+
+u_r(a) is evaluated from a fit u_r = A r + B/r over the nodes with φ < −2h; the FEM gets the
+same number to 3e-6 on a 8 × 16 quad8 quarter.
+
+Where it falls short:
+- **The free surface.** Homogeneous states are exact (linear fields are reproduced by every
+  stencil and by the extrapolation). With a curved surface and a strain gradient across it,
+  the blur zone makes the ring too stiff: −11 % with ten nodes across the wall, −3.2 % with
+  twenty (observed order ≈ 1.8, as the incompressible paper reports for its FSI tests). A wider
+  blur is stiffer (ε = 1.0 h: −8.5 %; 2.5 h: −16.8 % at h = 1). Stresses at the surface itself
+  are not usable; the numbers above are a node layer or more inside.
+- **Extrapolation** is linear: first-order wrong where the strain varies, and its fit needs
+  three non-collinear nodes, so features thinner than about two cells are not represented.
+- **Statics by relaxation.** The cylinder takes 1200 steps (2601 nodes) at h = 1 and about
+  4000 steps (10201 nodes) at h = 0.5 to come to rest; the FEM solves the same problem with one
+  sparse factorisation of under a thousand unknowns, more accurately. For a solid alone the RMT is
+  not competitive with the FEM; its case is FSI with large solid motion on the fluid's grid.
+- **Rotation** is transported with a first-order time error (explicit update of ξ with the
+  current ∇ξ); second order in time would need a predictor–corrector or an RK stage.
+- Not done: 3D, threads, contact between bodies, prescribed moving boundaries, the
+  incompressible law the LBRMT uses, the LB coupling (step 3).
+
 ## Papers
 
 All read from the open-access versions listed; journal details checked against the published

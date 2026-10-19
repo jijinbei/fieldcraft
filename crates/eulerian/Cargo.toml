@@ -1,0 +1,12 @@
+[package]
+name = "fieldcraft-eulerian"
+description = "FieldCraft's Eulerian solid prototype: the reference map technique on a fixed 2D grid (plane strain, compressible neo-Hookean and linear elastic), the research step towards solids on the lattice Boltzmann grid"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+thiserror = { workspace = true }

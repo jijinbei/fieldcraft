@@ -51,6 +51,7 @@ pub const TABLE: &[(&str, Class)] = &[
     ("solver", Class::Layer(2)),
     ("explicit", Class::Layer(2)),
     ("lbm", Class::Layer(2)),
+    ("eulerian", Class::Layer(2)),
     // L3: coupling between solvers (`fsi`, later).
     // L4 and up: the document, files, commands, UI.
     ("doc", Class::Layer(4)),

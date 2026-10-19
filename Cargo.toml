@@ -22,6 +22,7 @@ fieldcraft-fem = { path = "crates/fem" }
 fieldcraft-solver = { path = "crates/solver" }
 fieldcraft-explicit = { path = "crates/explicit" }
 fieldcraft-lbm = { path = "crates/lbm" }
+fieldcraft-eulerian = { path = "crates/eulerian" }
 fieldcraft-engine = { path = "crates/engine" }
 fieldcraft-testkit = { path = "crates/testkit" }
 fieldcraft-render = { path = "crates/render" }
@@ -103,6 +104,10 @@ opt-level = 3
 [profile.dev.package.fieldcraft-solver]
 opt-level = 3
 
+# The Eulerian solid prototype relaxes grids to equilibrium in its verification tests.
+[profile.dev.package.fieldcraft-eulerian]
+opt-level = 3
+
 # Tests and lints (`cargo xtask ci`, GitHub CI). Debug assertions are off because truck's
 # debug-only checks reject valid geometry (SolidCraft builds its tests the same way).
 [profile.ci]
@@ -123,6 +128,9 @@ opt-level = 3
 opt-level = 3
 
 [profile.ci.package.fieldcraft-solver]
+opt-level = 3
+
+[profile.ci.package.fieldcraft-eulerian]
 opt-level = 3
 
 [profile.release]

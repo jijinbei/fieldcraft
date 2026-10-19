@@ -1335,6 +1335,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "fieldcraft-eulerian"
+version = "0.7.0"
+dependencies = [
+ "thiserror 2.0.21",
+]
+
+[[package]]
 name = "fieldcraft-explicit"
 version = "0.7.0"
 dependencies = [
