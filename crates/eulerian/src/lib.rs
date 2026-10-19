@@ -19,6 +19,8 @@
 //! - [`statics`] and [`multigrid`]: static equilibrium of the mapped boundary by Newton–Krylov
 //!   (finite-difference Jacobian products, GMRES, a geometric multigrid preconditioner) with
 //!   load continuation, instead of dynamic relaxation.
+//! - [`refine`]: local refinement near the surface — nested levels (a balanced quadtree stored
+//!   level by level), conservative coarse–fine fluxes, subcycling in time, regridding.
 //!
 //! The scheme, in our own implementation from the published equations:
 //! - fields at nodes (the nodes a lattice Boltzmann fluid will share later): the reference map
@@ -74,6 +76,7 @@ pub mod grid;
 pub mod mapped;
 pub mod material;
 pub mod multigrid;
+pub mod refine;
 pub mod shape;
 mod sharp;
 pub mod solid;
@@ -83,6 +86,7 @@ pub use grid::Grid;
 pub use mapped::{CutStats, CutView, SurfaceSample};
 pub use material::Material;
 pub use multigrid::MultigridStats;
+pub use refine::{Hierarchy, NodeRef, Refinement, ResidualEntry, Role};
 pub use shape::Shape;
 pub use solid::{Boundary, NodeKind, Relaxation, Settings, Solid};
 pub use statics::{LinearTest, NewtonStep, PreconditionerMatrix, StaticReport, StaticSettings, StaticTimes};
