@@ -97,11 +97,17 @@ pub struct Refinement {
     /// Coarse steps between regrids in [`Hierarchy::run`] (0: never; the surface must not
     /// leave the finest band in between).
     pub regrid_every: usize,
+    /// Subcycling: each level steps twice per step of the coarser one (the default). Without,
+    /// every level takes the finest level's time step (for comparison).
+    pub subcycle: bool,
+    /// Hanging nodes interpolated cubically along the interface (the default); else linearly
+    /// between their two masters (the transpose of the force sharing; for comparison).
+    pub cubic_hanging: bool,
 }
 
 impl Default for Refinement {
     fn default() -> Self {
-        Refinement { levels: 2, band: 6.0, nesting: 2, base_margin: 6.0, region: None, regrid_every: 0 }
+        Refinement { levels: 2, band: 6.0, nesting: 2, base_margin: 6.0, region: None, regrid_every: 0, subcycle: true, cubic_hanging: true }
     }
 }
 
@@ -114,6 +120,8 @@ impl std::fmt::Debug for Refinement {
             .field("base_margin", &self.base_margin)
             .field("region", &self.region.is_some())
             .field("regrid_every", &self.regrid_every)
+            .field("subcycle", &self.subcycle)
+            .field("cubic_hanging", &self.cubic_hanging)
             .finish()
     }
 }
@@ -302,6 +310,10 @@ struct Level {
     tv_old: f64,
     v_sum: Vec<[f64; 2]>,
     sums: usize,
+    /// The coarse force at each link in the last step (for the register's extrapolation).
+    reg_prev: Vec<[f64; 2]>,
+    /// Whether that force came from a full step.
+    reg_prev_started: bool,
 }
 
 /// A degree of freedom of the composite grid.
@@ -371,9 +383,9 @@ pub struct Hierarchy {
     updates: u64,
     steps: usize,
     regrids: usize,
-    /// Σ of the impulses on all degrees of freedom and Σ of their magnitudes, from the last
-    /// coarse step (a conservation audit).
-    audit: ([f64; 2], f64),
+    /// Σ of the impulses on all degrees of freedom, Σ of their magnitudes, and the impulse of
+    /// the registers' extrapolation in time, from the last coarse step (a conservation audit).
+    audit: ([f64; 2], f64, [f64; 2]),
 }
 
 fn wrap(i: isize, n: usize, periodic: bool) -> Option<usize> {
@@ -451,7 +463,7 @@ impl Hierarchy {
             updates: 0,
             steps: 0,
             regrids: 0,
-            audit: ([0.0; 2], 0.0),
+            audit: ([0.0; 2], 0.0, [0.0; 2]),
         };
         hi.set_motion(|x| (x, [0.0, 0.0]))?;
         Ok(hi)
@@ -754,11 +766,13 @@ impl Hierarchy {
                 // The value: Lagrange through the masters and the further nodes on the line
                 // that this level advances.
                 let mut pts: Vec<(f64, usize)> = vec![(-1.0, a), (1.0, b)];
-                if let Some(m) = at(-3, &dof) {
-                    pts.push((-3.0, m));
-                }
-                if let Some(m) = at(3, &dof) {
-                    pts.push((3.0, m));
+                if self.refinement.cubic_hanging {
+                    if let Some(m) = at(-3, &dof) {
+                        pts.push((-3.0, m));
+                    }
+                    if let Some(m) = at(3, &dof) {
+                        pts.push((3.0, m));
+                    }
                 }
                 let mut value = Vec::with_capacity(pts.len());
                 for (p, &(xp, m)) in pts.iter().enumerate() {
@@ -927,6 +941,10 @@ impl Hierarchy {
             solid.extrapolate_velocity();
             solid.started = started;
             solid.time = time;
+            if !self.refinement.subcycle {
+                // Every level at the finest level's step.
+                solid.dt /= (1u64 << (self.refinement.levels - levels.len().min(self.refinement.levels))) as f64;
+            }
             solid.cut = None;
             let zeta_old = solid.zeta.clone();
             let v_old = solid.v.clone();
@@ -943,6 +961,8 @@ impl Hierarchy {
                 tv_old: 0.0,
                 v_sum: vec![[0.0; 2]; n],
                 sums: 0,
+                reg_prev: Vec::new(),
+                reg_prev_started: false,
             });
         }
         Ok(levels)
@@ -1095,7 +1115,10 @@ impl Hierarchy {
             let lv = &self.levels[l];
             (0..lv.role.len()).map(|k| lv.role[k].dof() && lv.solid.kind[k].source()).collect()
         };
-        self.levels[l].solid.step_mapped()?;
+        self.levels[l].solid.step_mapped().map_err(|e| match e {
+            Error::Diverged(m) => Error::Diverged(format!("level {l}: {m}")),
+            e => e,
+        })?;
         self.update_hanging(l);
         {
             let lv = &self.levels[l];
@@ -1116,22 +1139,40 @@ impl Hierarchy {
             return Ok(());
         }
         // The flux register: the force of the coarse leaves on each interface node, applied to
-        // the finer level's master through its substeps (two kicks of dt/2 sum to the coarse
-        // kick, so the impulses match; in the very first step the leapfrog start offsets the two
-        // levels' half-step times by a quarter coarse step, which shows as a one-off difference),
-        // and the coarse side's solid area.
-        let regs: Vec<(usize, [f64; 2], f64)> = {
+        // the finer level's master at each of its kicks, and the coarse side's solid area. The
+        // coarse kick at tⁿ stands for the force over [tⁿ − Δt/2, tⁿ + Δt/2]; the fine kicks at
+        // tⁿ and tⁿ + Δt/2 for [tⁿ − Δt/4, tⁿ + 3Δt/4]. Holding Fⁿ through both would lag the
+        // coupling by a quarter coarse step (a first-order error: a P wave reflects in
+        // proportion to h/λ); the register is extrapolated in time from the last two coarse
+        // forces instead, F(tⁿ + sΔt) = Fⁿ + s (Fⁿ − Fⁿ⁻¹). The impulse that adds over a coarse
+        // step, (Δt/4)(Fⁿ − Fⁿ⁻¹), is momentum in transit between the two levels' leapfrog
+        // clocks: it telescopes, (Δt/4)(Fᴺ − F⁰) in all, and never accumulates.
+        let regs: Vec<(usize, [f64; 2], [f64; 2], f64)> = {
             let lv = &self.levels[l];
             match &lv.solid.level {
-                Some(h) => lv.links.iter().map(|&(k, m)| (m, h.force[k], h.area[k])).collect(),
+                Some(h) => lv
+                    .links
+                    .iter()
+                    .enumerate()
+                    .map(|(i, &(k, m))| {
+                        let prev =
+                            if lv.solid.started && lv.reg_prev.len() == lv.links.len() && lv.reg_prev_started { lv.reg_prev[i] } else { h.force[k] };
+                        (m, h.force[k], prev, h.area[k])
+                    })
+                    .collect(),
                 None => Vec::new(),
             }
         };
         {
+            let lv = &mut self.levels[l];
+            lv.reg_prev = regs.iter().map(|r| r.1).collect();
+            // A force from a half kick (the first step) is not a full step's sample.
+            lv.reg_prev_started = kick == lv.solid.dt;
+        }
+        {
             let fine = &mut self.levels[l + 1];
             if let Some(h) = fine.solid.level.as_mut() {
-                for (m, f, a) in regs {
-                    h.ext_force[m] = f;
+                for &(m, _, _, a) in &regs {
                     h.ext_area[m] = a;
                 }
             }
@@ -1140,10 +1181,24 @@ impl Hierarchy {
         }
         let (t_old, t_new) = (self.levels[l].t_old, self.levels[l].solid.time);
         let (tv_old, tv_new) = (self.levels[l].tv_old, Self::v_time(&self.levels[l].solid));
-        for _ in 0..2 {
+        let ratio = if self.refinement.subcycle { 2 } else { 1 };
+        for _ in 0..ratio {
             let f = &self.levels[l + 1].solid;
             let theta = if t_new > t_old { (f.time - t_old) / (t_new - t_old) } else { 1.0 };
             let theta_v = if tv_new > tv_old { (Self::v_time(f) - tv_old) / (tv_new - tv_old) } else { 1.0 };
+            let fine_kick = Self::kick(f);
+            {
+                let fine = &mut self.levels[l + 1];
+                if let Some(h) = fine.solid.level.as_mut() {
+                    for &(m, fnow, fprev, _) in &regs {
+                        for c in 0..2 {
+                            let e = fnow[c] + theta * (fnow[c] - fprev[c]);
+                            h.ext_force[m][c] = e;
+                            self.audit.2[c] += fine_kick * (e - fnow[c]);
+                        }
+                    }
+                }
+            }
             self.fill_ghosts(l + 1, theta, theta_v);
             self.advance(l + 1)?;
             let fine = &mut self.levels[l + 1];
@@ -1385,7 +1440,7 @@ impl Hierarchy {
             return Err(Error::TooLarge(format!("{steps} steps, the cap is {}", self.limits.max_steps)));
         }
         for _ in 0..steps {
-            self.audit = ([0.0; 2], 0.0);
+            self.audit = ([0.0; 2], 0.0, [0.0; 2]);
             self.advance(0)?;
             self.steps += 1;
             if self.refinement.regrid_every > 0 && self.steps.is_multiple_of(self.refinement.regrid_every) {
@@ -1493,8 +1548,10 @@ impl Hierarchy {
     }
 
     /// The impulse audit of the last coarse step: (Σ impulse on all degrees of freedom,
-    /// Σ |impulse|). The first is zero to round-off for a free body without loads.
-    pub fn impulse_audit(&self) -> ([f64; 2], f64) {
+    /// Σ |impulse|, the part of the first from the registers' extrapolation in time). For a
+    /// free body without loads the first equals the third to round-off, and the third
+    /// telescopes over the steps (momentum in transit between the levels' clocks).
+    pub fn impulse_audit(&self) -> ([f64; 2], f64, [f64; 2]) {
         self.audit
     }
 

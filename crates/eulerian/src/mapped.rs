@@ -889,7 +889,8 @@ impl Solid {
     fn geometry_full(&self, frozen: Option<&Topology>) -> Result<Geometry, Error> {
         let n = self.grid.len();
         let h = self.grid.h();
-        // Crossings on every grid edge between an inside and an outside node.
+        // Crossings on every grid edge between an inside and an outside node (on a level of a
+        // refined hierarchy, the edges of its own leaf cells: the surface lives there).
         let mut cross_at = vec![[None::<usize>; 2]; n];
         let mut cross = Vec::new();
         let mut cross_t = Vec::new();
@@ -897,6 +898,7 @@ impl Solid {
             for k in 0..n {
                 if let Some(b) = self.along(k, d, 1)
                     && self.inside(k) != self.inside(b)
+                    && (self.level.is_none() || self.own_cell(k) || self.along(k, 1 - d, -1).is_some_and(|m| self.own_cell(m)))
                 {
                     cross_at[k][d] = Some(cross.len());
                     cross.push((k, d));

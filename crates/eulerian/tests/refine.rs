@@ -129,11 +129,14 @@ fn coarse_fine_fluxes_conserve_momentum() {
     let mut h = refined(2, 0.1, disc(), m);
     h.set_motion(|x| ([x[0] + 1e-3 * (3.0 * x[1]).sin(), x[1] - 2e-3 * (2.0 * x[0] + x[1]).cos()], [0.0, 0.0])).unwrap();
     h.run(1).unwrap();
-    for _ in 0..5 {
+    let mut transit = [0.0; 2];
+    for _ in 0..20 {
         h.run(1).unwrap();
-        let (sum, scale) = h.impulse_audit();
-        eprintln!("impulse {sum:?} of {scale:.3e}");
-        assert!(scale > 0.0 && sum[0].abs() < 1e-12 * scale && sum[1].abs() < 1e-12 * scale, "{sum:?} {scale}");
+        let (sum, scale, tr) = h.impulse_audit();
+        let net = [sum[0] - tr[0], sum[1] - tr[1]];
+        transit = [transit[0] + tr[0], transit[1] + tr[1]];
+        eprintln!("impulse {net:?} of {scale:.3e}, in transit {transit:?}");
+        assert!(scale > 0.0 && net[0].abs() < 1e-12 * scale && net[1].abs() < 1e-12 * scale, "{net:?} {scale}");
     }
     // The static residual sums to zero too.
     let res = h.residual().unwrap();
