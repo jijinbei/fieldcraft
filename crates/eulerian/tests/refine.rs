@@ -140,3 +140,67 @@ fn coarse_fine_fluxes_conserve_momentum() {
     let (fx, fy, mag) = res.iter().fold((0.0, 0.0, 0.0), |a, r| (a.0 + r.force[0], a.1 + r.force[1], a.2 + r.force[0].abs() + r.force[1].abs()));
     assert!(fx.abs() < 1e-12 * mag && fy.abs() < 1e-12 * mag, "{fx} {fy} {mag}");
 }
+
+/// A disc translating rigidly across the grid with regrids every few steps (the refined band
+/// follows the surface): ζ, v and σ stay exact to round-off at every degree of freedom.
+#[test]
+fn rigid_translation_through_regrids_is_exact() {
+    let m = Material::neo_hookean(100.0, 0.3, 1.0).unwrap();
+    let r = Refinement { levels: 2, band: 4.0, regrid_every: 4, ..Refinement::default() };
+    let mut s = Hierarchy::new(centred_grid(31, 0.1), m, disc(), mapped(), r, Limits::default()).unwrap();
+    let v = [0.7, -0.4];
+    s.set_motion(|x| (x, v)).unwrap();
+    let before = s.stats();
+    s.run(120).unwrap();
+    let t = s.time();
+    let after = s.stats();
+    eprintln!("moved {:.3} in {} regrids; nodes {:?} -> {:?}", t * v[0], after.regrids, before.nodes, after.nodes);
+    assert!(t * v[0] > 0.25 && after.regrids == 30, "{t} {after:?}");
+    let (mut ex, mut ev, mut es): (f64, f64, f64) = (0.0, 0.0, 0.0);
+    for n in s.dofs() {
+        let sol = s.level(n.level).unwrap();
+        let x = n.position;
+        let xi = sol.reference(n.index).unwrap();
+        ex = ex.max((xi[0] - (x[0] - v[0] * t)).abs()).max((xi[1] - (x[1] - v[1] * t)).abs());
+        let vel = sol.velocity(n.index).unwrap();
+        ev = ev.max((vel[0] - v[0]).abs()).max((vel[1] - v[1]).abs());
+        es = es.max(s.stress(&n).unwrap().iter().fold(0.0f64, |a, c| a.max(c.abs())));
+    }
+    eprintln!("errors: ξ {ex:.2e}, v {ev:.2e}, σ {es:.2e}");
+    assert!(ex < 1e-10 && ev < 1e-8 && es < 1e-6, "ξ {ex}, v {ev}, σ {es}");
+}
+
+/// A regrid hands the momentum of the old control volumes to the new ones: every piece of
+/// old mass finds new nodes, and Σ m v over the degrees of freedom is unchanged up to the
+/// cut cells next to the surface, which are rebuilt with the band of the new configuration
+/// (material that entered the body in the last step now extrapolates too, as it would in the
+/// next step) and move in the eighth digit.
+#[test]
+fn regrid_keeps_the_momentum() {
+    let m = Material::linear_elastic(100.0, 0.3, 1.0).unwrap();
+    let r = Refinement { levels: 2, band: 6.0, regrid_every: 4, ..Refinement::default() };
+    let mut s = Hierarchy::new(centred_grid(31, 0.1), m, disc(), mapped(), r, Limits::default()).unwrap();
+    let vel = |x: [f64; 2]| [0.7 - 0.5 * x[1], -0.4 + 0.5 * x[0]];
+    s.set_motion(|x| (x, vel(x))).unwrap();
+    s.run(30).unwrap();
+    let p = |s: &mut Hierarchy| -> [f64; 2] {
+        let res = s.residual().unwrap();
+        let mut p = [0.0; 2];
+        for r in &res {
+            let v = s.level(r.node.level).unwrap().velocity(r.node.index).unwrap();
+            p[0] += r.area * v[0];
+            p[1] += r.area * v[1];
+        }
+        p
+    };
+    let p0 = p(&mut s);
+    let nodes0 = s.stats().nodes;
+    let report = s.regrid().unwrap();
+    let p1 = p(&mut s);
+    eprintln!("momentum {p0:?} -> {p1:?} ({nodes0:?} -> {:?} nodes); {report:?}", s.stats().nodes);
+    assert!(nodes0 != s.stats().nodes, "the regrid changed nothing");
+    assert!(report.unassigned == 0.0 && report.mass > 0.7, "{report:?}");
+    for c in 0..2 {
+        assert!((p1[c] - p0[c]).abs() < 1e-7 * p0[c].abs(), "{p0:?} {p1:?}");
+    }
+}

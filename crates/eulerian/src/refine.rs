@@ -94,11 +94,14 @@ pub struct Refinement {
     pub base_margin: f64,
     /// An extra region refined to the finest level (cells whose centre lies in it).
     pub region: Option<Region>,
+    /// Coarse steps between regrids in [`Hierarchy::run`] (0: never; the surface must not
+    /// leave the finest band in between).
+    pub regrid_every: usize,
 }
 
 impl Default for Refinement {
     fn default() -> Self {
-        Refinement { levels: 2, band: 6.0, nesting: 2, base_margin: 6.0, region: None }
+        Refinement { levels: 2, band: 6.0, nesting: 2, base_margin: 6.0, region: None, regrid_every: 0 }
     }
 }
 
@@ -110,6 +113,7 @@ impl std::fmt::Debug for Refinement {
             .field("nesting", &self.nesting)
             .field("base_margin", &self.base_margin)
             .field("region", &self.region.is_some())
+            .field("regrid_every", &self.regrid_every)
             .finish()
     }
 }
@@ -212,6 +216,78 @@ struct Topology {
     held: Vec<(usize, usize)>,
 }
 
+/// The initial state of a new level.
+#[derive(Debug, Clone)]
+struct LevelState {
+    zeta: Vec<[f64; 2]>,
+    v: Vec<[f64; 2]>,
+    /// Whether the node's ζ is known (else it starts outside the body).
+    known: Vec<bool>,
+}
+
+/// What locating a point needs from a level, for old and new levels alike.
+struct LevelView<'a> {
+    grid: &'a Grid,
+    role: &'a [Role],
+    own_cell: &'a [bool],
+    /// The masters of each hanging node.
+    masters: Vec<Option<[usize; 2]>>,
+    /// The finer level's master at each interface node.
+    link: Vec<Option<usize>>,
+}
+
+impl<'a> LevelView<'a> {
+    fn new(grid: &'a Grid, role: &'a [Role], own_cell: &'a [bool], hanging: &[Hanging], links: &[(usize, usize)]) -> LevelView<'a> {
+        let n = grid.len();
+        let mut masters = vec![None; n];
+        for hg in hanging {
+            masters[hg.node] = Some(hg.masters);
+        }
+        let mut link = vec![None; n];
+        for &(k, m) in links {
+            link[k] = Some(m);
+        }
+        LevelView { grid, role, own_cell, masters, link }
+    }
+
+    /// The leaf cell of this level holding x: its lower-left node and the local coordinates.
+    fn leaf(&self, x: [f64; 2]) -> Option<(usize, [f64; 2])> {
+        let o = self.grid.origin();
+        let h = self.grid.h();
+        let (u, v) = ((x[0] - o[0]) / h, (x[1] - o[1]) / h);
+        let (fi, fj) = (u.floor(), v.floor());
+        if !(fi.is_finite() && fj.is_finite()) || fi < 0.0 || fj < 0.0 {
+            return None;
+        }
+        let k = self.grid.try_index(fi as usize, fj as usize)?;
+        self.own_cell.get(k).copied().unwrap_or(false).then_some((k, [u - fi, v - fj]))
+    }
+}
+
+/// The degrees of freedom (level, node, weight) whose control volumes hold point x: the corner
+/// of the leaf cell's quarter holding x, resolved through hanging nodes (half to each master)
+/// and interface nodes (the finer level's master).
+fn owners(views: &[LevelView], x: [f64; 2]) -> Vec<(usize, usize, f64)> {
+    for l in (0..views.len()).rev() {
+        let vw = &views[l];
+        let Some((c0, t)) = vw.leaf(x) else {
+            continue;
+        };
+        let (i, j) = vw.grid.ij(c0);
+        let (di, dj) = (isize::from(t[0] >= 0.5), isize::from(t[1] >= 0.5));
+        let Some(k) = vw.grid.lattice_shift(i, j, di, dj).and_then(|(a, b)| vw.grid.try_index(a, b)) else {
+            return Vec::new();
+        };
+        return match vw.role.get(k) {
+            Some(Role::Interior | Role::Master) => vec![(l, k, 1.0)],
+            Some(Role::Hanging) => vw.masters[k].map_or_else(Vec::new, |[a, b]| vec![(l, a, 0.5), (l, b, 0.5)]),
+            Some(Role::Interface) => vw.link[k].map_or_else(Vec::new, |m| vec![(l + 1, m, 1.0)]),
+            _ => Vec::new(),
+        };
+    }
+    Vec::new()
+}
+
 #[derive(Debug, Clone)]
 struct Level {
     solid: Solid,
@@ -248,6 +324,19 @@ pub struct ResidualEntry {
     pub force: [f64; 2],
     /// Solid area of its control volume.
     pub area: f64,
+}
+
+/// What a regrid moved: the momentum and mass (full-cell areas, unit density) of the old
+/// degrees of freedom handed to the new ones, and the part of that mass no new degree of
+/// freedom took (zero: the transfer conserves Σ m v exactly).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct RegridReport {
+    /// Σ m v handed over.
+    pub momentum: [f64; 2],
+    /// Σ m handed over.
+    pub mass: f64,
+    /// Mass that found no new node.
+    pub unassigned: f64,
 }
 
 /// Counters of the hierarchy.
@@ -388,9 +477,9 @@ impl Hierarchy {
                 z.push([xi[0] - x[0], xi[1] - x[1]]);
                 v.push(vel);
             }
-            states.push((z, v));
+            states.push(LevelState { known: vec![true; z.len()], zeta: z, v });
         }
-        self.levels = self.instantiate(topo, states, false)?;
+        self.levels = self.instantiate(topo, states, false, 0.0)?;
         self.synchronise()?;
         Ok(())
     }
@@ -799,9 +888,10 @@ impl Hierarchy {
     }
 
     /// Solids for the levels, with the given ζ and v at every node.
-    fn instantiate(&self, topo: Vec<Topology>, states: Vec<(Vec<[f64; 2]>, Vec<[f64; 2]>)>, started: bool) -> Result<Vec<Level>, Error> {
+    fn instantiate(&self, topo: Vec<Topology>, states: Vec<LevelState>, started: bool, time: f64) -> Result<Vec<Level>, Error> {
         let mut levels = Vec::with_capacity(topo.len());
-        for (t, (z, v)) in topo.into_iter().zip(states) {
+        for (t, st) in topo.into_iter().zip(states) {
+            let LevelState { zeta: z, v, known } = st;
             let n = t.grid.len();
             let mut solid = Solid::new(t.grid, self.material, self.shape, self.settings, self.limits)?;
             let mut hooks = LevelHooks::new(n);
@@ -825,7 +915,7 @@ impl Hierarchy {
             solid.zeta = z;
             solid.v = v;
             for k in 0..n {
-                let inside = solid.shape.phi0(solid.xi(k)) < 0.0;
+                let inside = known.get(k).copied().unwrap_or(false) && solid.shape.phi0(solid.xi(k)) < 0.0;
                 solid.kind[k] = match (t.role[k].frozen(), inside) {
                     (true, true) => NodeKind::Fixed,
                     (false, true) => NodeKind::Solid,
@@ -836,6 +926,7 @@ impl Hierarchy {
             solid.v_live = solid.kind.iter().map(|k| k.source()).collect();
             solid.extrapolate_velocity();
             solid.started = started;
+            solid.time = time;
             solid.cut = None;
             let zeta_old = solid.zeta.clone();
             let v_old = solid.v.clone();
@@ -1066,6 +1157,228 @@ impl Hierarchy {
         Ok(())
     }
 
+    /// The level set at x from the current state: at a node, the finest level's value there;
+    /// else ζ bilinear in the finest leaf cell holding x, or, where that cell has corners
+    /// outside the band, the least φ of its known corners (+∞ without any).
+    fn sample_phi(&self, views: &[LevelView], x: [f64; 2]) -> f64 {
+        if let Some(z) = self.node_zeta(views, x) {
+            return self.shape.phi0([x[0] + z[0], x[1] + z[1]]);
+        }
+        for l in (0..views.len()).rev() {
+            let Some((c0, t)) = views[l].leaf(x) else {
+                continue;
+            };
+            let s = &self.levels[l].solid;
+            let Some(c) = s.grid.neighbour(c0, 1, 0).zip(s.grid.neighbour(c0, 1, 1)).zip(s.grid.neighbour(c0, 0, 1)).map(|((a, b), d)| [c0, a, b, d])
+            else {
+                return f64::INFINITY;
+            };
+            if c.iter().any(|&k| !s.kind[k].known()) {
+                return c.iter().filter(|&&k| s.kind[k].known()).map(|&k| s.phi[k]).fold(f64::INFINITY, f64::min);
+            }
+            let w = [(1.0 - t[0]) * (1.0 - t[1]), t[0] * (1.0 - t[1]), t[0] * t[1], (1.0 - t[0]) * t[1]];
+            let mut xi = x;
+            for q in 0..4 {
+                xi[0] += w[q] * s.zeta[c[q]][0];
+                xi[1] += w[q] * s.zeta[c[q]][1];
+            }
+            return self.shape.phi0(xi);
+        }
+        f64::INFINITY
+    }
+
+    /// ζ at a node of the finest level that has a node at x (not a ghost) with a known value.
+    fn node_zeta(&self, views: &[LevelView], x: [f64; 2]) -> Option<[f64; 2]> {
+        let o = self.base.origin();
+        for l in (0..views.len()).rev() {
+            let s = &self.levels[l].solid;
+            let h = s.grid.h();
+            let (u, v) = ((x[0] - o[0]) / h, (x[1] - o[1]) / h);
+            let (ri, rj) = (u.round(), v.round());
+            if (u - ri).abs() < 1e-9
+                && (v - rj).abs() < 1e-9
+                && ri >= 0.0
+                && rj >= 0.0
+                && let Some(k) = s.grid.try_index(ri as usize, rj as usize)
+                && views[l].role[k] != Role::Ghost
+                && s.kind[k].known()
+            {
+                return Some(s.zeta[k]);
+            }
+        }
+        None
+    }
+
+    /// ζ at x from the current state: the value of the finest level that has a node there, else
+    /// biquadratic (bilinear when the window is incomplete) in the finest leaf holding x.
+    fn sample_zeta(&self, views: &[LevelView], x: [f64; 2]) -> Option<[f64; 2]> {
+        if let Some(z) = self.node_zeta(views, x) {
+            return Some(z);
+        }
+        for l in (0..views.len()).rev() {
+            let Some((c0, t)) = views[l].leaf(x) else {
+                continue;
+            };
+            let s = &self.levels[l].solid;
+            let (i, j) = s.grid.ij(c0);
+            // Centred 3 × 3 window around the nearer nodes.
+            let (si, sj) = (if t[0] < 0.5 { -1 } else { 0 }, if t[1] < 0.5 { -1 } else { 0 });
+            let (wx, wy) = (lagrange_weights(3, t[0] - si as f64), lagrange_weights(3, t[1] - sj as f64));
+            let mut z = [0.0; 2];
+            let mut ok = true;
+            'w: for q in 0..3 {
+                for p in 0..3 {
+                    match s.grid.lattice_shift(i, j, si + p as isize, sj + q as isize).and_then(|(a, b)| s.grid.try_index(a, b)) {
+                        Some(k) if s.kind[k].known() => {
+                            z[0] += wx[p] * wy[q] * s.zeta[k][0];
+                            z[1] += wx[p] * wy[q] * s.zeta[k][1];
+                        }
+                        _ => {
+                            ok = false;
+                            break 'w;
+                        }
+                    }
+                }
+            }
+            if ok {
+                return Some(z);
+            }
+            let c = [Some(c0), s.grid.neighbour(c0, 1, 0), s.grid.neighbour(c0, 1, 1), s.grid.neighbour(c0, 0, 1)];
+            let w = [(1.0 - t[0]) * (1.0 - t[1]), t[0] * (1.0 - t[1]), t[0] * t[1], (1.0 - t[0]) * t[1]];
+            let mut z = [0.0; 2];
+            for q in 0..4 {
+                let k = c[q].filter(|&k| s.kind[k].known())?;
+                z[0] += w[q] * s.zeta[k][0];
+                z[1] += w[q] * s.zeta[k][1];
+            }
+            return Some(z);
+        }
+        None
+    }
+
+    /// Rebuilds the levels around the current surface and moves the state onto them: ζ from
+    /// the finest old level holding each point; v by the overlap of old and new control
+    /// volumes, so Σ m v over the degrees of freedom is unchanged (masses of full cells; the
+    /// cut cells lie on the finest level on both sides and keep their nodes).
+    pub fn regrid(&mut self) -> Result<RegridReport, Error> {
+        self.synchronise()?;
+        let started = self.levels.first().is_some_and(|lv| lv.solid.started);
+        let time = self.time();
+        let old_views: Vec<LevelView> = self
+            .levels
+            .iter()
+            .filter_map(|lv| Some(LevelView::new(&lv.solid.grid, &lv.role, &lv.solid.level.as_ref()?.own_cell, &lv.hanging, &lv.links)))
+            .collect();
+        if old_views.len() != self.levels.len() {
+            return Err(Error::Invalid("a level without its hooks".into()));
+        }
+        let plans = self.plan(&|x| self.sample_phi(&old_views, x))?;
+        let topo = self.topologies(&plans)?;
+        // ζ.
+        let mut states = Vec::with_capacity(topo.len());
+        for t in &topo {
+            let n = t.grid.len();
+            let mut st = LevelState { zeta: vec![[0.0; 2]; n], v: vec![[0.0; 2]; n], known: vec![false; n] };
+            for k in 0..n {
+                if let Some(z) = self.sample_zeta(&old_views, t.grid.position(k)) {
+                    st.zeta[k] = z;
+                    st.known[k] = true;
+                }
+            }
+            states.push(st);
+        }
+        // v: momentum of every piece of the old control volumes handed to the new ones.
+        let new_views: Vec<LevelView> = topo.iter().map(|t| LevelView::new(&t.grid, &t.role, &t.own_cell, &t.hanging, &t.links)).collect();
+        let deepest = |views: &[LevelView], plans_cx: usize| -> Vec<Option<usize>> {
+            let mut out = vec![None::<usize>; plans_cx];
+            for (l, vw) in views.iter().enumerate() {
+                for k in 0..vw.grid.len() {
+                    if vw.own_cell[k] {
+                        let (i, j) = vw.grid.ij(k);
+                        let c = (i >> l) + plans[0].cx * (j >> l);
+                        if let Some(o) = out.get_mut(c) {
+                            *o = Some(o.map_or(l, |m: usize| m.max(l)));
+                        }
+                    }
+                }
+            }
+            out
+        };
+        let ncells = plans[0].cx * plans[0].cy;
+        let (dold, dnew) = (deepest(&old_views, ncells), deepest(&new_views, ncells));
+        let mut mom: Vec<Vec<([f64; 2], f64)>> = topo.iter().map(|t| vec![([0.0; 2], 0.0); t.grid.len()]).collect();
+        let mut report = RegridReport::default();
+        let o = self.base.origin();
+        let h0 = self.base.h();
+        for c in 0..ncells {
+            let Some(lmax) = dold[c].max(dnew[c]) else {
+                continue;
+            };
+            let (ci, cj) = (c % plans[0].cx, c / plans[0].cx);
+            let m = 1usize << (lmax + 1);
+            let sub = h0 / m as f64;
+            for q in 0..m {
+                for p in 0..m {
+                    let x = [o[0] + (ci as f64 + (p as f64 + 0.5) / m as f64) * h0, o[1] + (cj as f64 + (q as f64 + 0.5) / m as f64) * h0];
+                    let old = owners(&old_views, x);
+                    let mut pv = [0.0; 2];
+                    let mut mass = 0.0;
+                    for &(l, k, w) in &old {
+                        let s = &self.levels[l].solid;
+                        if s.kind[k].source() {
+                            pv[0] += w * s.v[k][0];
+                            pv[1] += w * s.v[k][1];
+                            mass += w;
+                        }
+                    }
+                    if !(mass > 0.0) {
+                        continue;
+                    }
+                    let a = sub * sub;
+                    report.momentum[0] += a * pv[0];
+                    report.momentum[1] += a * pv[1];
+                    report.mass += a * mass;
+                    let new = owners(&new_views, x);
+                    let taken: f64 = new.iter().map(|e| e.2).sum();
+                    report.unassigned += (1.0 - taken).abs() * a * mass;
+                    for (l, k, w) in new {
+                        let e = &mut mom[l][k];
+                        e.0[0] += w * a * pv[0];
+                        e.0[1] += w * a * pv[1];
+                        e.1 += w * a * mass;
+                    }
+                }
+            }
+        }
+        for (l, t) in topo.iter().enumerate() {
+            for k in 0..t.grid.len() {
+                let (p, m) = mom[l][k];
+                if m > 0.0 {
+                    states[l].v[k] = [p[0] / m, p[1] / m];
+                }
+            }
+        }
+        // Nodes without mass of their own (outside, ghosts, held) take the nearest old value.
+        for (l, t) in topo.iter().enumerate() {
+            for k in 0..t.grid.len() {
+                if mom[l][k].1 > 0.0 {
+                    continue;
+                }
+                let x = t.grid.position(k);
+                let own = owners(&old_views, x);
+                if let Some(&(ol, ok, _)) = own.first() {
+                    states[l].v[k] = self.levels[ol].solid.v[ok];
+                }
+            }
+        }
+        drop(new_views);
+        drop(old_views);
+        self.levels = self.instantiate(topo, states, started, time)?;
+        self.synchronise()?;
+        self.regrids += 1;
+        Ok(report)
+    }
+
     /// Advances `steps` coarse steps (each with the finer levels subcycled).
     pub fn run(&mut self, steps: usize) -> Result<(), Error> {
         if steps > self.limits.max_steps {
@@ -1075,6 +1388,12 @@ impl Hierarchy {
             self.audit = ([0.0; 2], 0.0);
             self.advance(0)?;
             self.steps += 1;
+            if self.refinement.regrid_every > 0 && self.steps.is_multiple_of(self.refinement.regrid_every) {
+                let r = self.regrid()?;
+                if r.unassigned > 1e-12 * r.mass {
+                    return Err(Error::Diverged(format!("a regrid left {} of {} of the momentum's mass without a node", r.unassigned, r.mass)));
+                }
+            }
         }
         Ok(())
     }
