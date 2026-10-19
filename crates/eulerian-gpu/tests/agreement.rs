@@ -5,7 +5,9 @@
 //!   largest speed, ζ within 1e-5 of the largest, the stress within 2e-5 of μ·(strain amplitude);
 //! - the pressurised ring with its deep interior on the device and the surface on the CPU:
 //!   after 300 steps, v within 1e-4 of the largest speed, ζ within 2e-5 of the largest, the
-//!   stress within 1e-4 of the bore pressure.
+//!   stress within 1e-4 of the bore pressure;
+//! - a disc translating rigidly across the grid (the work split again as it goes): ξ within
+//!   1e-6, v within 5e-5 of 0.81, the stress within 2e-4 of zero (μ = 38.5).
 //!
 //! Skipped without a GPU adapter unless `FIELDCRAFT_REQUIRE_GPU=1`, which makes a missing
 //! adapter a failure; `FIELDCRAFT_GPU` picks the adapter.
@@ -91,4 +93,44 @@ fn the_pressurised_ring_matches_the_cpu() {
     let (dv, dz, ds) = difference(&cpu, &solid);
     println!("ring: dv {dv:.2e}, dzeta {dz:.2e}, dstress/P {:.2e}", ds / 100.0);
     assert!(dv < 1e-4 && dz < 2e-5 && ds < 1e-4 * 100.0, "{dv:e} {dz:e} {ds:e}");
+}
+
+/// A disc translating rigidly across the grid: the surface sweeps over ten cells, so the work
+/// is split again several times on the way, and every field stays uniform (ξ = x − v t, v
+/// constant, no stress) to single precision.
+#[test]
+fn a_translating_disc_stays_rigid_while_the_split_follows_it() {
+    let n = 101;
+    let h = 0.02;
+    let o = -0.5 * (n as f64 - 1.0) * h;
+    let grid = Grid::new(n, n, h, [o, o], [false; 2], &Limits::default()).unwrap();
+    let m = Material::neo_hookean(100.0, 0.3, 1.0).unwrap();
+    let settings = Settings { boundary: Boundary::Mapped, ..Settings::default() };
+    let mut s = Solid::new(grid, m, Shape::Disc { center: [-0.2, 0.1], radius: 0.5 }, settings, Limits::default()).unwrap();
+    let v = [0.7, -0.4];
+    s.set_motion(|x| (x, v)).unwrap();
+    let Some(mut g) = gpu(s) else { return };
+    let first = g.counts().0;
+    assert!(first > 500, "{first} nodes on the device");
+    g.run(400).unwrap();
+    let splits = g.timings().splits;
+    let s = g.into_solid().unwrap();
+    let t = s.time();
+    assert!(splits >= 3, "split {splits} times");
+    assert!(t * v[0] > 8.0 * h, "moved {}", t * v[0]);
+    let (mut exi, mut ev, mut es) = (0.0f64, 0.0f64, 0.0f64);
+    for k in 0..s.grid().len() {
+        if s.kind(k) != Some(NodeKind::Solid) {
+            continue;
+        }
+        let x = s.grid().position(k);
+        let xi = s.reference(k).unwrap();
+        exi = exi.max((xi[0] - (x[0] - v[0] * t)).hypot(xi[1] - (x[1] - v[1] * t)));
+        let w = s.velocity(k).unwrap();
+        ev = ev.max((w[0] - v[0]).hypot(w[1] - v[1]));
+        es = es.max(s.stress(k).unwrap().iter().fold(0.0f64, |a, c| a.max(c.abs())));
+    }
+    println!("translation ({splits} splits): |xi error| {exi:.2e}, |v error| {ev:.2e}, |stress| {es:.2e}");
+    // |v| = 0.81, μ = 38.5 (the CPU alone: v to 5e-10, σ to 4e-9).
+    assert!(exi < 1e-6 && ev < 5e-5 && es < 2e-4, "{exi:e} {ev:e} {es:e}");
 }

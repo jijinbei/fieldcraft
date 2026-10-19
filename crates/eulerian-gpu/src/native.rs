@@ -72,6 +72,8 @@ pub struct Timings {
     pub wait: f64,
     /// Checking that the device's nodes are still deep, and splitting the work again.
     pub checks: f64,
+    /// Times the work was split (the first time included).
+    pub splits: usize,
 }
 
 /// A solid with its deep interior stepped on the GPU.
@@ -528,6 +530,7 @@ impl GpuSolid {
             _download_nodes: download_nodes,
         });
         self.since_check = 0;
+        self.timings.splits += 1;
         Ok(())
     }
 
