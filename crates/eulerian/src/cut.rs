@@ -25,6 +25,45 @@
 /// A point or vector in the plane.
 pub type P2 = [f64; 2];
 
+/// The root of f on [a, b] where f(a) and f(b) differ in sign (f(a) < 0 ≤ f(b) or the
+/// reverse), by the Illinois variant of regula falsi, to `tol` in the argument.
+pub fn bracketed_root(f: &dyn Fn(f64) -> f64, mut a: f64, mut b: f64, mut fa: f64, mut fb: f64, tol: f64) -> f64 {
+    if fb == 0.0 {
+        return b;
+    }
+    if fa == 0.0 {
+        return a;
+    }
+    let mut side = 0i8;
+    for _ in 0..100 {
+        let c = if fb != fa { b - fb * (b - a) / (fb - fa) } else { 0.5 * (a + b) };
+        let c = if c.is_finite() && c > a.min(b) && c < a.max(b) { c } else { 0.5 * (a + b) };
+        let fc = f(c);
+        if !fc.is_finite() || fc == 0.0 || (b - a).abs() <= tol {
+            return c;
+        }
+        if (fc < 0.0) == (fb < 0.0) {
+            b = c;
+            fb = fc;
+            if side == -1 {
+                fa *= 0.5;
+            }
+            side = -1;
+        } else {
+            a = c;
+            fa = fc;
+            if side == 1 {
+                fb *= 0.5;
+            }
+            side = 1;
+        }
+        if (b - a).abs() <= tol {
+            return if fa.abs() < fb.abs() { a } else { b };
+        }
+    }
+    0.5 * (a + b)
+}
+
 /// Two-point Gauss–Legendre rule on [0, 1] (abscissa, weight).
 pub const GAUSS2: [(f64, f64); 2] = [(0.211_324_865_405_187_1, 0.5), (0.788_675_134_594_812_9, 0.5)];
 
@@ -367,18 +406,9 @@ fn arc_middle(p: P2, q: P2, h: f64, phi: &dyn Fn(P2) -> f64) -> P2 {
             return c;
         }
         if (f < 0.0) != (flo < 0.0) {
-            // Bisect on [lo, s].
-            let (mut a, mut b) = (lo, s);
-            let fa_neg = flo < 0.0;
-            for _ in 0..60 {
-                let mid = 0.5 * (a + b);
-                if (phi(at(mid)) < 0.0) == fa_neg {
-                    a = mid;
-                } else {
-                    b = mid;
-                }
-            }
-            let m = at(0.5 * (a + b));
+            let g = |t: f64| phi(at(t));
+            let r = bracketed_root(&g, lo, s, flo, f, 1e-13 * h);
+            let m = at(r);
             return [m[0].clamp(0.0, h), m[1].clamp(0.0, h)];
         }
         lo = s;

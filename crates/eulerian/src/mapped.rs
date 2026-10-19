@@ -32,8 +32,9 @@
 //! - **The surface values** ζ_S are not extrapolated: at each surface point they make the
 //!   traction of the solid law equal the prescribed one, σ(F)·n = t, with F from the map
 //!   (normal derivative from the one-sided quadratic, tangential derivative along the surface
-//!   from the neighbouring surface points). A 2 × 2 Newton step per point, Gauss–Seidel along
-//!   the surface, warm-started from the previous step.
+//!   from the neighbouring surface points). Newton on the coupled conditions of each chain of
+//!   surface points (one family's points on consecutive lines), with a banded
+//!   finite-difference Jacobian factorised by LU, warm-started from the previous step.
 //!
 //! ζ outside the body is still extrapolated (the band of [`crate::solid`]), but only for
 //! what needs a neighbour there: the upwind differences of the ξ advection, where the
@@ -53,8 +54,8 @@ pub const MERGE_FRACTION: f64 = 0.25;
 /// Width of the blend between the two line families, in |n_x| − |n_y| (±0.2 is about ±8°
 /// around the diagonal).
 const BLEND: f64 = 0.2;
-/// Gauss–Seidel sweeps of the traction condition per step, at most.
-const MAX_SWEEPS: usize = 50;
+/// Newton iterations of the surface conditions per step, at most.
+const MAX_NEWTON: usize = 20;
 
 /// What a grid cell is: no solid, all solid, or cut (index into the cut cells).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -122,9 +123,9 @@ pub struct CutStats {
     pub merged: usize,
     /// Solid area that found no inside node to join (dropped).
     pub lost_area: f64,
-    /// Gauss–Seidel sweeps of the traction condition.
+    /// Newton iterations of the surface conditions.
     pub sweeps: usize,
-    /// The last sweep's largest change of a surface value.
+    /// The last iteration's largest change of a surface value.
     pub last_change: f64,
 }
 
@@ -367,20 +368,8 @@ impl Solid {
             self.shape.phi0(xi)
         };
         // φ ≥ 0 at the outside node; exactly 0 puts the surface on it.
-        let t = if f(1.0) > 0.0 {
-            let (mut lo, mut hi) = (0.0, 1.0);
-            for _ in 0..60 {
-                let m = 0.5 * (lo + hi);
-                if f(m) < 0.0 {
-                    lo = m;
-                } else {
-                    hi = m;
-                }
-            }
-            0.5 * (lo + hi)
-        } else {
-            1.0
-        };
+        let f1 = f(1.0);
+        let t = if f1 > 0.0 { cut::bracketed_root(&f, 0.0, 1.0, self.phi[n_in], f1, 1e-14) } else { 1.0 };
         Ok(if self.inside(a) { t } else { 1.0 - t })
     }
 
@@ -430,6 +419,7 @@ impl Solid {
         let h = self.grid.h();
         let mut stats = CutStats::default();
 
+        let tb0 = std::time::Instant::now();
         // Crossings on every grid edge between an inside and an outside node.
         let mut cross = vec![[None::<f64>; 2]; n];
         for k in 0..n {
@@ -662,8 +652,8 @@ impl Solid {
                 points[p].valid = false;
                 continue;
             };
-            let xs: Vec<f64> = offs[..cnt].iter().map(|&o| o as f64).collect();
-            let (_, dw) = lagrange(&xs, 0.0);
+            let xs = offs.map(|o| o as f64);
+            let (_, dw) = lagrange(&xs[..cnt], 0.0);
             let mut yp = 0.0;
             for m in 0..cnt {
                 if let Some(q) = points[p].nb[(offs[m] + 2) as usize] {
@@ -685,69 +675,94 @@ impl Solid {
         }
         stats.valid_points = points.iter().filter(|p| p.valid).count();
 
-        // Surface values from the traction condition.
+        let tb1 = std::time::Instant::now();
+        // Surface values from the traction condition: Newton on the coupled conditions of each
+        // chain of matched points (one family's points on consecutive lines), the Jacobian by
+        // finite differences, banded (a point's condition involves the points up to two lines
+        // away), solved by LU with partial pivoting.
         let tol = 1e-13 * h;
-        for sweep in 0..MAX_SWEEPS {
+        let targets: Vec<P2> = points
+            .iter()
+            .map(|pt| {
+                if pt.valid {
+                    let x = pt.position();
+                    traction(&self.ambient_at(x, self.cell_of(x)), pt.normal)
+                } else {
+                    [0.0; 2]
+                }
+            })
+            .collect();
+        let chains = surface_chains(&points);
+        for it in 0..MAX_NEWTON {
             let mut change: f64 = 0.0;
-            for p in 0..points.len() {
-                if !points[p].valid {
+            for ch in &chains {
+                let m = ch.len();
+                let mut r = vec![0.0; 2 * m];
+                let mut folded = false;
+                for (i, &p) in ch.iter().enumerate() {
+                    match self.traction_residual(&points, p, points[p].zeta, targets[p]) {
+                        Ok(v) => {
+                            r[2 * i] = v[0];
+                            r[2 * i + 1] = v[1];
+                        }
+                        Err(_) => {
+                            // The guess folds the map: restart from the linear extrapolation.
+                            let lin = linear(points[p].n1, points[p].n2, points[p].s);
+                            if points[p].zeta == lin {
+                                return Err(Error::Diverged(format!("the map folded at the surface by node {}", points[p].n1)));
+                            }
+                            points[p].zeta = lin;
+                            folded = true;
+                        }
+                    }
+                }
+                if folded {
+                    change = f64::INFINITY;
                     continue;
                 }
-                let x = points[p].position();
-                let t = traction(&self.ambient_at(x, self.cell_of(x)), points[p].normal);
-                let mut z = points[p].zeta;
-                for _ in 0..3 {
-                    let Ok(r0) = self.traction_residual(&points, p, z, t) else {
-                        // The guess folds the map: restart from the linear extrapolation.
-                        let lin = linear(points[p].n1, points[p].n2, points[p].s);
-                        if z == lin {
-                            return Err(Error::Diverged(format!("the map folded at the surface by node {}", points[p].n1)));
-                        }
-                        z = lin;
-                        change = f64::INFINITY;
-                        continue;
-                    };
+                let mut jac = Band::new(2 * m, 5, 5);
+                for (i, &p) in ch.iter().enumerate() {
                     let eps = 1e-7 * h * points[p].s.max(1e-3);
-                    let mut jac = [[0.0; 2]; 2];
                     for c in 0..2 {
-                        let mut zp = z;
-                        zp[c] += eps;
-                        let r = self.traction_residual(&points, p, zp, t)?;
-                        for row in 0..2 {
-                            jac[row][c] = (r[row] - r0[row]) / eps;
+                        let z0 = points[p].zeta;
+                        points[p].zeta[c] += eps;
+                        for j in i.saturating_sub(2)..=(i + 2).min(m - 1) {
+                            let q = ch[j];
+                            let rq = self.traction_residual(&points, q, points[q].zeta, targets[q]);
+                            if let Ok(rq) = rq {
+                                for row in 0..2 {
+                                    jac.set(2 * j + row, 2 * i + c, (rq[row] - r[2 * j + row]) / eps);
+                                }
+                            }
                         }
-                    }
-                    let det = jac[0][0] * jac[1][1] - jac[0][1] * jac[1][0];
-                    if !(det.abs() > 0.0) || !det.is_finite() {
-                        break;
-                    }
-                    let mut dz = [-(jac[1][1] * r0[0] - jac[0][1] * r0[1]) / det, -(-jac[1][0] * r0[0] + jac[0][0] * r0[1]) / det];
-                    if !(dz[0].is_finite() && dz[1].is_finite()) {
-                        return Err(Error::Diverged(format!("the surface value at node {} did not converge", points[p].n1)));
-                    }
-                    // Backtrack while the step folds the map.
-                    let mut tries = 0;
-                    while self.traction_residual(&points, p, [z[0] + dz[0], z[1] + dz[1]], t).is_err() && tries < 30 {
-                        dz = [0.5 * dz[0], 0.5 * dz[1]];
-                        tries += 1;
-                    }
-                    z = [z[0] + dz[0], z[1] + dz[1]];
-                    change = change.max(dz[0].abs()).max(dz[1].abs());
-                    if dz[0].abs().max(dz[1].abs()) <= tol {
-                        break;
+                        points[p].zeta = z0;
                     }
                 }
-                points[p].zeta = z;
-                let lin = linear(points[p].n1, points[p].n2, points[p].s);
-                points[p].deviation = [z[0] - lin[0], z[1] - lin[1]];
+                let rhs: Vec<f64> = r.iter().map(|v| -v).collect();
+                let dz = jac.solve(rhs).ok_or_else(|| Error::Diverged("the surface conditions are singular".into()))?;
+                for (i, &p) in ch.iter().enumerate() {
+                    let d = [dz[2 * i], dz[2 * i + 1]];
+                    if !(d[0].is_finite() && d[1].is_finite()) {
+                        return Err(Error::Diverged(format!("the surface value at node {} did not converge", points[p].n1)));
+                    }
+                    points[p].zeta = [points[p].zeta[0] + d[0], points[p].zeta[1] + d[1]];
+                    change = change.max(d[0].abs()).max(d[1].abs());
+                }
             }
-            stats.sweeps = sweep + 1;
+            stats.sweeps = it + 1;
             stats.last_change = change;
             if change <= tol {
                 break;
             }
         }
+        for pt in points.iter_mut() {
+            let lin = linear(pt.n1, pt.n2, pt.s);
+            pt.deviation = [pt.zeta[0] - lin[0], pt.zeta[1] - lin[1]];
+        }
 
+        if std::env::var("MAPPED_TIMING").is_ok() {
+            eprintln!("TIMING geometry+points {:.3} surface solve {:.3} ms", (tb1 - tb0).as_secs_f64() * 1e3, tb1.elapsed().as_secs_f64() * 1e3);
+        }
         Ok(CutState { class, cells, points, lines, owner, share, area, moment, near, stats })
     }
 
@@ -811,8 +826,8 @@ impl Solid {
     fn surface_gradient(&self, points: &[SurfacePoint], p: usize, z: P2) -> Option<Tensor> {
         let pt = &points[p];
         let (offs, cnt) = tangent_stencil(&pt.nb)?;
-        let xs: Vec<f64> = offs[..cnt].iter().map(|&o| o as f64).collect();
-        let (_, dw) = lagrange(&xs, 0.0);
+        let xs = offs.map(|o| o as f64);
+        let (_, dw) = lagrange(&xs[..cnt], 0.0);
         let mut zu = [0.0; 2];
         let mut yp = 0.0;
         for m in 0..cnt {
@@ -934,8 +949,11 @@ impl Solid {
             }
         }
         let (set, ids) = chosen?;
-        let xs: Vec<f64> = set.iter().map(|&v| v as f64).collect();
-        let (w, dw) = lagrange(&xs, u);
+        let mut xs = [0.0; 4];
+        for (m, &v) in set.iter().enumerate() {
+            xs[m] = v as f64;
+        }
+        let (w, dw) = lagrange(&xs[..set.len()], u);
         let sigma = pt.sigma;
         let mut y = 0.0;
         let mut yp = 0.0;
@@ -970,8 +988,11 @@ impl Solid {
         self.started = true;
         let mu_e = self.settings.viscosity * rho0 * self.material.p_wave_speed() * h;
 
+        let t0 = std::time::Instant::now();
         let mut st = self.build_cut()?;
+        let t1 = std::time::Instant::now();
         let force = self.mapped_forces(&mut st, mu_e)?;
+        let t2 = std::time::Instant::now();
         // 3. Momentum of each control volume (lumped: ρ times its solid area).
         let mut cv = vec![0.0; n];
         for k in 0..n {
@@ -1025,6 +1046,15 @@ impl Solid {
             if self.kind[k].known() && self.v[k].iter().chain(self.zeta[k].iter()).any(|x| !x.is_finite()) {
                 return Err(Error::Diverged(format!("non-finite value at node {k} at t = {}", self.time)));
             }
+        }
+        if std::env::var("MAPPED_TIMING").is_ok() {
+            let t3 = std::time::Instant::now();
+            eprintln!(
+                "TIMING build {:.3} forces {:.3} rest {:.3} ms",
+                (t1 - t0).as_secs_f64() * 1e3,
+                (t2 - t1).as_secs_f64() * 1e3,
+                (t3 - t2).as_secs_f64() * 1e3
+            );
         }
         Ok(())
     }
@@ -1172,6 +1202,126 @@ impl Solid {
     }
 }
 
+/// The chains of valid surface points: each a family's points on consecutive lines, linked
+/// both ways by their matches, in line order.
+fn surface_chains(points: &[SurfacePoint]) -> Vec<Vec<usize>> {
+    let valid = |q: Option<usize>| q.filter(|&q| points[q].valid);
+    let next = |p: usize| valid(points[p].nb[3]).filter(|&q| points[q].nb[1] == Some(p));
+    let prev = |p: usize| valid(points[p].nb[1]).filter(|&q| points[q].nb[3] == Some(p));
+    let mut seen = vec![false; points.len()];
+    let mut chains = Vec::new();
+    // Starts first, then whatever is left (a closed chain, cut anywhere).
+    let starts: Vec<usize> = (0..points.len()).filter(|&p| points[p].valid && prev(p).is_none()).collect();
+    let rest: Vec<usize> = (0..points.len()).filter(|&p| points[p].valid).collect();
+    for p0 in starts.into_iter().chain(rest) {
+        if seen[p0] {
+            continue;
+        }
+        let mut chain = vec![p0];
+        seen[p0] = true;
+        let mut p = p0;
+        while let Some(q) = next(p) {
+            if seen[q] {
+                break;
+            }
+            seen[q] = true;
+            chain.push(q);
+            p = q;
+        }
+        chains.push(chain);
+    }
+    chains
+}
+
+/// A square band matrix (kl sub- and ku superdiagonals, room for the fill of partial
+/// pivoting), solved by LU with partial pivoting.
+struct Band {
+    n: usize,
+    kl: usize,
+    ku: usize,
+    w: usize,
+    a: Vec<f64>,
+}
+
+impl Band {
+    fn new(n: usize, kl: usize, ku: usize) -> Band {
+        let w = 2 * kl + ku + 1;
+        Band { n, kl, ku, w, a: vec![0.0; n * w] }
+    }
+
+    /// Storage of (i, j), when inside the band (with the room for fill).
+    fn at(&self, i: usize, j: usize) -> Option<usize> {
+        let o = (j + self.kl).checked_sub(i)?;
+        (o < self.w && i < self.n && j < self.n).then_some(i * self.w + o)
+    }
+
+    fn get(&self, i: usize, j: usize) -> f64 {
+        self.at(i, j).map_or(0.0, |k| self.a[k])
+    }
+
+    /// Sets (i, j); entries outside the band are dropped.
+    fn set(&mut self, i: usize, j: usize, v: f64) {
+        if j + self.kl >= i
+            && j <= i + self.ku
+            && let Some(k) = self.at(i, j)
+        {
+            self.a[k] = v;
+        }
+    }
+
+    /// Solves A x = b; `None` when singular.
+    fn solve(mut self, mut b: Vec<f64>) -> Option<Vec<f64>> {
+        let n = self.n;
+        let reach = self.kl + self.ku;
+        for k in 0..n {
+            let last = (k + self.kl).min(n - 1);
+            let mut piv = k;
+            for i in k + 1..=last {
+                if self.get(i, k).abs() > self.get(piv, k).abs() {
+                    piv = i;
+                }
+            }
+            let pv = self.get(piv, k);
+            if !(pv.abs() > 0.0) || !pv.is_finite() {
+                return None;
+            }
+            let right = (k + reach).min(n - 1);
+            if piv != k {
+                for j in k..=right {
+                    let (x, y) = (self.get(k, j), self.get(piv, j));
+                    if let (Some(a), Some(c)) = (self.at(k, j), self.at(piv, j)) {
+                        self.a[a] = y;
+                        self.a[c] = x;
+                    }
+                }
+                b.swap(k, piv);
+            }
+            for i in k + 1..=last {
+                let f = self.get(i, k) / pv;
+                if f == 0.0 {
+                    continue;
+                }
+                for j in k..=right {
+                    if let Some(c) = self.at(i, j) {
+                        self.a[c] -= f * self.get(k, j);
+                    }
+                }
+                b[i] -= f * b[k];
+            }
+        }
+        let mut x = vec![0.0; n];
+        for k in (0..n).rev() {
+            let right = (k + reach).min(n - 1);
+            let mut s = b[k];
+            for j in k + 1..=right {
+                s -= self.get(k, j) * x[j];
+            }
+            x[k] = s / self.get(k, k);
+        }
+        x.iter().all(|v| v.is_finite()).then_some(x)
+    }
+}
+
 /// The line offsets for the tangential derivative at a surface point: centred when both
 /// neighbours exist, else one-sided over three lines, else two.
 fn tangent_stencil(nb: &[Option<usize>; 5]) -> Option<([isize; 3], usize)> {
@@ -1194,6 +1344,27 @@ fn tangent_stencil(nb: &[Option<usize>; 5]) -> Option<([isize; 3], usize)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn band_solver_matches_a_dense_solve() {
+        // A pentadiagonal system needing pivoting (zero leading diagonal entry).
+        let n = 7;
+        let mut b = Band::new(n, 2, 2);
+        let mut dense = vec![vec![0.0; n]; n];
+        for i in 0..n {
+            for j in i.saturating_sub(2)..=(i + 2).min(n - 1) {
+                let v = if i == j && i == 0 { 0.0 } else { 1.0 + ((3 * i + 5 * j) % 7) as f64 * 0.3 - if i == j { 0.0 } else { 0.9 } };
+                b.set(i, j, v);
+                dense[i][j] = v;
+            }
+        }
+        let x_true: Vec<f64> = (0..n).map(|i| 1.0 + i as f64 * 0.5).collect();
+        let rhs: Vec<f64> = (0..n).map(|i| (0..n).map(|j| dense[i][j] * x_true[j]).sum()).collect();
+        let x = b.solve(rhs).unwrap();
+        for i in 0..n {
+            assert!((x[i] - x_true[i]).abs() < 1e-10, "{x:?}");
+        }
+    }
 
     #[test]
     fn lagrange_weights_reproduce_quadratics() {
