@@ -8,7 +8,8 @@
 //! - `band=` finest band half-width in finest cells (default 6), `nesting=` (default 2),
 //! - `law=lin|nh` (default lin), `load=` load multiplier (default 0.01: small strain),
 //! - `damp=` damping multiplier (γ = damp · 0.5 c_P / b), `cfl=`, `visc=`,
-//! - `tolf=` relaxation tolerance multiplier, `steps=` most coarse steps,
+//! - `tolf=` relaxation tolerance multiplier (default 0.1), `window=` how long the speed must
+//!   stay below it, in periods 2π b / c_P (default 1), `steps=` most coarse steps,
 //! - `dump=PREFIX` (writes PREFIX_nodes.csv, PREFIX_leaves.csv, PREFIX_surface.csv).
 //!
 //! Prints one JSON line of metrics: errors at the surface and in the interior (r within
@@ -55,7 +56,7 @@ fn main() {
     let damp: f64 = get("damp", "1").parse().unwrap();
     let cfl: f64 = get("cfl", "0.4").parse().unwrap();
     let visc: f64 = get("visc", "0.1").parse().unwrap();
-    let tolf: f64 = get("tolf", "1").parse().unwrap();
+    let tolf: f64 = get("tolf", "0.1").parse().unwrap();
     let max_steps: usize = get("steps", "400000").parse().unwrap();
     let mat = if law == "lin" { Material::linear_elastic(E, NU, 1.0).unwrap() } else { Material::neo_hookean(E, NU, 1.0).unwrap() };
 
@@ -88,8 +89,13 @@ fn main() {
     // Relax until the speed, less the best-fit rigid motion, is below the tolerance.
     let tol = tolf * 1e-5 * 0.009 * load * c / b;
     let t0 = std::time::Instant::now();
+    // The speed must stay below the tolerance for a whole window longer than the slowest
+    // vibration period (≈ 2π r / c_P for the ring's breathing mode): one mode alone passes
+    // through zero velocity everywhere at once.
+    let window = get("window", "1").parse::<f64>().unwrap() * 2.0 * std::f64::consts::PI * b / c;
     let mut steps = 0;
     let mut converged = false;
+    let mut quiet_since: Option<f64> = None;
     while steps < max_steps {
         if let Err(e) = s.run(20) {
             println!("{{\"case\":\"{case}\",\"h0\":{h0},\"levels\":{levels},\"diverged\":\"{e}\",\"t\":{}}}", s.time());
@@ -97,8 +103,13 @@ fn main() {
         }
         steps += 20;
         if deformation_speed(&s) < tol {
-            converged = true;
-            break;
+            let t0 = *quiet_since.get_or_insert(s.time());
+            if s.time() - t0 >= window {
+                converged = true;
+                break;
+            }
+        } else {
+            quiet_since = None;
         }
     }
     let wall = t0.elapsed().as_secs_f64();
