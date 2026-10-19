@@ -32,6 +32,7 @@ fieldcraft-update = { path = "crates/update" }
 fieldcraft-gpu = { path = "crates/gpu" }
 fieldcraft-lbm-gpu = { path = "crates/lbm-gpu" }
 fieldcraft-mesh-gpu = { path = "crates/mesh-gpu" }
+fieldcraft-eulerian-gpu = { path = "crates/eulerian-gpu" }
 
 # foundation
 thiserror = "2"

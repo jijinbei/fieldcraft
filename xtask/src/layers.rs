@@ -60,6 +60,7 @@ pub const TABLE: &[(&str, Class)] = &[
     ("gpu", Class::Layer(7)),
     ("lbm-gpu", Class::Layer(7)),
     ("mesh-gpu", Class::Layer(7)),
+    ("eulerian-gpu", Class::Layer(7)),
     ("ui-egui", Class::Layer(7)),
     ("mcp", Class::Layer(7)),
     ("testkit", Class::Testkit),
@@ -80,6 +81,8 @@ pub const INTRA_LAYER_ORDER: &[&[&str]] = &[
     &["gpu", "lbm-gpu"],
     // So does the projection smoothing GPU device.
     &["gpu", "mesh-gpu"],
+    // The Eulerian solid's GPU interior opens its device the same way.
+    &["gpu", "eulerian-gpu"],
 ];
 
 fn intra_layer_allowed(from: &str, to: &str) -> bool {

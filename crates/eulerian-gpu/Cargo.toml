@@ -1,0 +1,19 @@
+[package]
+name = "fieldcraft-eulerian-gpu"
+description = "FieldCraft's Eulerian solid on the GPU: the deep interior of the reference map step as wgpu compute shaders, the surface on the CPU, exchanging the seam each step; checked against the CPU"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+fieldcraft-eulerian = { workspace = true }
+fieldcraft-gpu = { workspace = true }
+fieldcraft-parallel = { workspace = true }
+wgpu = { workspace = true }
+pollster = { workspace = true }
+
+[dev-dependencies]
+fieldcraft-gpu = { workspace = true }

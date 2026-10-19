@@ -1343,6 +1343,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "fieldcraft-eulerian-gpu"
+version = "0.7.0"
+dependencies = [
+ "fieldcraft-eulerian",
+ "fieldcraft-gpu",
+ "fieldcraft-parallel",
+ "pollster 1.0.1",
+ "wgpu",
+]
+
+[[package]]
 name = "fieldcraft-explicit"
 version = "0.7.0"
 dependencies = [
