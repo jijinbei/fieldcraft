@@ -110,7 +110,8 @@ fn main() {
     // Exit: the tail just past the strip; the reflection is inside it.
     let exit = measure(&mut fine, &mut coarse, steps_to(xb + tail), (xa + 2.0 * h0, xb - 2.0 * h0), "exit", &mut dump);
     let mut out = format!(
-        "{{\"h0\":{h0},\"levels\":{levels},\"width\":{width},\"visc\":{visc},\"entry_reflection\":{entry:.4e},\"exit_reflection\":{exit:.4e},\"nodes\":{:?}",
+        "{{\"h0\":{h0},\"levels\":{levels},\"width\":{width},\"visc\":{visc},\"subcycle\":{subcycle},\"hanging\":\"{}\",\"entry_reflection\":{entry:.4e},\"exit_reflection\":{exit:.4e},\"nodes\":{:?}",
+        if cubic { "cubic" } else { "linear" },
         fine.stats().nodes
     );
     // Stability: many trips around the box; the largest |u| and |v| at the end of each trip.
