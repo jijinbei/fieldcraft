@@ -282,7 +282,7 @@ impl Multigrid {
             let mut parents_grid: Vec<Vec<(usize, f64)>> = Vec::with_capacity(ij.len());
             for &(i, j) in &ij {
                 let along = |i: usize, n: usize| -> Vec<(usize, f64)> {
-                    if i % 2 == 0 { vec![(i / 2, 1.0)] } else { [(i / 2, 0.5), (i / 2 + 1, 0.5)].into_iter().filter(|p| p.0 < n).collect() }
+                    if i.is_multiple_of(2) { vec![(i / 2, 1.0)] } else { [(i / 2, 0.5), (i / 2 + 1, 0.5)].into_iter().filter(|p| p.0 < n).collect() }
                 };
                 let mut ps = Vec::with_capacity(4);
                 for (ci, wi) in along(i, cdims.0) {

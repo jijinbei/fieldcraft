@@ -723,6 +723,21 @@ impl Solid {
         let (Some(ap), Some(am), Some(bp), Some(bm)) = (side(k, 1), side(k, -1), side(b, 1), side(b, -1)) else {
             return Ok(None);
         };
+        self.compact_edge_at(k, d, [b, ap, am, bp, bm], mu_e).map(Some)
+    }
+
+    /// The nodes of the compact stencil of edge d of node k: its other end b and the transverse
+    /// neighbours of k and b ([b, k₊, k₋, b₊, b₋]); `None` when one of them is unknown.
+    pub(crate) fn compact_nodes(&self, k: usize, d: usize) -> Option<[usize; 5]> {
+        let (ei, ej, ti, tj) = if d == 0 { (1, 0, 0, 1) } else { (0, 1, 1, 0) };
+        let b = self.grid.neighbour(k, ei, ej).filter(|&b| self.kind[b].known() && self.kind[k].known())?;
+        let side = |m: usize, s: isize| self.grid.neighbour(m, s * ti, s * tj).filter(|&q| self.kind[q].known());
+        Some([b, side(k, 1)?, side(k, -1)?, side(b, 1)?, side(b, -1)?])
+    }
+
+    /// [`Solid::compact_edge`] on given stencil nodes ([`Solid::compact_nodes`]).
+    pub(crate) fn compact_edge_at(&self, k: usize, d: usize, nodes: [usize; 5], mu_e: f64) -> Result<EdgeStress, Error> {
+        let [b, ap, am, bp, bm] = nodes;
         let h = self.grid.h();
         // Gradients at the edge: along the edge direction from (k, b), across it from the four
         // transverse neighbours. g[r][c] = ∂field_r/∂x_c.
@@ -744,7 +759,7 @@ impl Solid {
         let s = self.material.cauchy(&f).map_err(|e| Error::Diverged(format!("{e} at node {k}, t = {}", self.time)))?;
         let gv = grad(&|m| self.v[m]);
         let viscous = [2.0 * mu_e * gv[0][0], 2.0 * mu_e * gv[1][1], mu_e * (gv[0][1] + gv[1][0])];
-        Ok(Some(EdgeStress { stress: [s[0], s[1], s[2]], viscous, det }))
+        Ok(EdgeStress { stress: [s[0], s[1], s[2]], viscous, det })
     }
 
     /// ∇ζ at node k by central differences, one-sided next to unknown nodes.

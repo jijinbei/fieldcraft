@@ -128,7 +128,7 @@ impl StaticSettings {
         if !(self.min_increment > 0.0 && self.min_increment <= 1.0) {
             return Err(Error::Invalid(format!("min_increment must lie in (0, 1], got {}", self.min_increment)));
         }
-        if self.probe < 3 || self.probe > 9 || self.probe % 2 == 0 {
+        if self.probe < 3 || self.probe > 9 || self.probe.is_multiple_of(2) {
             return Err(Error::Invalid(format!("probe spacing must be odd in 3..=9, got {}", self.probe)));
         }
         if self.max_newton == 0
@@ -182,6 +182,11 @@ pub struct StaticTimes {
     pub cycles: f64,
     /// Topology rebuilds.
     pub topology: f64,
+    /// Parts of the held evaluations: placing the nodes and refilling the band; the cut cells
+    /// with the surface solve; the forces.
+    pub fill: f64,
+    pub cut: f64,
+    pub forces: f64,
     /// The whole solve.
     pub total: f64,
 }
@@ -479,7 +484,7 @@ impl Solid {
             for _ in 0..7 {
                 let trial: Vec<f64> = delta.iter().map(|d| alpha * d).collect();
                 let t = run.now();
-                let flips = self.place(&ctx, &trial);
+                let flips = self.place(&ctx, &trial, run);
                 // A trial that moves the surface across a node is judged on the updated
                 // topology (the held one has no cut geometry for it).
                 let e =
@@ -707,29 +712,36 @@ impl Solid {
     /// The residual at the context's base plus `delta` (per unknown), with its topology held.
     /// Leaves the body at that state.
     fn eval(&mut self, ctx: &Context, delta: &[f64], reuse_lu: bool, run: &mut Run) -> Result<Eval, Error> {
-        let flips = self.place(ctx, delta);
+        let flips = self.place(ctx, delta, run);
         self.held(ctx, flips, reuse_lu, run)
     }
 
     /// Moves the body nodes to the context's base plus `delta` and refills the band with the
     /// topology held; returns the number of nodes whose kind no longer matches φ.
-    fn place(&mut self, ctx: &Context, delta: &[f64]) -> usize {
+    fn place(&mut self, ctx: &Context, delta: &[f64], run: &mut Run) -> usize {
+        let t = run.now();
         for (u, mem) in ctx.members.iter().enumerate() {
             let d = [delta[2 * u], delta[2 * u + 1]];
             for &m in mem {
                 self.zeta[m] = [ctx.base[m][0] + d[0], ctx.base[m][1] + d[1]];
             }
         }
-        self.refill_planned(&ctx.plan)
+        let flips = self.refill_planned(&ctx.plan);
+        run.report.times.fill += run.now() - t;
+        flips
     }
 
     /// The residual at the placed state with the context's topology held.
     fn held(&mut self, ctx: &Context, flips: usize, reuse_lu: bool, run: &mut Run) -> Result<Eval, Error> {
         run.report.evaluations += 1;
+        let t0 = run.now();
         let mut cut = self.build_cut_with(Some(&ctx.cut), Some(&ctx.topo), reuse_lu, true)?;
+        let t1 = run.now();
         run.report.surface_factorizations += cut.stats().factorizations;
         run.report.surface_traction_evals += cut.stats().traction_evals;
         let force = self.mapped_forces(&mut cut, 0.0)?;
+        run.report.times.cut += t1 - t0;
+        run.report.times.forces += run.now() - t1;
         let r: Vec<f64> = ctx.unknowns.iter().flat_map(|&k| force[k]).collect();
         if !r.iter().all(|v| v.is_finite()) {
             return Err(Error::Diverged("non-finite force".into()));

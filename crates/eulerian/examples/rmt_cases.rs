@@ -331,7 +331,7 @@ fn main() {
         let its: Vec<String> = rep.newton.iter().map(|st| st.krylov.to_string()).collect();
         let tm = rep.times;
         let mut line = format!(
-            "{{\"case\":\"{case}\",\"h\":{h},\"solver\":\"static\",\"reuse\":\"{reuse}\",\"probe\":{},\"converged\":{},\"residual\":{:.3e},\"increments\":{},\"failed_increments\":{},\"newton\":{},\"krylov\":{},\"krylov_per_newton\":[{}],\"evals\":{},\"krylov_evals\":{},\"probe_evals\":{},\"pc_builds\":{},\"topology_changes\":{},\"surface_lu\":{},\"traction_evals\":{},\"mg_levels\":{},\"mg_fine\":{},\"mg_coarse\":{},\"mg_complexity\":{:.3},\"t_residual\":{:.4},\"t_probing\":{:.4},\"t_setup\":{:.4},\"t_cycles\":{:.4},\"t_topology\":{:.4},\"t_total\":{:.4},\"wall\":{wall:.4},\"nodes\":{}",
+            "{{\"case\":\"{case}\",\"h\":{h},\"solver\":\"static\",\"reuse\":\"{reuse}\",\"probe\":{},\"converged\":{},\"residual\":{:.3e},\"increments\":{},\"failed_increments\":{},\"newton\":{},\"krylov\":{},\"krylov_per_newton\":[{}],\"evals\":{},\"krylov_evals\":{},\"probe_evals\":{},\"pc_builds\":{},\"topology_changes\":{},\"surface_lu\":{},\"traction_evals\":{},\"mg_levels\":{},\"mg_fine\":{},\"mg_coarse\":{},\"mg_complexity\":{:.3},\"t_residual\":{:.4},\"t_probing\":{:.4},\"t_setup\":{:.4},\"t_cycles\":{:.4},\"t_topology\":{:.4},\"t_fill\":{:.4},\"t_cut\":{:.4},\"t_forces\":{:.4},\"t_total\":{:.4},\"wall\":{wall:.4},\"nodes\":{}",
             set.probe,
             rep.converged,
             rep.residual,
@@ -356,6 +356,9 @@ fn main() {
             tm.setup,
             tm.cycles,
             tm.topology,
+            tm.fill,
+            tm.cut,
+            tm.forces,
             tm.total,
             s.grid().len()
         );
