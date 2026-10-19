@@ -110,6 +110,41 @@ fn solve3(m: &[[f64; 3]; 3], r: [f64; 3]) -> [f64; 3] {
     out
 }
 
+/// The largest node speed in the body after removing the best-fit rigid motion v = a + ω × x,
+/// and the largest speed of that rigid motion.
+fn deformation_speed(s: &Solid) -> (f64, f64) {
+    let ks: Vec<usize> = (0..s.grid().len()).filter(|&k| matches!(s.kind(k), Some(NodeKind::Solid))).collect();
+    let n = ks.len() as f64;
+    let (mut cx, mut cy, mut vx, mut vy) = (0.0, 0.0, 0.0, 0.0);
+    for &k in &ks {
+        let x = s.grid().position(k);
+        let v = s.velocity(k).unwrap();
+        cx += x[0] / n;
+        cy += x[1] / n;
+        vx += v[0] / n;
+        vy += v[1] / n;
+    }
+    let (mut num, mut den) = (0.0, 0.0);
+    for &k in &ks {
+        let x = s.grid().position(k);
+        let v = s.velocity(k).unwrap();
+        let (dx, dy) = (x[0] - cx, x[1] - cy);
+        num += dx * (v[1] - vy) - dy * (v[0] - vx);
+        den += dx * dx + dy * dy;
+    }
+    let w = num / den;
+    let (mut res, mut rig): (f64, f64) = (0.0, 0.0);
+    for &k in &ks {
+        let x = s.grid().position(k);
+        let v = s.velocity(k).unwrap();
+        let (dx, dy) = (x[0] - cx, x[1] - cy);
+        let r = [vx - w * dy, vy + w * dx];
+        rig = rig.max(r[0].hypot(r[1]));
+        res = res.max((v[0] - r[0]).hypot(v[1] - r[1]));
+    }
+    (res, rig)
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let case = args.get(1).cloned().unwrap_or_else(|| "lame".into());
@@ -171,7 +206,8 @@ fn main() {
         .unwrap();
     }
     let t0 = std::time::Instant::now();
-    let tol = 1e-5 * 0.009 * load * c / b;
+    let tolf: f64 = get("tolf", "1").parse().unwrap();
+    let tol = tolf * 1e-5 * 0.009 * load * c / b;
     if let Some(tr) = kv.get("trace") {
         let every: usize = tr.parse().unwrap();
         for i in 0..max_steps / every {
@@ -210,13 +246,29 @@ fn main() {
         }
         return;
     }
-    let rx = match s.relax(tol, max_steps) {
-        Ok(r) => r,
-        Err(e) => {
+    // Relax until the speed, less the rigid-body part (a free body under traction is at rest
+    // only up to a rigid motion its discrete net load may drive), is below the tolerance.
+    let mut steps = 0;
+    let mut converged = false;
+    let mut rigid_speed = 0.0;
+    while steps < max_steps {
+        if let Err(e) = s.run(20) {
             println!("{{\"case\":\"{case}\",\"h\":{h},\"diverged\":\"{e}\",\"t\":{}}}", s.time());
             return;
         }
-    };
+        steps += 20;
+        let (res, rig) = deformation_speed(&s);
+        rigid_speed = rig;
+        if res < tol {
+            converged = true;
+            break;
+        }
+    }
+    struct Rx {
+        steps: usize,
+        converged: bool,
+    }
+    let rx = Rx { steps, converged };
     let wall = t0.elapsed().as_secs_f64();
 
     // u_r fit over nodes with φ < −2h.
@@ -335,7 +387,7 @@ fn main() {
     }
     let stats = s.cut_stats();
     let mut out = format!(
-        "{{\"case\":\"{case}\",\"h\":{h},\"boundary\":\"{:?}\",\"damp\":{damp},\"cfl\":{cfl},\"visc\":{visc},\"band\":\"{}\",\"law\":\"{law}\",\"steps\":{},\"converged\":{},\"wall\":{wall:.3},\"ms_per_step\":{:.4},\"nodes\":{}",
+        "{{\"case\":\"{case}\",\"h\":{h},\"boundary\":\"{:?}\",\"damp\":{damp},\"cfl\":{cfl},\"visc\":{visc},\"band\":\"{}\",\"law\":\"{law}\",\"steps\":{},\"converged\":{},\"rigid_speed\":{rigid_speed:.3e},\"wall\":{wall:.3},\"ms_per_step\":{:.4},\"nodes\":{}",
         boundary,
         if exact_band { "exact" } else { "lin" },
         rx.steps,

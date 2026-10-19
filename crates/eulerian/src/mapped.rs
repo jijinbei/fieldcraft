@@ -262,8 +262,8 @@ impl CutState {
 }
 
 impl Solid {
-    /// The stress at the surface points of the last mapped step (empty for the blurred
-    /// boundary or before the first step).
+    /// The stress at the surface points of the current configuration, from the surface-fitted
+    /// map (empty for the blurred boundary or before the first step).
     pub fn surface_stress(&self) -> Vec<SurfaceSample> {
         let Some(st) = &self.cut else {
             return Vec::new();
@@ -273,7 +273,9 @@ impl Solid {
             if !pt.valid {
                 continue;
             }
-            let Some(g) = self.surface_gradient(&st.points, p, pt.zeta) else {
+            // The blended map the fluxes use (a point on lines that meet the surface obliquely
+            // is weighted out where the other family is steeper).
+            let Some(g) = self.reconstruct(st, pt.position()).or_else(|| self.surface_gradient(&st.points, p, pt.zeta)) else {
                 continue;
             };
             let Some(f) = invert(&identity_plus(&g)) else {
@@ -1076,6 +1078,8 @@ impl Solid {
         let mut raw = vec![[0.0f64; 2]; n];
         // 1. Faces.
         let mut stats = st.stats.clone();
+        stats.mapped_faces = 0;
+        stats.fallback_points = 0;
         for k in 0..n {
             for d in 0..2 {
                 self.face_force(st, k, d, mu_e, &mut raw, &mut stats)?;
