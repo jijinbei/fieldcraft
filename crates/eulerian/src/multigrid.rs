@@ -385,10 +385,6 @@ impl Multigrid {
                 }
             }
         }
-        if let Ok(path) = std::env::var("MG_DUMP") {
-            let txt: Vec<String> = dense.chunks(m).map(|r| r.iter().map(|v| format!("{v:e}")).collect::<Vec<_>>().join(" ")).collect();
-            let _ = std::fs::write(path, txt.join("\n"));
-        }
         let coarse = DenseLu::factor(m, dense, 2 * n)?;
         let dinv = (0..a.rows()).map(|r| invert_block(&a.diagonal(r))).collect();
         levels.push(Level { a, dinv, parents: Vec::new() });

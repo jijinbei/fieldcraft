@@ -228,9 +228,10 @@ pub struct StaticReport {
     pub residual: f64,
     /// The force scale at the end (see [`StaticSettings::tolerance`]).
     pub force_scale: f64,
-    /// Load increments accepted and failed.
+    /// Load increments accepted and failed, and why each failed one did.
     pub increments: usize,
     pub failed_increments: usize,
+    pub failures: Vec<String>,
     /// Every Newton step.
     pub newton: Vec<NewtonStep>,
     /// Residual evaluations: all, and those inside Krylov products and probing.
@@ -378,7 +379,6 @@ struct Kept {
 struct Eval {
     r: Vec<f64>,
     cut: CutState,
-    flips: usize,
 }
 
 /// The solver's working state.
@@ -467,10 +467,8 @@ impl Solid {
                     }
                 }
                 Err(e) => {
-                    if std::env::var("STATIC_DEBUG").is_ok() {
-                        eprintln!("increment to {next} failed: {e}");
-                    }
                     run.report.failed_increments += 1;
+                    run.report.failures.push(format!("increment to load factor {next}: {e}"));
                     (self.zeta, self.kind, self.phi, self.cut) = saved;
                     run.kept = None;
                     inc *= 0.5;
@@ -603,68 +601,30 @@ impl Solid {
                 let flips = self.place(&ctx, &trial, run);
                 // A trial that moves the surface across a node is judged on the updated
                 // topology (the held one has no cut geometry for it).
-                let e =
-                    if flips == 0 { self.held(&ctx, 0, set.reuse_surface_lu, run) } else { Ok(Eval { r: Vec::new(), cut: ctx.cut.clone(), flips }) };
-                run.report.times.residual += run.now() - t;
-                if let Err(err) = &e
-                    && std::env::var("STATIC_DEBUG").is_ok()
-                {
-                    eprintln!("  trial α {alpha}: {err}");
-                }
-                if let Ok(e) = e {
-                    if e.flips == 0 {
-                        let n = norm2(&ctx.projected(&e.r));
-                        if n <= (1.0 - 1e-4 * alpha) * r2 {
-                            let base = self.zeta.clone();
-                            let next = Context { base, cut: e.cut, r: e.r, ..ctx.clone_structure() };
-                            accepted = Some((next, false));
-                            break;
-                        }
-                    } else {
-                        // The body changed: rebuild the topology at the trial point.
-                        let t = run.now();
-                        let rebuilt = self.rebuild().and_then(|_| self.context(Some(&ctx), run));
-                        run.report.times.topology += run.now() - t;
-                        if let Err(err) = &rebuilt
-                            && std::env::var("STATIC_DEBUG").is_ok()
-                        {
-                            eprintln!("  trial α {alpha}: rebuilt: {err}");
-                        }
-                        if let Ok(next) = rebuilt {
-                            let n = norm2(&next.projected(&next.r));
-                            if std::env::var("STATIC_DEBUG").is_ok() {
-                                let fr = 0.0;
-                                let q = next.projected(&next.r);
-                                let (mut w, mut wv) = (0, 0.0);
-                                for u in 0..next.unknowns.len() {
-                                    let v = q[2 * u].hypot(q[2 * u + 1]);
-                                    if v > wv {
-                                        wv = v;
-                                        w = next.unknowns[u];
-                                    }
-                                }
-                                let cv = next.cut.control_volumes();
-                                eprintln!(
-                                    "  trial α {alpha}: flips {} frozen {:.3e} rebuilt {:.3e} (old {:.3e}); worst node {w} at {:?} φ {:.3e} cv/h² {:.3} |r| {:.3e} was unknown {}",
-                                    e.flips,
-                                    fr,
-                                    n,
-                                    r2,
-                                    self.grid.position(w),
-                                    self.phi[w],
-                                    cv[w] / (self.grid.h() * self.grid.h()),
-                                    wv,
-                                    ctx.unknowns.contains(&w)
-                                );
-                            }
-                            if n <= (1.0 - 1e-4 * alpha) * r2 {
-                                accepted = Some((next, true));
-                                break;
-                            }
-                        }
-                        // Back to the held topology for the next trial.
-                        self.kind = ctx.topo.kind.clone();
+                if flips == 0 {
+                    let e = self.held(&ctx, set.reuse_surface_lu, run);
+                    run.report.times.residual += run.now() - t;
+                    if let Ok(e) = e
+                        && norm2(&ctx.projected(&e.r)) <= (1.0 - 1e-4 * alpha) * r2
+                    {
+                        let next = Context { base: self.zeta.clone(), cut: e.cut, r: e.r, ..ctx.clone_structure() };
+                        accepted = Some((next, false));
+                        break;
                     }
+                } else {
+                    run.report.times.residual += run.now() - t;
+                    // The body changed: rebuild the topology at the trial point.
+                    let t = run.now();
+                    let rebuilt = self.rebuild().and_then(|_| self.context(Some(&ctx), run));
+                    run.report.times.topology += run.now() - t;
+                    if let Ok(next) = rebuilt
+                        && norm2(&next.projected(&next.r)) <= (1.0 - 1e-4 * alpha) * r2
+                    {
+                        accepted = Some((next, true));
+                        break;
+                    }
+                    // Back to the held topology for the next trial.
+                    self.kind = ctx.topo.kind.clone();
                 }
                 alpha *= 0.5;
             }
@@ -833,8 +793,8 @@ impl Solid {
     /// The residual at the context's base plus `delta` (per unknown), with its topology held.
     /// Leaves the body at that state.
     fn eval(&mut self, ctx: &Context, delta: &[f64], reuse_lu: bool, run: &mut Run) -> Result<Eval, Error> {
-        let flips = self.place(ctx, delta, run);
-        self.held(ctx, flips, reuse_lu, run)
+        self.place(ctx, delta, run);
+        self.held(ctx, reuse_lu, run)
     }
 
     /// Moves the body nodes to the context's base plus `delta` and refills the band with the
@@ -853,12 +813,12 @@ impl Solid {
     }
 
     /// The residual at the placed state with the context's topology held.
-    fn held(&mut self, ctx: &Context, flips: usize, reuse_lu: bool, run: &mut Run) -> Result<Eval, Error> {
-        self.held_on(ctx, flips, reuse_lu, None, run)
+    fn held(&mut self, ctx: &Context, reuse_lu: bool, run: &mut Run) -> Result<Eval, Error> {
+        self.held_on(ctx, reuse_lu, None, run)
     }
 
     /// As [`Solid::held`] with the forces only on the faces touching `faces` (when given).
-    fn held_on(&mut self, ctx: &Context, flips: usize, reuse_lu: bool, faces: Option<&[bool]>, run: &mut Run) -> Result<Eval, Error> {
+    fn held_on(&mut self, ctx: &Context, reuse_lu: bool, faces: Option<&[bool]>, run: &mut Run) -> Result<Eval, Error> {
         run.report.evaluations += 1;
         let t0 = run.now();
         let mut cut = self.build_cut_with(Some(&ctx.cut), Some(&ctx.topo), reuse_lu, true)?;
@@ -872,7 +832,7 @@ impl Solid {
         if !r.iter().all(|v| v.is_finite()) {
             return Err(Error::Diverged("non-finite force".into()));
         }
-        Ok(Eval { r, cut, flips })
+        Ok(Eval { r, cut })
     }
 
     /// Makes sure a hierarchy for the context's topology is kept; returns whether one was built.
@@ -958,8 +918,8 @@ impl Solid {
                     for &u in &colour {
                         delta[2 * u + c] = eps;
                     }
-                    let flips = self.place(ctx, &delta, run);
-                    let e = self.held_on(ctx, flips, run.set.reuse_surface_lu, faces.as_deref(), run)?;
+                    self.place(ctx, &delta, run);
+                    let e = self.held_on(ctx, run.set.reuse_surface_lu, faces.as_deref(), run)?;
                     run.report.probe_evaluations += 1;
                     for (w, row) in rows.iter_mut().enumerate() {
                         let k = ctx.unknowns[w];
@@ -1035,8 +995,21 @@ impl Solid {
             let s = self.material.cauchy(&f)?;
             Ok(if d == 0 { [s[0] * h, s[2] * h] } else { [s[2] * h, s[1] * h] })
         };
-        // Raw rows (per dual cell node), then shared to the unknowns.
-        let mut raw: HashMap<usize, Vec<(usize, Block)>> = HashMap::new();
+        let mut index = vec![usize::MAX; n];
+        for (u, &k) in ctx.unknowns.iter().enumerate() {
+            index[k] = u;
+        }
+        // A dual cell's row goes to the control volumes holding its solid, with their shares.
+        let targets = |j: usize| -> [(usize, f64); 2] {
+            let mut out = [(usize::MAX, 0.0); 2];
+            for (slot, (o, w)) in out.iter_mut().zip(ctx.cut.share(j).into_iter().flatten()) {
+                if w != 0.0 && index[o] != usize::MAX {
+                    *slot = (index[o], w);
+                }
+            }
+            out
+        };
+        let mut rows: Vec<Vec<(usize, Block)>> = vec![Vec::new(); nu];
         let step = 1e-7;
         for (k, d, fraction) in ctx.cut.solid_faces(self) {
             if !(fraction > 0.0) {
@@ -1065,6 +1038,7 @@ impl Solid {
                 }
             }
             let (wa, wc) = (1.0 / h, 1.0 / (4.0 * h));
+            let (tk, tb) = (targets(k), targets(b));
             for (m, a_w, c_w) in [(k, -wa, 0.0), (b, wa, 0.0), (ap, 0.0, wc), (bp, 0.0, wc), (am, 0.0, -wc), (bm, 0.0, -wc)] {
                 for (u, w) in columns(m) {
                     let mut blk = [[0.0; 2]; 2];
@@ -1073,23 +1047,14 @@ impl Solid {
                             blk[comp][c] = w * (sens[comp][c][d] * a_w + sens[comp][c][1 - d] * c_w);
                         }
                     }
-                    raw.entry(k).or_default().push((u, blk));
-                    raw.entry(b).or_default().push((u, blk.map(|row| row.map(|v| -v))));
-                }
-            }
-        }
-        let mut index = vec![usize::MAX; n];
-        for (u, &k) in ctx.unknowns.iter().enumerate() {
-            index[k] = u;
-        }
-        let mut rows: Vec<Vec<(usize, Block)>> = vec![Vec::new(); nu];
-        for (j, entries) in raw {
-            for (o, w) in ctx.cut.share(j).into_iter().flatten() {
-                if w == 0.0 || index[o] == usize::MAX {
-                    continue;
-                }
-                for &(u, blk) in &entries {
-                    rows[index[o]].push((u, blk.map(|row| row.map(|v| w * v))));
+                    // + on k's dual cell, − on b's.
+                    for (t, sign) in [(tk, 1.0), (tb, -1.0)] {
+                        for (r, ws) in t {
+                            if r != usize::MAX {
+                                rows[r].push((u, blk.map(|row| row.map(|v| sign * ws * v))));
+                            }
+                        }
+                    }
                 }
             }
         }
