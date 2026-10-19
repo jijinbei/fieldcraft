@@ -16,6 +16,9 @@
 //! - [`cut`] and [`mapped`]: the default surface, [`Boundary::Mapped`] — sharp cut cells with
 //!   the traction imposed on the curved surface and the deformation gradient near it from a
 //!   surface-fitted map.
+//! - [`statics`] and [`multigrid`]: static equilibrium of the mapped boundary by Newton–Krylov
+//!   (finite-difference Jacobian products, GMRES, a geometric multigrid preconditioner) with
+//!   load continuation, instead of dynamic relaxation.
 //!
 //! The scheme, in our own implementation from the published equations:
 //! - fields at nodes (the nodes a lattice Boltzmann fluid will share later): the reference map
@@ -70,15 +73,19 @@ pub mod extrapolate;
 pub mod grid;
 pub mod mapped;
 pub mod material;
+pub mod multigrid;
 pub mod shape;
 mod sharp;
 pub mod solid;
+pub mod statics;
 
 pub use grid::Grid;
 pub use mapped::{CutStats, CutView, SurfaceSample};
 pub use material::Material;
+pub use multigrid::MultigridStats;
 pub use shape::Shape;
 pub use solid::{Boundary, NodeKind, Relaxation, Settings, Solid};
+pub use statics::{NewtonStep, StaticReport, StaticSettings, StaticTimes};
 
 /// Errors of the Eulerian solver.
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]

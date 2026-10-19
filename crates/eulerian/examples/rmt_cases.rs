@@ -3,18 +3,24 @@
 //! hole, with the blurred or the mapped boundary.
 //!
 //! `cargo run --release -p fieldcraft-eulerian --example rmt_cases -- CASE H [key=value ...]`
-//! with CASE one of lame, disc, kirsch and keys
+//! with CASE one of lame, disc, kirsch, nh (the Lamé cylinder at p = 8000 with the decoupled
+//! neo-Hookean law of FieldCraft's FEM, load ramped in ten increments) and keys
 //! - `boundary=blurred|mapped` (default mapped),
 //! - `damp=` damping multiplier (default 1: γ = 0.5 c_P / b),
 //! - `cfl=` (default 0.4), `visc=` κ (default 0.1),
 //! - `band=lin|exact` (ζ outside the body extrapolated, or the exact solution),
 //! - `law=nh|lin` (neo-Hookean or linear elastic, default nh),
-//! - `dump=PREFIX` (writes PREFIX_nodes.csv, PREFIX_surface.csv, PREFIX_cut.json).
+//! - `dump=PREFIX` (writes PREFIX_nodes.csv, PREFIX_surface.csv, PREFIX_cut.json),
+//! - `solver=relax|static` (dynamic relaxation, default, or the Newton–Krylov static solve),
+//!   with `incs=` initial load increments, `probe=` colour spacing, `sweeps=`, `stol=`
+//!   tolerance, `reuse=all|none|pc|lu` (what is kept while the topology is unchanged),
+//!   `newton=1` (print every Newton step),
+//! - `compare=1` (static: also relax a copy and report the largest difference of ζ).
 //!
 //! Prints one JSON line of metrics.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-use fieldcraft_eulerian::{Boundary, Grid, Limits, Material, NodeKind, Settings, Shape, Solid};
+use fieldcraft_eulerian::{Boundary, Grid, Limits, Material, NodeKind, Settings, Shape, Solid, StaticSettings};
 use std::collections::HashMap;
 use std::fmt::Write as _;
 
@@ -145,6 +151,68 @@ fn deformation_speed(s: &Solid) -> (f64, f64) {
     (res, rig)
 }
 
+/// The deformed position of the material at reference radius `r0` along the four grid axes
+/// (averaged): ξ along each half-axis by a quadratic through the three body nodes whose ξ is
+/// nearest r0, solved for ξ = r0.
+fn deformed_radius(s: &Solid, r0: f64) -> f64 {
+    let g = s.grid();
+    let mut total = 0.0;
+    for (axis, sign) in [(0usize, 1.0f64), (0, -1.0), (1, 1.0), (1, -1.0)] {
+        let mut pts: Vec<(f64, f64)> = Vec::new();
+        for k in 0..g.len() {
+            let x = g.position(k);
+            if !matches!(s.kind(k), Some(NodeKind::Solid)) || x[1 - axis].abs() > 1e-9 || x[axis] * sign <= 0.0 {
+                continue;
+            }
+            let xi = s.reference(k).unwrap();
+            pts.push((x[axis] * sign, xi[axis] * sign));
+        }
+        pts.sort_by(|a, b| (a.1 - r0).abs().total_cmp(&(b.1 - r0).abs()));
+        if pts.len() < 3 {
+            return f64::NAN;
+        }
+        pts.truncate(3);
+        let q = |x: f64| {
+            let mut v = 0.0;
+            for i in 0..3 {
+                let mut w = 1.0;
+                for j in 0..3 {
+                    if j != i {
+                        w *= (x - pts[j].0) / (pts[i].0 - pts[j].0);
+                    }
+                }
+                v += w * pts[i].1;
+            }
+            v
+        };
+        let mut x = pts[0].0;
+        for _ in 0..30 {
+            let d = 1e-6;
+            let slope = (q(x + d) - q(x - d)) / (2.0 * d);
+            x -= (q(x) - r0) / slope;
+        }
+        total += x;
+    }
+    total / 4.0
+}
+
+/// Relaxes until the deformation speed (the speed less the best-fit rigid motion) is below
+/// `tol`; returns (steps, converged, rigid speed) or the error text.
+fn relax_to(s: &mut Solid, tol: f64, max_steps: usize) -> Result<(usize, bool, f64), String> {
+    let mut steps = 0;
+    let mut rigid = 0.0;
+    while steps < max_steps {
+        s.run(20).map_err(|e| e.to_string())?;
+        steps += 20;
+        let (res, rig) = deformation_speed(s);
+        rigid = rig;
+        if res < tol {
+            return Ok((steps, true, rigid));
+        }
+    }
+    Ok((steps, false, rigid))
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let case = args.get(1).cloned().unwrap_or_else(|| "lame".into());
@@ -161,7 +229,17 @@ fn main() {
     // Load multiplier (the closed forms are linear in the load; stresses are reported per unit
     // multiplier).
     let load: f64 = get("load", "1").parse().unwrap();
-    let mat = if law == "lin" { Material::linear_elastic(E, NU, 1.0).unwrap() } else { Material::neo_hookean(E, NU, 1.0).unwrap() };
+    let solver = get("solver", "relax");
+    let nh = case == "nh";
+    // The neo-Hookean cylinder: p = 8000 = 80 × P with the decoupled law.
+    let load: f64 = if nh { get("load", "80").parse().unwrap() } else { load };
+    let mat = if nh {
+        Material::neo_hookean_decoupled(E, NU, 1.0).unwrap()
+    } else if law == "lin" {
+        Material::linear_elastic(E, NU, 1.0).unwrap()
+    } else {
+        Material::neo_hookean(E, NU, 1.0).unwrap()
+    };
 
     let (a, b) = if case == "kirsch" { (A_K, 20.0) } else { (10.0, 20.0) };
     let n = (2.0 * (b + 5.0) / h).round() as usize + 1;
@@ -208,6 +286,147 @@ fn main() {
     let t0 = std::time::Instant::now();
     let tolf: f64 = get("tolf", "1").parse().unwrap();
     let tol = tolf * 1e-5 * 0.009 * load * c / b;
+    if solver == "static" {
+        fn clock() -> f64 {
+            use std::sync::OnceLock;
+            static START: OnceLock<std::time::Instant> = OnceLock::new();
+            START.get_or_init(std::time::Instant::now).elapsed().as_secs_f64()
+        }
+        let reuse = get("reuse", "all");
+        let set = StaticSettings {
+            increments: get("incs", if nh { "4" } else { "1" }).parse().unwrap(),
+            probe: get("probe", "5").parse().unwrap(),
+            sweeps: get("sweeps", "2").parse().unwrap(),
+            tolerance: get("stol", "1e-9").parse().unwrap(),
+            reuse_preconditioner: reuse == "all" || reuse == "pc",
+            reuse_surface_lu: reuse == "all" || reuse == "lu",
+            clock: Some(clock),
+            ..StaticSettings::default()
+        };
+        let reference = (get("compare", "0") == "1").then(|| s.clone());
+        let rep = match s.solve_static(&set) {
+            Ok(r) => r,
+            Err(e) => {
+                println!("{{\"case\":\"{case}\",\"h\":{h},\"solver\":\"static\",\"failed\":\"{e}\"}}");
+                return;
+            }
+        };
+        let wall = t0.elapsed().as_secs_f64();
+        if get("newton", "0") == "1" {
+            for st in &rep.newton {
+                eprintln!(
+                    "load {:.3} res {:.3e} unknowns {} krylov {} lin {:.2e}/{:.1e} step {} pc {} topo {}",
+                    st.load,
+                    st.residual,
+                    st.unknowns,
+                    st.krylov,
+                    st.linear_residual,
+                    st.forcing,
+                    st.step,
+                    st.preconditioner_built,
+                    st.topology_changed
+                );
+            }
+        }
+        let its: Vec<String> = rep.newton.iter().map(|st| st.krylov.to_string()).collect();
+        let tm = rep.times;
+        let mut line = format!(
+            "{{\"case\":\"{case}\",\"h\":{h},\"solver\":\"static\",\"reuse\":\"{reuse}\",\"probe\":{},\"converged\":{},\"residual\":{:.3e},\"increments\":{},\"failed_increments\":{},\"newton\":{},\"krylov\":{},\"krylov_per_newton\":[{}],\"evals\":{},\"krylov_evals\":{},\"probe_evals\":{},\"pc_builds\":{},\"topology_changes\":{},\"surface_lu\":{},\"traction_evals\":{},\"mg_levels\":{},\"mg_fine\":{},\"mg_coarse\":{},\"mg_complexity\":{:.3},\"t_residual\":{:.4},\"t_probing\":{:.4},\"t_setup\":{:.4},\"t_cycles\":{:.4},\"t_topology\":{:.4},\"t_total\":{:.4},\"wall\":{wall:.4},\"nodes\":{}",
+            set.probe,
+            rep.converged,
+            rep.residual,
+            rep.increments,
+            rep.failed_increments,
+            rep.newton.len(),
+            rep.krylov_iterations(),
+            its.join(","),
+            rep.evaluations,
+            rep.krylov_evaluations,
+            rep.probe_evaluations,
+            rep.preconditioner_builds,
+            rep.topology_changes,
+            rep.surface_factorizations,
+            rep.surface_traction_evals,
+            rep.multigrid.levels,
+            rep.multigrid.fine_nodes,
+            rep.multigrid.coarse_nodes,
+            rep.multigrid.complexity,
+            tm.residual,
+            tm.probing,
+            tm.setup,
+            tm.cycles,
+            tm.topology,
+            tm.total,
+            s.grid().len()
+        );
+        write!(line, ",\"ur_def\":{:.6}", deformed_radius(&s, a) - a).unwrap();
+        if let Some(mut r) = reference {
+            let tr = std::time::Instant::now();
+            let ramp = if nh { 10 } else { 1 };
+            let mut out = Ok((0, false, 0.0));
+            let mut steps = 0;
+            for i in 1..=ramp {
+                r.set_load_factor(i as f64 / ramp as f64).unwrap();
+                let t = if i == ramp { tol } else { 100.0 * tol };
+                out = relax_to(&mut r, t, max_steps);
+                match &out {
+                    Ok(o) => steps += o.0,
+                    Err(_) => break,
+                }
+            }
+            let relax_wall = tr.elapsed().as_secs_f64();
+            match out {
+                Ok((_, conv, _)) => {
+                    let (mut dz, mut zmax): (f64, f64) = (0.0, 0.0);
+                    let mut differ = 0;
+                    for k in 0..s.grid().len() {
+                        let a_in = matches!(s.kind(k), Some(NodeKind::Solid));
+                        let b_in = matches!(r.kind(k), Some(NodeKind::Solid));
+                        if a_in != b_in {
+                            differ += 1;
+                        }
+                        if a_in && b_in {
+                            let (p, q) = (s.reference(k).unwrap(), r.reference(k).unwrap());
+                            let x = s.grid().position(k);
+                            dz = dz.max((p[0] - q[0]).hypot(p[1] - q[1]));
+                            zmax = zmax.max((p[0] - x[0]).hypot(p[1] - x[1]));
+                        }
+                    }
+                    write!(
+                        line,
+                        ",\"relax_steps\":{steps},\"relax_converged\":{conv},\"relax_wall\":{relax_wall:.3},\"relax_ur_def\":{:.6},\"max_dzeta\":{dz:.3e},\"max_u\":{zmax:.3e},\"kind_differs\":{differ}",
+                        deformed_radius(&r, a) - a
+                    )
+                    .unwrap();
+                }
+                Err(e) => write!(line, ",\"relax_failed\":\"{e}\"").unwrap(),
+            }
+        }
+        println!("{line}}}");
+        return;
+    }
+    if nh {
+        // Ten load increments, each relaxed (the intermediate ones loosely).
+        let tr = std::time::Instant::now();
+        let mut steps = 0;
+        for i in 1..=10 {
+            s.set_load_factor(i as f64 / 10.0).unwrap();
+            match relax_to(&mut s, if i == 10 { tol } else { 100.0 * tol }, max_steps) {
+                Ok(o) => steps += o.0,
+                Err(e) => {
+                    println!("{{\"case\":\"nh\",\"h\":{h},\"diverged\":\"{e}\"}}");
+                    return;
+                }
+            }
+        }
+        println!(
+            "{{\"case\":\"nh\",\"h\":{h},\"solver\":\"relax\",\"steps\":{steps},\"wall\":{:.3},\"ur_def\":{:.6},\"nodes\":{}}}",
+            tr.elapsed().as_secs_f64(),
+            deformed_radius(&s, a) - a,
+            s.grid().len()
+        );
+        return;
+    }
     if let Some(tr) = kv.get("trace") {
         let every: usize = tr.parse().unwrap();
         for i in 0..max_steps / every {

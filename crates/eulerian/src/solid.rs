@@ -193,6 +193,9 @@ pub struct Solid {
     pub(crate) fallbacks: usize,
     /// Ghost nodes of the last rebuild filled by the linear constrained fit.
     pub(crate) linear_fills: usize,
+    /// Factor on the ambient stress and the body force (the load parameter of a continuation;
+    /// 1 by default). The mapped boundary applies it.
+    pub(crate) load: f64,
 }
 
 /// The stresses at the middle of an edge.
@@ -257,6 +260,7 @@ impl Solid {
             cut: None,
             fallbacks: 0,
             linear_fills: 0,
+            load: 1.0,
         };
         if settings.boundary == Boundary::Mapped && (s.grid.periodic()[0] || s.grid.periodic()[1]) && shape != Shape::Everywhere {
             return Err(Error::Invalid("not supported yet: a mapped surface on a periodic grid".into()));
@@ -345,6 +349,19 @@ impl Solid {
         }
         self.body = Some(Field(Arc::new(force)));
         Ok(())
+    }
+
+    /// Scales the ambient stress and the body force by `factor` (a load ramp). The mapped
+    /// boundary applies it; the blurred boundary ignores it.
+    pub fn set_load_factor(&mut self, factor: f64) -> Result<(), Error> {
+        self.load = finite("load factor", factor)?;
+        self.cut = None;
+        Ok(())
+    }
+
+    /// The load factor.
+    pub fn load_factor(&self) -> f64 {
+        self.load
     }
 
     /// For verification only: prescribes ζ = ξ − x outside the body (in the band) instead of
@@ -845,6 +862,42 @@ impl Solid {
                 self.phi[k] = self.shape.phi0(self.xi(k));
             }
         }
+    }
+
+    /// As [`Solid::rebuild`] with the node kinds held: φ at the body nodes, the band refilled
+    /// from them, and no node enters or leaves the body. Returns the number of nodes whose kind
+    /// no longer matches the sign of φ (body nodes with φ ≥ 0, band nodes with φ < 0), which a
+    /// static solve treats as a change of the cut topology.
+    pub(crate) fn refill_frozen(&mut self) -> usize {
+        let n = self.grid.len();
+        let mut flips = 0;
+        for k in 0..n {
+            if self.kind[k].source() {
+                self.phi[k] = self.shape.phi0(self.xi(k));
+                if self.kind[k] == NodeKind::Solid && !(self.phi[k] < 0.0) {
+                    flips += 1;
+                }
+            }
+        }
+        let source: Vec<bool> = self.kind.iter().map(|k| k.source()).collect();
+        let target = vec![true; n];
+        let filled = layered_fill(&self.grid, &source, &target, self.settings.band_layers, &mut self.zeta);
+        if let Some(f) = &self.exterior {
+            for k in 0..n {
+                if filled[k] {
+                    self.zeta[k] = (f.0)(self.grid.position(k));
+                }
+            }
+        }
+        for k in 0..n {
+            if self.kind[k] == NodeKind::Band {
+                self.phi[k] = self.shape.phi0(self.xi(k));
+                if self.phi[k] < 0.0 {
+                    flips += 1;
+                }
+            }
+        }
+        flips
     }
 
     /// Extrapolates v from the nodes that carry it to the other known nodes.

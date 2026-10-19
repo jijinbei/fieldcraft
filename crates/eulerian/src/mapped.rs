@@ -46,6 +46,7 @@ use crate::cut::{self, CellCut, CellInput, Curve, GAUSS2, GAUSS3, P2};
 use crate::material::{Stress, Tensor};
 use crate::solid::{NodeKind, Solid, identity_plus, invert};
 use std::collections::HashMap;
+use std::sync::Arc;
 
 /// The smallest |n_d| of a surface point on a grid line along axis d.
 const MIN_NORMAL: f64 = 0.3;
@@ -127,6 +128,10 @@ pub struct CutStats {
     pub sweeps: usize,
     /// The last iteration's largest change of a surface value.
     pub last_change: f64,
+    /// Banded LU factorisations of the surface conditions (one per chain and Jacobian).
+    pub factorizations: usize,
+    /// Evaluations of a surface point's traction condition.
+    pub traction_evals: usize,
 }
 
 /// The cut cells, control volumes and surface of one step.
@@ -148,7 +153,26 @@ pub(crate) struct CutState {
     moment: Vec<P2>,
     /// Nodes near the surface (corners of cut cells, nodes behind surface points).
     near: Vec<bool>,
+    /// Small control volumes merged into a neighbour: (node, the node it joined), in order.
+    merges: Vec<(usize, usize)>,
+    /// The chains of surface points and the factorised Jacobian of each chain's conditions.
+    chains: Vec<Vec<usize>>,
+    lus: Vec<Option<Arc<BandLu>>>,
     stats: CutStats,
+}
+
+/// The discrete choices of a cut state: which nodes are in the body, which surface points
+/// carry a value and how they are matched along the surface, and which control volumes are
+/// merged. With these held, the forces are continuous functions of ζ (crossings, areas,
+/// normals and surface values move, the structure does not), which is what a Newton solve
+/// needs; a static solve holds them through each linearisation and updates them between
+/// Newton steps.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct Topology {
+    pub(crate) kind: Vec<NodeKind>,
+    /// Per surface point in build order: (n₁, d, outside towards +d), valid, matches.
+    points: Vec<((usize, usize, bool), bool, [Option<usize>; 5])>,
+    merges: Vec<(usize, usize)>,
 }
 
 /// The stress at a point of the surface.
@@ -252,6 +276,36 @@ fn traction(s: &[f64; 3], n: P2) -> P2 {
 }
 
 impl CutState {
+    /// The discrete choices of this state, with the node kinds it was built for.
+    pub(crate) fn topology(&self, kind: &[NodeKind]) -> Topology {
+        Topology {
+            kind: kind.to_vec(),
+            points: self.points.iter().map(|p| ((p.n1, p.d, p.sigma > 0.0), p.valid, p.nb)).collect(),
+            merges: self.merges.clone(),
+        }
+    }
+
+    /// The node holding the control volume of node k, when k's solid belongs to one.
+    pub(crate) fn owner(&self, k: usize) -> Option<usize> {
+        self.owner.get(k).copied().flatten()
+    }
+
+    /// The solid area of the control volume held by each node.
+    pub(crate) fn control_volumes(&self) -> Vec<f64> {
+        let mut cv = vec![0.0; self.area.len()];
+        for (k, sh) in self.share.iter().enumerate() {
+            for (o, w) in sh.iter().flatten() {
+                cv[*o] += w * self.area[k];
+            }
+        }
+        cv
+    }
+
+    /// The counters of this state.
+    pub(crate) fn stats(&self) -> &CutStats {
+        &self.stats
+    }
+
     /// ∇ζ at node k from the surface-fitted map, for nodes near the surface.
     pub(crate) fn node_gradient(&self, solid: &Solid, k: usize) -> Option<Tensor> {
         if !*self.near.get(k)? {
@@ -365,9 +419,17 @@ impl Solid {
             }
             self.shape.phi0(xi)
         };
-        // φ ≥ 0 at the outside node; exactly 0 puts the surface on it.
+        // φ ≥ 0 at the outside node; exactly 0 puts the surface on it. A held node kind that no
+        // longer matches φ (a static solve between topology updates) puts the surface on the
+        // node that crossed, so the crossing moves continuously to the end of the edge.
         let f1 = f(1.0);
-        let t = if f1 > 0.0 { cut::bracketed_root(&f, 0.0, 1.0, self.phi[n_in], f1, 1e-14) } else { 1.0 };
+        let t = if !(self.phi[n_in] < 0.0) {
+            0.0
+        } else if f1 > 0.0 {
+            cut::bracketed_root(&f, 0.0, 1.0, self.phi[n_in], f1, 1e-14)
+        } else {
+            1.0
+        };
         Ok(if self.inside(a) { t } else { 1.0 - t })
     }
 
@@ -391,6 +453,11 @@ impl Solid {
     /// The ambient stress at x (in the cell with lower-left node c0): the field when given,
     /// else bilinear in the cell's node values.
     fn ambient_at(&self, x: P2, c0: usize) -> [f64; 3] {
+        let s = self.ambient_unscaled(x, c0);
+        [self.load * s[0], self.load * s[1], self.load * s[2]]
+    }
+
+    fn ambient_unscaled(&self, x: P2, c0: usize) -> [f64; 3] {
         if let Some(f) = &self.ambient_field {
             return (f.0)(x);
         }
@@ -418,6 +485,17 @@ impl Solid {
 
     /// As [`Solid::build_cut`], warm-starting the surface values from `prev`.
     fn build_cut_from(&self, prev: Option<&CutState>) -> Result<CutState, Error> {
+        self.build_cut_with(prev, None, false, true)
+    }
+
+    /// Builds the cut state, warm-starting the surface values from `prev`. With `frozen`, the
+    /// surface points' validity and matches and the merges are taken from it instead of being
+    /// decided (the node kinds must already be its kinds). With `reuse_lu` and a frozen
+    /// topology, the surface conditions are solved by the chord method with the factorised
+    /// Jacobians of `prev` (refreshed when a chain converges slowly); without it every
+    /// iteration refactorises, as in the dynamic step. Without `solve` the surface values are
+    /// left at their warm start (for reading the topology only).
+    pub(crate) fn build_cut_with(&self, prev: Option<&CutState>, frozen: Option<&Topology>, reuse_lu: bool, solve: bool) -> Result<CutState, Error> {
         let n = self.grid.len();
         let h = self.grid.h();
         let mut stats = CutStats::default();
@@ -529,34 +607,45 @@ impl Solid {
                 cv[o] += w * area[k];
             }
         }
-        for k in 0..n {
-            let own = share[k].is_some_and(|sh| sh[0] == (k, 1.0));
-            if !own || self.kind[k] == NodeKind::Fixed || cv[k] >= MERGE_FRACTION * h * h {
-                continue;
-            }
-            let mut best: Option<usize> = None;
-            for (di, dj) in [(1, 0), (-1, 0), (0, 1), (0, -1)] {
-                if let Some(m) = self.grid.neighbour(k, di, dj)
-                    && share[m].is_some_and(|sh| sh[0] == (m, 1.0))
-                    && best.is_none_or(|b| self.phi[m] < self.phi[b])
-                    && self.phi[m] < self.phi[k]
-                {
-                    best = Some(m);
-                }
-            }
-            if let Some(m) = best {
-                for sh in share.iter_mut().flatten() {
-                    for e in sh.iter_mut() {
-                        if e.0 == k {
-                            e.0 = m;
-                        }
+        let mut merges = Vec::new();
+        let mut merge = |k: usize, m: usize, share: &mut Vec<Option<[(usize, f64); 2]>>, cv: &mut Vec<f64>| {
+            for sh in share.iter_mut().flatten() {
+                for e in sh.iter_mut() {
+                    if e.0 == k {
+                        e.0 = m;
                     }
                 }
-                cv[m] += cv[k];
-                cv[k] = 0.0;
-                stats.merged += 1;
+            }
+            cv[m] += cv[k];
+            cv[k] = 0.0;
+            merges.push((k, m));
+        };
+        if let Some(t) = frozen {
+            for &(k, m) in &t.merges {
+                merge(k, m, &mut share, &mut cv);
+            }
+        } else {
+            for k in 0..n {
+                let own = share[k].is_some_and(|sh| sh[0] == (k, 1.0));
+                if !own || self.kind[k] == NodeKind::Fixed || cv[k] >= MERGE_FRACTION * h * h {
+                    continue;
+                }
+                let mut best: Option<usize> = None;
+                for (di, dj) in [(1, 0), (-1, 0), (0, 1), (0, -1)] {
+                    if let Some(m) = self.grid.neighbour(k, di, dj)
+                        && share[m].is_some_and(|sh| sh[0] == (m, 1.0))
+                        && best.is_none_or(|b| self.phi[m] < self.phi[b])
+                        && self.phi[m] < self.phi[k]
+                    {
+                        best = Some(m);
+                    }
+                }
+                if let Some(m) = best {
+                    merge(k, m, &mut share, &mut cv);
+                }
             }
         }
+        stats.merged = merges.len();
         let owner: Vec<Option<usize>> = share.iter().map(|sh| sh.map(|sh| if sh[1].1 > sh[0].1 { sh[1].0 } else { sh[0].0 })).collect();
 
         // Surface points.
@@ -610,9 +699,21 @@ impl Solid {
             }
         }
         stats.surface_points = points.len();
+        if let Some(t) = frozen {
+            if t.points.len() != points.len() {
+                return Err(Error::Diverged("the held cut topology does not match the surface".into()));
+            }
+            for (pt, (key, valid, nb)) in points.iter_mut().zip(&t.points) {
+                if *key != (pt.n1, pt.d, pt.sigma > 0.0) {
+                    return Err(Error::Diverged("the held cut topology does not match the surface".into()));
+                }
+                pt.valid = *valid;
+                pt.nb = *nb;
+            }
+        }
         // Match each point with the points of the same family and orientation on the
         // neighbouring lines (the nearest along the line), then drop points without neighbours.
-        for _ in 0..2 {
+        for _ in 0..if frozen.is_some() { 0 } else { 2 } {
             for p in 0..points.len() {
                 let mut nb = [None; 5];
                 if points[p].valid {
@@ -694,12 +795,19 @@ impl Solid {
             })
             .collect();
         let chains = surface_chains(&points);
-        for it in 0..MAX_NEWTON {
+        let chord = reuse_lu && frozen.is_some();
+        let mut lus: Vec<Option<Arc<BandLu>>> = match prev {
+            Some(p) if chord && p.chains == chains => p.lus.clone(),
+            _ => vec![None; chains.len()],
+        };
+        let mut last = vec![f64::INFINITY; chains.len()];
+        for it in 0..if solve { MAX_NEWTON } else { 0 } {
             let mut change: f64 = 0.0;
-            for ch in &chains {
+            for (ci, ch) in chains.iter().enumerate() {
                 let m = ch.len();
                 let mut r = vec![0.0; 2 * m];
                 let mut folded = false;
+                stats.traction_evals += m;
                 for (i, &p) in ch.iter().enumerate() {
                     match self.traction_residual(&points, p, points[p].zeta, targets[p]) {
                         Ok(v) => {
@@ -719,36 +827,54 @@ impl Solid {
                 }
                 if folded {
                     change = f64::INFINITY;
+                    lus[ci] = None;
                     continue;
                 }
-                let mut jac = Band::new(2 * m, 5, 5);
-                for (i, &p) in ch.iter().enumerate() {
-                    let eps = 1e-7 * h * points[p].s.max(1e-3);
-                    for c in 0..2 {
-                        let z0 = points[p].zeta;
-                        points[p].zeta[c] += eps;
-                        for j in i.saturating_sub(2)..=(i + 2).min(m - 1) {
-                            let q = ch[j];
-                            let rq = self.traction_residual(&points, q, points[q].zeta, targets[q]);
-                            if let Ok(rq) = rq {
-                                for row in 0..2 {
-                                    jac.set(2 * j + row, 2 * i + c, (rq[row] - r[2 * j + row]) / eps);
+                let lu = match lus.get(ci).and_then(|l| l.clone()) {
+                    Some(lu) if chord => lu,
+                    _ => {
+                        let mut jac = Band::new(2 * m, 5, 5);
+                        for (i, &p) in ch.iter().enumerate() {
+                            let eps = 1e-7 * h * points[p].s.max(1e-3);
+                            for c in 0..2 {
+                                let z0 = points[p].zeta;
+                                points[p].zeta[c] += eps;
+                                for j in i.saturating_sub(2)..=(i + 2).min(m - 1) {
+                                    let q = ch[j];
+                                    stats.traction_evals += 1;
+                                    let rq = self.traction_residual(&points, q, points[q].zeta, targets[q]);
+                                    if let Ok(rq) = rq {
+                                        for row in 0..2 {
+                                            jac.set(2 * j + row, 2 * i + c, (rq[row] - r[2 * j + row]) / eps);
+                                        }
+                                    }
                                 }
+                                points[p].zeta = z0;
                             }
                         }
-                        points[p].zeta = z0;
+                        stats.factorizations += 1;
+                        let lu = Arc::new(jac.factor().ok_or_else(|| Error::Diverged("the surface conditions are singular".into()))?);
+                        lus[ci] = Some(lu.clone());
+                        lu
                     }
-                }
+                };
                 let rhs: Vec<f64> = r.iter().map(|v| -v).collect();
-                let dz = jac.solve(rhs).ok_or_else(|| Error::Diverged("the surface conditions are singular".into()))?;
+                let dz = lu.solve(rhs).ok_or_else(|| Error::Diverged("the surface conditions are singular".into()))?;
+                let mut chain_change: f64 = 0.0;
                 for (i, &p) in ch.iter().enumerate() {
                     let d = [dz[2 * i], dz[2 * i + 1]];
                     if !(d[0].is_finite() && d[1].is_finite()) {
                         return Err(Error::Diverged(format!("the surface value at node {} did not converge", points[p].n1)));
                     }
                     points[p].zeta = [points[p].zeta[0] + d[0], points[p].zeta[1] + d[1]];
-                    change = change.max(d[0].abs()).max(d[1].abs());
+                    chain_change = chain_change.max(d[0].abs()).max(d[1].abs());
                 }
+                // A chord step that contracts slowly: refactorise at the next iteration.
+                if chord && chain_change > tol && chain_change > 0.1 * last[ci] {
+                    lus[ci] = None;
+                }
+                last[ci] = chain_change;
+                change = change.max(chain_change);
             }
             stats.sweeps = it + 1;
             stats.last_change = change;
@@ -761,7 +887,7 @@ impl Solid {
             pt.deviation = [pt.zeta[0] - lin[0], pt.zeta[1] - lin[1]];
         }
 
-        Ok(CutState { class, cells, points, lines, owner, share, area, moment, near, stats })
+        Ok(CutState { class, cells, points, lines, owner, share, area, moment, near, merges, chains, lus, stats })
     }
 
     /// The cell (lower-left node) containing x, clamped to the grid.
@@ -1086,7 +1212,36 @@ impl Solid {
             }
         }
         st.stats = stats;
-        // 2. The traction on the curved surface and the body force.
+        self.add_loads(st, &mut raw);
+        let mut force = vec![[0.0f64; 2]; n];
+        for k in 0..n {
+            for (o, w) in st.share[k].into_iter().flatten() {
+                force[o][0] += w * raw[k][0];
+                force[o][1] += w * raw[k][1];
+            }
+        }
+        Ok(force)
+    }
+
+    /// The external load on every control volume (at the node that holds it): the traction on
+    /// the curved surface and the body force.
+    pub(crate) fn mapped_loads(&self, st: &CutState) -> Vec<[f64; 2]> {
+        let n = self.grid.len();
+        let mut raw = vec![[0.0f64; 2]; n];
+        self.add_loads(st, &mut raw);
+        let mut force = vec![[0.0f64; 2]; n];
+        for k in 0..n {
+            for (o, w) in st.share[k].into_iter().flatten() {
+                force[o][0] += w * raw[k][0];
+                force[o][1] += w * raw[k][1];
+            }
+        }
+        force
+    }
+
+    /// Adds the traction on the curved surface and the body force to the dual cells' forces.
+    fn add_loads(&self, st: &CutState, raw: &mut [[f64; 2]]) {
+        let n = self.grid.len();
         for (c0, cell) in st.cells.iter() {
             let Some(c) = self.cell_corners(*c0) else {
                 continue;
@@ -1105,19 +1260,11 @@ impl Solid {
                 if st.area[k] > 0.0 {
                     let c = [st.moment[k][0] / st.area[k], st.moment[k][1] / st.area[k]];
                     let f = (b.0)(c);
-                    raw[k][0] += f[0] * st.area[k];
-                    raw[k][1] += f[1] * st.area[k];
+                    raw[k][0] += self.load * f[0] * st.area[k];
+                    raw[k][1] += self.load * f[1] * st.area[k];
                 }
             }
         }
-        let mut force = vec![[0.0f64; 2]; n];
-        for k in 0..n {
-            for (o, w) in st.share[k].into_iter().flatten() {
-                force[o][0] += w * raw[k][0];
-                force[o][1] += w * raw[k][1];
-            }
-        }
-        Ok(force)
     }
 
     /// Adds the flux through the face between node k and its +d neighbour to both control
@@ -1232,6 +1379,7 @@ fn surface_chains(points: &[SurfacePoint]) -> Vec<Vec<usize>> {
 
 /// A square band matrix (kl sub- and ku superdiagonals, room for the fill of partial
 /// pivoting), solved by LU with partial pivoting.
+#[derive(Debug, Clone)]
 struct Band {
     n: usize,
     kl: usize,
@@ -1267,9 +1415,17 @@ impl Band {
     }
 
     /// Solves A x = b; `None` when singular.
-    fn solve(mut self, mut b: Vec<f64>) -> Option<Vec<f64>> {
+    #[cfg(test)]
+    fn solve(self, b: Vec<f64>) -> Option<Vec<f64>> {
+        self.factor()?.solve(b)
+    }
+
+    /// LU with partial pivoting in place (LINPACK order: the multipliers stay where they were
+    /// computed, the row swaps are replayed on the right-hand side); `None` when singular.
+    fn factor(mut self) -> Option<BandLu> {
         let n = self.n;
         let reach = self.kl + self.ku;
+        let mut pivots = vec![0; n];
         for k in 0..n {
             let last = (k + self.kl).min(n - 1);
             let mut piv = k;
@@ -1282,6 +1438,7 @@ impl Band {
             if !(pv.abs() > 0.0) || !pv.is_finite() {
                 return None;
             }
+            pivots[k] = piv;
             let right = (k + reach).min(n - 1);
             if piv != k {
                 for j in k..=right {
@@ -1291,19 +1448,49 @@ impl Band {
                         self.a[c] = x;
                     }
                 }
-                b.swap(k, piv);
             }
             for i in k + 1..=last {
                 let f = self.get(i, k) / pv;
-                if f == 0.0 {
-                    continue;
-                }
-                for j in k..=right {
-                    if let Some(c) = self.at(i, j) {
-                        self.a[c] -= f * self.get(k, j);
+                if f != 0.0 {
+                    for j in k + 1..=right {
+                        if let Some(c) = self.at(i, j) {
+                            self.a[c] -= f * self.get(k, j);
+                        }
                     }
                 }
-                b[i] -= f * b[k];
+                if let Some(c) = self.at(i, k) {
+                    self.a[c] = f;
+                }
+            }
+        }
+        Some(BandLu { band: self, pivots })
+    }
+}
+
+/// A factorised [`Band`]: U on and above the diagonal, the multipliers below, the pivot rows.
+#[derive(Debug, Clone)]
+pub(crate) struct BandLu {
+    band: Band,
+    pivots: Vec<usize>,
+}
+
+impl BandLu {
+    /// Solves A x = b; `None` when the result is not finite.
+    fn solve(&self, mut b: Vec<f64>) -> Option<Vec<f64>> {
+        let a = &self.band;
+        let n = a.n;
+        if b.len() != n {
+            return None;
+        }
+        let reach = a.kl + a.ku;
+        for k in 0..n {
+            let p = self.pivots[k];
+            if p != k {
+                b.swap(k, p);
+            }
+            let last = (k + a.kl).min(n - 1);
+            for i in k + 1..=last {
+                b[i] -= a.get(i, k) * b[k];
             }
         }
         let mut x = vec![0.0; n];
@@ -1311,9 +1498,9 @@ impl Band {
             let right = (k + reach).min(n - 1);
             let mut s = b[k];
             for j in k + 1..=right {
-                s -= self.get(k, j) * x[j];
+                s -= a.get(k, j) * x[j];
             }
-            x[k] = s / self.get(k, k);
+            x[k] = s / a.get(k, k);
         }
         x.iter().all(|v| v.is_finite()).then_some(x)
     }
