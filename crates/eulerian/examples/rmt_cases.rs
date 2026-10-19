@@ -304,6 +304,29 @@ fn main() {
             clock: Some(clock),
             ..StaticSettings::default()
         };
+        if let Some(rt) = kv.get("lintest") {
+            // The first Newton system to a fixed tolerance: `lintest=RTOL`, `pc=0` without the
+            // preconditioner.
+            let rtol: f64 = rt.parse().unwrap();
+            let pc = get("pc", "1") == "1";
+            let set = StaticSettings { max_krylov: get("maxk", "3000").parse().unwrap(), ..set };
+            let t = std::time::Instant::now();
+            let lt = if get("op", "jac") == "a0" {
+                s.static_linear_test_assembled(&set, rtol).unwrap()
+            } else {
+                s.static_linear_test(&set, rtol, pc).unwrap()
+            };
+            let hist: Vec<String> = lt.history.iter().map(|v| format!("{v:.3e}")).collect();
+            println!(
+                "{{\"case\":\"{case}\",\"h\":{h},\"lintest\":{rtol},\"pc\":{pc},\"unknowns\":{},\"iterations\":{},\"levels\":{},\"wall\":{:.3},\"history\":[{}]}}",
+                lt.unknowns,
+                lt.iterations,
+                lt.multigrid.levels,
+                t.elapsed().as_secs_f64(),
+                hist.join(",")
+            );
+            return;
+        }
         let reference = (get("compare", "0") == "1").then(|| s.clone());
         let rep = match s.solve_static(&set) {
             Ok(r) => r,

@@ -67,8 +67,10 @@ use std::sync::Arc;
 /// Settings of the static solve.
 #[derive(Debug, Clone, Copy)]
 pub struct StaticSettings {
-    /// Converged when ‖QR‖∞ ≤ tolerance × the largest external force on a control volume at the
-    /// full load.
+    /// Converged when ‖QR‖∞ ≤ tolerance × the force scale: the larger of the largest external
+    /// force on a control volume at the full load and the largest force through one face at
+    /// the current state (a body force puts O(h²) on a control volume but O(h) through its
+    /// faces, and the residual cannot be resolved below the rounding of those).
     pub tolerance: f64,
     /// Load increments to start with (halved on failure, grown after easy increments).
     pub increments: usize,
@@ -202,7 +204,7 @@ pub struct StaticReport {
     pub converged: bool,
     /// ‖QR‖∞ / force scale at the end.
     pub residual: f64,
-    /// The force scale (largest external force on a control volume at the full load).
+    /// The force scale at the end (see [`StaticSettings::tolerance`]).
     pub force_scale: f64,
     /// Load increments accepted and failed.
     pub increments: usize,
@@ -223,6 +225,19 @@ pub struct StaticReport {
     pub multigrid: MultigridStats,
     /// Times.
     pub times: StaticTimes,
+}
+
+/// The outcome of [`Solid::static_linear_test`].
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct LinearTest {
+    /// Unknown nodes.
+    pub unknowns: usize,
+    /// GMRES iterations to the tolerance (or the cap).
+    pub iterations: usize,
+    /// The relative residual after each iteration.
+    pub history: Vec<f64>,
+    /// The hierarchy (empty without a preconditioner).
+    pub multigrid: MultigridStats,
 }
 
 impl StaticReport {
@@ -391,7 +406,6 @@ impl Solid {
             run.report.times.total = run.now() - t0;
             return Ok(run.report);
         }
-        let tol = set.tolerance * scale;
         // Converged states (load, ζ at every node) for the secant predictor.
         let mut history: Vec<(f64, Vec<[f64; 2]>)> = vec![(0.0, self.zeta.clone())];
         let mut done = 0.0;
@@ -415,7 +429,7 @@ impl Solid {
                 }
             }
             self.load = next;
-            let outcome = self.newton(&mut run, tol, last_ctx.take());
+            let outcome = self.newton(&mut run, scale, last_ctx.take());
             match outcome {
                 Ok(ctx) => {
                     let iterations = run.report.newton.iter().rev().take_while(|s| s.load == next).count();
@@ -446,11 +460,70 @@ impl Solid {
             Some(c) => c,
             None => self.context(None, &mut run)?,
         };
+        let scale = scale.max(ctx.cut.stats().max_flux);
+        run.report.force_scale = scale;
         run.report.residual = norm_inf(&ctx.projected(&ctx.r)) / scale;
         run.report.converged = run.report.residual <= set.tolerance;
         self.finish(ctx);
         run.report.times.total = run.now() - t0;
         Ok(run.report)
+    }
+
+    /// Research diagnostic: the first Newton system at the current state and load,
+    /// QJP δ = −QR, solved by GMRES to the relative tolerance `rtol` (at most
+    /// `set.max_krylov` iterations), with the multigrid preconditioner or without any. The body
+    /// is left at the current state.
+    pub fn static_linear_test(&mut self, set: &StaticSettings, rtol: f64, precondition: bool) -> Result<LinearTest, Error> {
+        self.linear_test(set, rtol, precondition, false)
+    }
+
+    /// As [`Solid::static_linear_test`] with the preconditioner's own assembled matrix as the
+    /// operator instead of the Jacobian (to tell the multigrid's quality from the matrix's).
+    pub fn static_linear_test_assembled(&mut self, set: &StaticSettings, rtol: f64) -> Result<LinearTest, Error> {
+        self.linear_test(set, rtol, true, true)
+    }
+
+    fn linear_test(&mut self, set: &StaticSettings, rtol: f64, precondition: bool, assembled: bool) -> Result<LinearTest, Error> {
+        set.validate()?;
+        if self.settings.boundary != Boundary::Mapped {
+            return Err(Error::Invalid("not supported yet: a static solve with a boundary other than the mapped one".into()));
+        }
+        let mut run = Run { set, report: StaticReport::default(), kept: None };
+        self.rebuild()?;
+        let ctx = self.context(None, &mut run)?;
+        let a0 = if assembled { Some(self.assemble_jacobian(&ctx, &mut run)?) } else { None };
+        let mg = if precondition { Some(self.build_preconditioner(&ctx, &mut run)?) } else { None };
+        let b: Vec<f64> = ctx.projected(&ctx.r).iter().map(|v| -v).collect();
+        let h = self.grid.h();
+        let reuse = set.reuse_surface_lu;
+        let k = {
+            let mut apply = |v: &[f64]| -> Result<Vec<f64>, Error> {
+                let pv = ctx.free(v);
+                if let Some(a) = &a0 {
+                    let mut y = vec![0.0; v.len()];
+                    a.mul(&pv, &mut y);
+                    return Ok(ctx.projected(&y));
+                }
+                let vmax = norm_inf(&pv);
+                if !(vmax > 0.0) {
+                    return Ok(vec![0.0; v.len()]);
+                }
+                let eps = 1e-7 * h / vmax;
+                let delta: Vec<f64> = pv.iter().map(|x| eps * x).collect();
+                let e = self.eval(&ctx, &delta, reuse, &mut run)?;
+                let jv: Vec<f64> = e.r.iter().zip(&ctx.r).map(|(a, b)| (a - b) / eps).collect();
+                Ok(ctx.projected(&jv))
+            };
+            let mut pre = |v: &[f64]| -> Vec<f64> { mg.as_ref().map_or_else(|| v.to_vec(), |m| m.apply(v)) };
+            gmres(&b, &mut apply, &mut pre, rtol, set.restart, set.max_krylov)?
+        };
+        self.place(&ctx, &vec![0.0; 2 * ctx.unknowns.len()], &mut run);
+        Ok(LinearTest {
+            unknowns: ctx.unknowns.len(),
+            iterations: k.iterations,
+            history: k.history,
+            multigrid: mg.map(|m| m.stats()).unwrap_or_default(),
+        })
     }
 
     /// Leaves the body at the context's state, at rest, with its cut state.
@@ -466,7 +539,9 @@ impl Solid {
     }
 
     /// Newton at the current load from the current state; returns the converged context.
-    fn newton(&mut self, run: &mut Run, tol: f64, previous: Option<Context>) -> Result<Context, Error> {
+    fn newton(&mut self, run: &mut Run, external: f64, previous: Option<Context>) -> Result<Context, Error> {
+        let tolerance = run.set.tolerance;
+        let tol_of = |c: &Context| tolerance * external.max(c.cut.stats().max_flux);
         let set = *run.set;
         self.rebuild()?;
         let mut ctx = self.context(previous.as_ref(), run)?;
@@ -476,6 +551,7 @@ impl Solid {
         for _ in 0..set.max_newton {
             let qr = ctx.projected(&ctx.r);
             let rn = norm_inf(&qr);
+            let tol = tol_of(&ctx);
             if rn <= tol {
                 return Ok(ctx);
             }
@@ -572,7 +648,7 @@ impl Solid {
             };
             // Converged on the held topology: check that the topology the solution implies is
             // the one held (validity of surface points and merges included).
-            if !changed && norm_inf(&next.projected(&next.r)) <= tol {
+            if !changed && norm_inf(&next.projected(&next.r)) <= tol_of(&next) {
                 let t = run.now();
                 let topo = self.current_topology(&next)?;
                 run.report.times.topology += run.now() - t;
@@ -590,7 +666,7 @@ impl Solid {
             }
             run.report.newton.push(NewtonStep {
                 load: self.load,
-                residual: rn / run.report.force_scale,
+                residual: rn / external.max(ctx.cut.stats().max_flux),
                 unknowns: ctx.unknowns.len(),
                 krylov,
                 linear_residual: lin,
@@ -602,10 +678,14 @@ impl Solid {
             ctx = next;
         }
         let rn = norm_inf(&ctx.projected(&ctx.r));
-        if rn <= tol {
+        if rn <= tol_of(&ctx) {
             return Ok(ctx);
         }
-        Err(Error::Diverged(format!("Newton did not converge at load factor {} (‖QR‖∞ / scale = {:.3e})", self.load, rn / run.report.force_scale)))
+        Err(Error::Diverged(format!(
+            "Newton did not converge at load factor {} (‖QR‖∞ / scale = {:.3e})",
+            self.load,
+            rn / external.max(ctx.cut.stats().max_flux)
+        )))
     }
 
     /// The topology an unheld build would choose at the context's state.
@@ -674,7 +754,8 @@ impl Solid {
                 None => return Err(Error::Diverged(format!("body node {k} has no control volume to move with"))),
             }
         }
-        let force = self.mapped_forces(&mut cut.clone(), 0.0)?;
+        let mut cut = cut;
+        let force = self.mapped_forces(&mut cut, 0.0)?;
         let r: Vec<f64> = unknowns.iter().flat_map(|&k| force[k]).collect();
         let rigid = self.rigid(&unknowns, &cut);
         run.report.evaluations += 1;
@@ -792,6 +873,18 @@ impl Solid {
     /// the faces those rows need. With `local_probing` off, every row is probed (the reference
     /// for checking the local assembly).
     fn build_preconditioner(&mut self, ctx: &Context, run: &mut Run) -> Result<Multigrid, Error> {
+        let a = self.assemble_jacobian(ctx, run)?;
+        let t1 = run.now();
+        let ij: Vec<(usize, usize)> = ctx.unknowns.iter().map(|&k| self.grid.ij(k)).collect();
+        let h = self.grid.h();
+        let mg =
+            Multigrid::new(a, ij, (self.grid.nx(), self.grid.ny()), self.grid.position(0), h, ctx.rigid.as_ref().map(|r| r.centre), run.set.sweeps)?;
+        run.report.times.setup += run.now() - t1;
+        Ok(mg)
+    }
+
+    /// The assembled approximate Jacobian of [`Solid::build_preconditioner`].
+    fn assemble_jacobian(&mut self, ctx: &Context, run: &mut Run) -> Result<BlockMatrix, Error> {
         let s = run.set.probe;
         let h = self.grid.h();
         let eps = 1e-7 * h;
@@ -872,12 +965,7 @@ impl Solid {
         let t1 = run.now();
         run.report.times.probing += t1 - t0;
         run.report.times.residual += t1 - t0;
-        let a = BlockMatrix::from_rows(rows);
-        let ij: Vec<(usize, usize)> = ctx.unknowns.iter().map(|&k| self.grid.ij(k)).collect();
-        let mg =
-            Multigrid::new(a, ij, (self.grid.nx(), self.grid.ny()), self.grid.position(0), h, ctx.rigid.as_ref().map(|r| r.centre), run.set.sweeps)?;
-        run.report.times.setup += run.now() - t1;
-        Ok(mg)
+        Ok(BlockMatrix::from_rows(rows))
     }
 
     /// The rows of the unknowns away from the surface: each full face's flux f = σ(F)·n h with

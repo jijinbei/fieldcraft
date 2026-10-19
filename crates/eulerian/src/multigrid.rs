@@ -460,6 +460,8 @@ pub(crate) struct Krylov {
     pub(crate) iterations: usize,
     /// ‖b − A x‖ / ‖b‖ (the GMRES estimate).
     pub(crate) relative_residual: f64,
+    /// The relative residual after each iteration.
+    pub(crate) history: Vec<f64>,
 }
 
 /// Restarted GMRES with right preconditioning: solves A x = b to ‖b − A x‖ ≤ rtol ‖b‖ with at
@@ -476,10 +478,11 @@ pub(crate) fn gmres(
     let mut x = vec![0.0; n];
     let bnorm = norm(b);
     if !(bnorm > 0.0) {
-        return Ok(Krylov { x, iterations: 0, relative_residual: 0.0 });
+        return Ok(Krylov { x, iterations: 0, relative_residual: 0.0, history: Vec::new() });
     }
     let m = restart.max(1);
     let mut total = 0;
+    let mut history = Vec::new();
     loop {
         let r: Vec<f64> = if total == 0 {
             b.to_vec()
@@ -491,7 +494,7 @@ pub(crate) fn gmres(
         let beta = norm(&r);
         let mut rel = beta / bnorm;
         if rel <= rtol || total >= max_iter {
-            return Ok(Krylov { x, iterations: total, relative_residual: rel });
+            return Ok(Krylov { x, iterations: total, relative_residual: rel, history });
         }
         let mut v: Vec<Vec<f64>> = vec![r.iter().map(|q| q / beta).collect()];
         let mut z: Vec<Vec<f64>> = Vec::with_capacity(m);
@@ -530,6 +533,7 @@ pub(crate) fn gmres(
             hcol.push(hk);
             k += 1;
             rel = g[k].abs() / bnorm;
+            history.push(rel);
             if rel <= rtol || !(wn > 0.0) {
                 break;
             }
@@ -553,7 +557,7 @@ pub(crate) fn gmres(
             if !x.iter().all(|q| q.is_finite()) {
                 return Err(Error::Diverged("the Krylov solve produced a non-finite update".into()));
             }
-            return Ok(Krylov { x, iterations: total, relative_residual: rel });
+            return Ok(Krylov { x, iterations: total, relative_residual: rel, history });
         }
     }
 }

@@ -132,6 +132,8 @@ pub struct CutStats {
     pub factorizations: usize,
     /// Evaluations of a surface point's traction condition.
     pub traction_evals: usize,
+    /// The largest force component through one face in the last force evaluation.
+    pub max_flux: f64,
 }
 
 /// The cut cells, control volumes and surface of one step.
@@ -1374,6 +1376,7 @@ impl Solid {
         let mut stats = st.stats.clone();
         stats.mapped_faces = 0;
         stats.fallback_points = 0;
+        stats.max_flux = 0.0;
         let h = self.grid.h();
         let structure = st.structure.clone();
         for &(k, d, full) in &structure.faces {
@@ -1399,6 +1402,7 @@ impl Solid {
             let sv = [e.stress[0] + e.viscous[0], e.stress[1] + e.viscous[1], e.stress[2] + e.viscous[2]];
             let s = if d == 0 { [sv[0], sv[2]] } else { [sv[2], sv[1]] };
             let f = [s[0] * h, s[1] * h];
+            stats.max_flux = stats.max_flux.max(f[0].abs()).max(f[1].abs());
             raw[k][0] += f[0];
             raw[k][1] += f[1];
             raw[b][0] -= f[0];
@@ -1531,6 +1535,7 @@ impl Solid {
                 }
             }
         }
+        stats.max_flux = stats.max_flux.max(f[0].abs()).max(f[1].abs());
         force[k][0] += f[0];
         force[k][1] += f[1];
         force[b][0] -= f[0];
