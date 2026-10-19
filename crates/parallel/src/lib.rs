@@ -86,6 +86,27 @@ pub fn map_grained<T: Send>(count: usize, grain: usize, f: impl Fn(usize) -> T +
     parts.into_iter().flatten().collect()
 }
 
+/// `f(i)` for `i` in `0..count`, results in index order, written in place by the pool's
+/// threads (no copy on the calling thread), at least `grain` consecutive indices per task.
+/// Each result depends only on its index, so how the range is split never changes it.
+pub fn map_indexed<T: Send>(count: usize, grain: usize, f: impl Fn(usize) -> T + Sync + Send) -> Vec<T> {
+    pool::map_indexed(count, grain.max(1), f)
+}
+
+/// [`map_indexed`] for a fallible `f`: the error of the first failing index (found again
+/// in index order when one fails, so it does not depend on the scheduling).
+pub fn try_map_indexed<T: Send, E: Send>(count: usize, grain: usize, f: impl Fn(usize) -> Result<T, E> + Sync + Send) -> Result<Vec<T>, E> {
+    match pool::try_map_indexed(count, grain.max(1), &f) {
+        Ok(v) => Ok(v),
+        Err(e) => {
+            for i in 0..count {
+                f(i)?;
+            }
+            Err(e)
+        }
+    }
+}
+
 /// `f(i, item)` for every item, run in parallel; each task gets its own item mutably (use it to
 /// hand tasks disjoint parts of the output).
 pub fn for_each_mut<T: Send>(items: &mut [T], f: impl Fn(usize, &mut T) + Sync + Send) {
@@ -180,6 +201,20 @@ mod pool {
         inside(|| (0..count).into_par_iter().with_max_len(1).map(&f).collect())
     }
 
+    pub fn map_indexed<T: Send>(count: usize, grain: usize, f: impl Fn(usize) -> T + Sync + Send) -> Vec<T> {
+        if count <= grain {
+            return (0..count).map(f).collect();
+        }
+        inside(|| (0..count).into_par_iter().with_min_len(grain).map(&f).collect())
+    }
+
+    pub fn try_map_indexed<T: Send, E: Send>(count: usize, grain: usize, f: &(impl Fn(usize) -> Result<T, E> + Sync + Send)) -> Result<Vec<T>, E> {
+        if count <= grain {
+            return (0..count).map(f).collect();
+        }
+        inside(|| (0..count).into_par_iter().with_min_len(grain).map(f).collect())
+    }
+
     pub fn for_each_mut<T: Send>(items: &mut [T], f: impl Fn(usize, &mut T) + Sync + Send) {
         if items.len() <= 1 {
             items.iter_mut().enumerate().for_each(|(i, x)| f(i, x));
@@ -200,6 +235,14 @@ mod pool {
     }
 
     pub fn map<T: Send>(count: usize, f: impl Fn(usize) -> T + Sync + Send) -> Vec<T> {
+        (0..count).map(f).collect()
+    }
+
+    pub fn map_indexed<T: Send>(count: usize, _grain: usize, f: impl Fn(usize) -> T + Sync + Send) -> Vec<T> {
+        (0..count).map(f).collect()
+    }
+
+    pub fn try_map_indexed<T: Send, E: Send>(count: usize, _grain: usize, f: &(impl Fn(usize) -> Result<T, E> + Sync + Send)) -> Result<Vec<T>, E> {
         (0..count).map(f).collect()
     }
 
@@ -253,6 +296,22 @@ mod tests {
         assert_eq!(blocks(10, 4).collect::<Vec<_>>(), vec![0..4, 4..8, 8..10]);
         assert_eq!(blocks(0, 4).count(), 0);
         assert_eq!(blocks(3, 0).count(), 3);
+    }
+
+    #[test]
+    fn indexed_maps_keep_order_and_the_first_error() {
+        let f = |i: usize| ((i as f64) * 0.618_033_988_7).sin();
+        let one = with_threads(1, || map_indexed(100_000, 1000, f));
+        for threads in [2, 7] {
+            let other = with_threads(threads, || map_indexed(100_000, 1000, f));
+            assert!(one.iter().zip(&other).all(|(a, b)| a.to_bits() == b.to_bits()));
+        }
+        assert_eq!(one.len(), 100_000);
+        let fail = |i: usize| if i % 997 == 996 { Err(i) } else { Ok(i) };
+        for threads in [1, 3, 8] {
+            assert_eq!(with_threads(threads, || try_map_indexed(50_000, 64, fail)), Err(996));
+        }
+        assert_eq!(try_map_indexed(10, 64, Ok::<usize, ()>), Ok((0..10).collect()));
     }
 
     #[test]
