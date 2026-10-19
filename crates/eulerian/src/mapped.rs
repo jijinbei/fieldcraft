@@ -58,12 +58,14 @@ const BLEND: f64 = 0.2;
 /// Newton iterations of the surface conditions per step, at most.
 const MAX_NEWTON: usize = 20;
 
-/// What a grid cell is: no solid, all solid, or cut (index into the cut cells).
+/// What a grid cell is: no solid, all solid, or cut (index into the cut cells); or not a
+/// leaf of this level of a refined hierarchy (assembled on another level).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CellClass {
     Empty,
     Full,
     Cut(usize),
+    Foreign,
 }
 
 /// Where a grid line meets the surface.
@@ -382,7 +384,7 @@ impl CutState {
                 let mut len = 0.0;
                 for (c0, hf) in [lower, Some((k, if d == 0 { 0 } else { 3 }))].into_iter().flatten() {
                     match self.class[c0] {
-                        CellClass::Empty => {}
+                        CellClass::Empty | CellClass::Foreign => {}
                         CellClass::Full => len += 0.5 * h,
                         CellClass::Cut(i) => {
                             for (a, b) in &self.cells[i].1.faces[hf] {
@@ -547,15 +549,18 @@ impl Solid {
 
     /// The ambient stress at x (in the cell with lower-left node c0): the field when given,
     /// else bilinear in the cell's node values.
-    fn ambient_at(&self, x: P2, c0: usize) -> [f64; 3] {
+    fn ambient_at(&self, x: P2, c0: Option<usize>) -> [f64; 3] {
         let s = self.ambient_unscaled(x, c0);
         [self.load * s[0], self.load * s[1], self.load * s[2]]
     }
 
-    fn ambient_unscaled(&self, x: P2, c0: usize) -> [f64; 3] {
+    fn ambient_unscaled(&self, x: P2, c0: Option<usize>) -> [f64; 3] {
         if let Some(f) = &self.ambient_field {
             return (f.0)(x);
         }
+        let Some(c0) = c0 else {
+            return [0.0; 3];
+        };
         let Some(c) = self.cell_corners(c0) else {
             return self.ambient[c0];
         };
@@ -907,6 +912,10 @@ impl Solid {
             let Some(c) = self.cell_corners(c0) else {
                 continue;
             };
+            if !self.own_cell(c0) {
+                class[c0] = CellClass::Foreign;
+                continue;
+            }
             let ins = c.map(|k| self.inside(k));
             if ins.iter().all(|&b| b) {
                 class[c0] = CellClass::Full;
@@ -936,7 +945,7 @@ impl Solid {
             };
             let o = self.grid.position(c0);
             match class[c0] {
-                CellClass::Empty => {}
+                CellClass::Empty | CellClass::Foreign => {}
                 CellClass::Full => {
                     for (q, &k) in c.iter().enumerate() {
                         let qc = match q {
@@ -971,15 +980,21 @@ impl Solid {
             if !(area[k] > 0.0) {
                 continue;
             }
-            share[k] = if self.inside(k) {
+            // A hanging node of a refined level gives its solid to its two masters.
+            let slave = self.level.as_ref().and_then(|l| l.slave.get(k).copied().flatten());
+            share[k] = if let Some(sl) = slave {
+                Some(sl)
+            } else if self.inside(k) {
                 Some([(k, 1.0), (k, 0.0)])
             } else {
                 orphans.push(k);
                 self.orphan_shares(k)
             };
         }
-        // Small control volumes join their deepest inside edge neighbour.
-        let mut cv = vec![0.0; n];
+        // Small control volumes join their deepest inside edge neighbour (never one the
+        // hierarchy sets, nor one on the interface with the coarser level).
+        let mut cv = self.level.as_ref().map_or_else(|| vec![0.0; n], |l| l.ext_area.clone());
+        cv.resize(n, 0.0);
         for k in 0..n {
             for (o, w) in share[k].into_iter().flatten() {
                 cv[o] += w * area[k];
@@ -1005,13 +1020,15 @@ impl Solid {
         } else {
             for k in 0..n {
                 let own = share[k].is_some_and(|sh| sh[0] == (k, 1.0));
-                if !own || self.kind[k] == NodeKind::Fixed || cv[k] >= MERGE_FRACTION * h * h {
+                let interface = self.level.as_ref().is_some_and(|l| l.master.get(k).copied().unwrap_or(false));
+                if !own || self.kind[k] == NodeKind::Fixed || self.frozen(k) || interface || cv[k] >= MERGE_FRACTION * h * h {
                     continue;
                 }
                 let mut best: Option<usize> = None;
                 for (di, dj) in [(1, 0), (-1, 0), (0, 1), (0, -1)] {
                     if let Some(m) = self.grid.neighbour(k, di, dj)
                         && share[m].is_some_and(|sh| sh[0] == (m, 1.0))
+                        && !self.frozen(m)
                         && best.is_none_or(|b| self.phi[m] < self.phi[b])
                         && self.phi[m] < self.phi[k]
                     {
@@ -1034,7 +1051,7 @@ impl Solid {
                 }
                 let lower = if d == 0 { self.grid.neighbour(k, 0, -1) } else { self.grid.neighbour(k, -1, 0) };
                 let classes = [lower.map_or(CellClass::Empty, |c| class[c]), class[k]];
-                if classes.iter().all(|c| *c == CellClass::Empty) {
+                if classes.iter().all(|c| matches!(c, CellClass::Empty | CellClass::Foreign)) {
                     continue;
                 }
                 let full = classes.iter().all(|c| *c == CellClass::Full);
@@ -1086,13 +1103,14 @@ impl Solid {
         Ok(Geometry { class: base.class.clone(), structure, cross_t, cells, area, moment, near, share, owner, merges: topo.merges.clone() })
     }
 
-    /// The cell (lower-left node) containing x, clamped to the grid.
-    fn cell_of(&self, x: P2) -> usize {
-        let o = self.grid.position(0);
+    /// The cell (lower-left node) containing x, clamped to the grid; `None` when that node is
+    /// not active on a sparse grid.
+    fn cell_of(&self, x: P2) -> Option<usize> {
+        let o = self.grid.origin();
         let h = self.grid.h();
         let i = (((x[0] - o[0]) / h).floor().max(0.0) as usize).min(self.grid.nx().saturating_sub(2));
         let j = (((x[1] - o[1]) / h).floor().max(0.0) as usize).min(self.grid.ny().saturating_sub(2));
-        self.grid.index(i, j)
+        self.grid.try_index(i, j)
     }
 
     /// How the solid of the dual cell of outside node m is shared: between the inside
@@ -1212,7 +1230,7 @@ impl Solid {
     /// The map of the lines along axis d at x, with |n_d| of the surface there.
     fn reconstruct_family(&self, st: &CutState, x: P2, d: usize) -> Option<(Tensor, f64)> {
         let h = self.grid.h();
-        let o = self.grid.position(0);
+        let o = self.grid.origin();
         let t = (x[1 - d] - o[1 - d]) / h;
         let l0 = t.round();
         // The nearest surface point of this family on the lines within two of x, then its
@@ -1314,12 +1332,22 @@ impl Solid {
             Some(st) => st,
             None => self.build_cut()?,
         };
-        let force = self.mapped_forces(&mut st, mu_e)?;
-        // 3. Momentum of each control volume (lumped: ρ times its solid area).
+        let mut force = self.mapped_forces(&mut st, mu_e)?;
+        // 3. Momentum of each control volume (lumped: ρ times its solid area), with the
+        // coarser level's part of the interface nodes' control volumes on a refined level.
         let mut cv = vec![0.0; n];
         for k in 0..n {
             for (o, w) in st.share[k].into_iter().flatten() {
                 cv[o] += w * st.area[k];
+            }
+        }
+        if let Some(l) = self.level.as_mut() {
+            l.force.clone_from(&force);
+            l.area.clone_from(&cv);
+            for k in 0..n {
+                cv[k] += l.ext_area[k];
+                force[k][0] += l.ext_force[k][0];
+                force[k][1] += l.ext_force[k][1];
             }
         }
         let mut v_new = self.v.clone();
@@ -1376,6 +1404,29 @@ impl Solid {
         Ok(())
     }
 
+    /// The net force on every control volume and its solid area from the current
+    /// configuration, without stepping (the residual of the static problem); with the
+    /// coarser level's register on a refined level.
+    pub(crate) fn level_forces(&mut self) -> Result<(Vec<[f64; 2]>, Vec<f64>), Error> {
+        let n = self.grid.len();
+        let (_, _, rho0) = self.material.constants();
+        let mu_e = self.settings.viscosity * rho0 * self.material.p_wave_speed() * self.grid.h();
+        let mut st = self.build_cut_from(self.cut.as_ref())?;
+        let force = self.mapped_forces(&mut st, mu_e)?;
+        let mut cv = vec![0.0; n];
+        for k in 0..n {
+            for (o, w) in st.share[k].into_iter().flatten() {
+                cv[o] += w * st.area[k];
+            }
+        }
+        if let Some(l) = self.level.as_mut() {
+            l.force.clone_from(&force);
+            l.area.clone_from(&cv);
+        }
+        self.cut = Some(st);
+        Ok((force, cv))
+    }
+
     /// ∫ t ds over a surface piece of the cell at `origin`: t = σ_ambient·n, n ds = (dy, −dx).
     fn arc_traction(&self, arc: &Curve, origin: P2, c0: usize) -> P2 {
         let mut f = [0.0; 2];
@@ -1383,7 +1434,7 @@ impl Solid {
             let p = arc.at(t);
             let x = [origin[0] + p[0], origin[1] + p[1]];
             let d = arc.tangent(t);
-            let s = self.ambient_at(x, c0);
+            let s = self.ambient_at(x, Some(c0));
             let tr = traction(&s, [d[1], -d[0]]);
             f[0] += w * tr[0];
             f[1] += w * tr[1];
@@ -1508,7 +1559,7 @@ impl Solid {
         let upper = Some((k, if d == 0 { 0 } else { 3 }));
         let halves = [lower, upper];
         let classes = halves.map(|hf| hf.map_or(CellClass::Empty, |(c, _)| st.class[c]));
-        if classes.iter().all(|c| *c == CellClass::Empty) {
+        if classes.iter().all(|c| matches!(c, CellClass::Empty | CellClass::Foreign)) {
             return Ok(());
         }
         let (Some(sk), Some(sb)) = (st.share[k], st.share[b]) else {
@@ -1528,6 +1579,26 @@ impl Solid {
             };
             let s = comps([e.stress[0] + e.viscous[0], e.stress[1] + e.viscous[1], e.stress[2] + e.viscous[2]]);
             f = [s[0] * h, s[1] * h];
+        } else if classes.iter().all(|c| matches!(c, CellClass::Full | CellClass::Foreign)) {
+            // Half of the face on this level (a coarse–fine interface runs along the edge): the
+            // midpoint rule on that half, the stress at its middle (a quarter of a cell from the
+            // edge) interpolated between the edge and the parallel edge on the same side.
+            let Some(e) = edge else {
+                return Ok(());
+            };
+            let side: isize = if classes[1] == CellClass::Full { 1 } else { -1 };
+            let par = self.along(k, 1 - d, side);
+            let e2 = match par {
+                Some(p) => self.compact_edge(p, d, mu_e)?,
+                None => None,
+            };
+            let e2 = e2.unwrap_or(e);
+            let mut s3 = [0.0; 3];
+            for c in 0..3 {
+                s3[c] = 0.75 * (e.stress[c] + e.viscous[c]) + 0.25 * (e2.stress[c] + e2.viscous[c]);
+            }
+            let s = comps(s3);
+            f = [0.5 * s[0] * h, 0.5 * s[1] * h];
         } else {
             stats.mapped_faces += 1;
             let visc = edge.map_or([0.0; 3], |e| e.viscous);
@@ -1537,7 +1608,7 @@ impl Solid {
                 };
                 let o = self.grid.position(c0);
                 let pieces: Vec<(P2, P2)> = match class {
-                    CellClass::Empty => continue,
+                    CellClass::Empty | CellClass::Foreign => continue,
                     CellClass::Full => vec![cut::half_face(h, hf)],
                     CellClass::Cut(i) => st.cells[i].1.faces[hf].clone(),
                 };

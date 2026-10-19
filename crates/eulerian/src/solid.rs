@@ -196,6 +196,49 @@ pub struct Solid {
     /// Factor on the ambient stress and the body force (the load parameter of a continuation;
     /// 1 by default). The mapped boundary applies it.
     pub(crate) load: f64,
+    /// What the solid needs as one level of a refined hierarchy (`crate::refine`); `None` on a
+    /// plain grid.
+    pub(crate) level: Option<Box<LevelHooks>>,
+}
+
+/// A level of a refined hierarchy as the solid sees it. The hierarchy owns the nodes it sets
+/// from other levels (frozen: ghosts, hanging nodes, nodes a finer level covers); the solid
+/// assembles only the cells that are leaves on this level, and adds the coarser level's flux
+/// and area to the nodes on the coarse–fine interface.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct LevelHooks {
+    /// Whether the cell with lower-left node k is a leaf of this level.
+    pub(crate) own_cell: Vec<bool>,
+    /// Nodes whose kind and values the hierarchy sets; the solid never changes them.
+    pub(crate) frozen: Vec<bool>,
+    /// Hanging nodes: the two interface nodes that take their mass and force, with weights.
+    pub(crate) slave: Vec<Option<[(usize, f64); 2]>>,
+    /// Nodes on the interface with the coarser level (never merged into a neighbour).
+    pub(crate) master: Vec<bool>,
+    /// Force added to each node from the coarser level's cells (the flux register).
+    pub(crate) ext_force: Vec<[f64; 2]>,
+    /// Solid area added to each node's control volume from the coarser level's cells.
+    pub(crate) ext_area: Vec<f64>,
+    /// The net force on each node from this level's cells in the last step.
+    pub(crate) force: Vec<[f64; 2]>,
+    /// The solid area of each node's control volume in this level's cells in the last step.
+    pub(crate) area: Vec<f64>,
+}
+
+impl LevelHooks {
+    /// Hooks for `n` nodes: every cell a leaf, nothing frozen.
+    pub(crate) fn new(n: usize) -> LevelHooks {
+        LevelHooks {
+            own_cell: vec![true; n],
+            frozen: vec![false; n],
+            slave: vec![None; n],
+            master: vec![false; n],
+            ext_force: vec![[0.0; 2]; n],
+            ext_area: vec![0.0; n],
+            force: vec![[0.0; 2]; n],
+            area: vec![0.0; n],
+        }
+    }
 }
 
 /// The stresses at the middle of an edge.
@@ -261,6 +304,7 @@ impl Solid {
             fallbacks: 0,
             linear_fills: 0,
             load: 1.0,
+            level: None,
         };
         if settings.boundary == Boundary::Mapped && (s.grid.periodic()[0] || s.grid.periodic()[1]) && shape != Shape::Everywhere {
             return Err(Error::Invalid("not supported yet: a mapped surface on a periodic grid".into()));
@@ -787,6 +831,12 @@ impl Solid {
     pub(crate) fn rebuild(&mut self) -> Result<(), Error> {
         let n = self.grid.len();
         for k in 0..n {
+            if self.frozen(k) {
+                if self.kind[k].known() {
+                    self.phi[k] = self.shape.phi0(self.xi(k));
+                }
+                continue;
+            }
             match self.kind[k] {
                 NodeKind::Solid | NodeKind::Fixed => {
                     let xi = self.xi(k);
@@ -802,7 +852,7 @@ impl Solid {
             return Err(Error::Diverged("no grid node lies inside the body".into()));
         }
         let source: Vec<bool> = self.kind.iter().map(|k| k.source()).collect();
-        let target = vec![true; n];
+        let target: Vec<bool> = (0..n).map(|k| !self.frozen(k)).collect();
         let filled = layered_fill(&self.grid, &source, &target, self.settings.band_layers, &mut self.zeta);
         if let Some(f) = &self.exterior {
             for k in 0..n {
@@ -925,14 +975,24 @@ impl Solid {
     pub(crate) fn extrapolate_velocity(&mut self) {
         let n = self.grid.len();
         let source: Vec<bool> = (0..n).map(|k| self.v_live[k] && self.kind[k].known()).collect();
-        let target: Vec<bool> = (0..n).map(|k| self.kind[k].known()).collect();
+        let target: Vec<bool> = (0..n).map(|k| self.kind[k].known() && !self.frozen(k)).collect();
         let filled = layered_fill(&self.grid, &source, &target, 2 * self.settings.band_layers, &mut self.v);
         for k in 0..n {
-            if self.kind[k].known() && !source[k] && !filled[k] {
+            if target[k] && !source[k] && !filled[k] {
                 // Isolated: no velocity information nearby.
                 self.v[k] = [0.0; 2];
             }
         }
+    }
+
+    /// Whether the hierarchy sets node k (never changed by this solid).
+    pub(crate) fn frozen(&self, k: usize) -> bool {
+        self.level.as_ref().is_some_and(|l| l.frozen.get(k).copied().unwrap_or(false))
+    }
+
+    /// Whether the cell with lower-left node c0 is assembled on this grid.
+    pub(crate) fn own_cell(&self, c0: usize) -> bool {
+        self.level.as_ref().is_none_or(|l| l.own_cell.get(c0).copied().unwrap_or(false))
     }
 
     pub(crate) fn xi(&self, k: usize) -> [f64; 2] {
