@@ -37,8 +37,11 @@ use crate::Error;
 /// A 2 × 2 block, row-major.
 pub(crate) type Block = [[f64; 2]; 2];
 
-/// Coarsest level size (nodes) for the dense solve.
-const COARSEST: usize = 160;
+/// Coarsest level size (nodes) for the dense solve. Coarsening further puts the surface of
+/// the test bodies within one or two coarse cells of each other (an annulus wall of 10 at
+/// spacing 4), where the renormalised interpolation is crude; stopping at about 240 nodes
+/// (spacing 2 there) took the iterations at h = 0.0625 from 28 to 25.
+const COARSEST: usize = 400;
 /// Most levels.
 const MAX_LEVELS: usize = 12;
 
