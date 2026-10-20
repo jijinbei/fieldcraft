@@ -187,6 +187,8 @@ surface (`Boundary::Blurred`).
   differences in time (v at half steps), Δt = 0.4 h / c_P; artificial viscosity
   μ_e = κ ρ c_P h (κ = 0.1 by default); implicit mass-proportional damping for statics.
 - Compressible neo-Hookean (Bonet & Wood) and small-strain linear elasticity.
+- Later additions: the decoupled neo-Hookean of FieldCraft's FEM (μ/2 (Ī₁ − 3) +
+  κ/2 (J − 1)²) for finite-strain comparisons, and a body force per unit volume.
 
 Verification (`crates/eulerian/tests/verification.rs`):
 
@@ -203,6 +205,7 @@ Verification (`crates/eulerian/tests/verification.rs`):
 
 u_r(a) is evaluated from a fit u_r = A r + B/r over the nodes with φ < −2h; the FEM gets the
 same number to 3e-6 on a 8 × 16 quad8 quarter.
+The checks except the Lamé ones now run with the blurred and the ghost-filled surfaces (§9).
 
 Where it falls short:
 - **The free surface.** Homogeneous states are exact (linear fields are reproduced by every
@@ -281,6 +284,123 @@ the grid, so the stress error is O(1) · (dσ/dn) · h, first order.
 So a sharp surface needs two things: the traction imposed where the surface is, by the
 solid's own stress (no blending), and no stress computed from extrapolated ζ.
 
+## 9. A sharp boundary by ghost values (kept for comparison)
+
+`Boundary::Ghost` (`crates/eulerian/src/sharp.rs`) was the first sharp surface. It is kept as
+an option for the comparison studies; §10's mapped cut cells replace it.
+
+Momentum is integrated at the body's nodes only; every edge with a body node at either end
+uses the solid stress alone (no blending); the first 8-neighbour ring of nodes outside (the
+ghosts) gets ζ from a local constrained least-squares fit: a polynomial ζ(d) per component
+fitted to the body nodes in a 7 × 7 (cubic) or 5 × 5 (quadratic) window, subject to the two
+equations [σ(G₀) + C:(∇ζ − G₀)]·n = σ_ambient·n at the surface point nearest the ghost
+(the stress linearised about the previous fit, C by differences of the material law; two
+passes, so the traction is exact at equilibrium for any law). The surface point is the
+projection d ← d − φ∇φ/|∇φ|² onto φ₀(x + ζ(x)) = 0; the normal is ∇φ there. Outer band
+layers stay linear (they only feed φ and the upwind advection).
+
+Rules for the hard cases:
+- small cut cells: nothing divides by the cut distance, so a surface arbitrarily close to a
+  node gives a regular system;
+- a surface that comes to rest on a node: body nodes leave at φ ≥ 0, band nodes enter only at
+  φ < −h/10 (without this hysteresis the finite-strain cylinder rang forever, 8 bore nodes
+  flipping in and out); a ghost may therefore lie up to h/10 inside, and the projection runs
+  from either side;
+- fits the data barely determine (the inside of a convex corner): the KKT system is
+  equilibrated and a pivot below 1e-6 refuses the fit; then the quadratic, then a linear fit
+  with the same traction, then the plain extrapolation (counted; zero in every case below);
+- other things measured and dropped: other fit weights (no change: the error is truncation),
+  extra traction rows at the window's edge crossings (doubled the error: they over-constrain
+  the fit's gradient), the quadratic fit (exact for linear stress, but 3–5 times the cubic's
+  error at a curved surface).
+
+Stability: with no artificial viscosity (κ = 0) a growing surface mode appears after a few
+thousand steps in the cylinder, at any time step (CFL 0.4 and 0.2 alike): the closure is not
+symmetric. κ = 0.02–0.1 damps it, with or without the relaxation damping, and the static
+answer does not depend on κ or γ.
+
+Verification (linear elastic at strain 1e-6 unless noted; `examples/boundary_study.rs`). The
+slab of §8 is exact to the relaxation tolerance wherever its faces cut the grid (effective
+face shift −7e-7 to −6e-6 h). Lamé cylinder (a = 10, b = 20; relative errors; σ at the bore
+extrapolated from the three nearest nodes on y = 0):
+
+| h | blurred u_r(a) | order | ghost quadratic u_r(a) | order | ghost cubic u_r(a) | order | cubic σθ(15) | cubic σrr(a)/p (−1) | cubic σθ(a) |
+|---|---|---|---|---|---|---|---|---|---|
+| 2 | −2.61e-1 | – | −1.07e-1 | – | −1.42e-1 | – | −1.33e-1 | −0.838 | −1.80e-1 |
+| 1 | −1.12e-1 | 1.22 | −3.69e-2 | 1.54 | −2.57e-2 | 2.47 | −2.71e-2 | −0.986 | −4.61e-2 |
+| 0.5 | −3.45e-2 | 1.70 | −1.11e-2 | 1.73 | −4.01e-3 | 2.68 | −5.32e-3 | −1.0015 | −1.01e-2 |
+| 0.25 | −1.01e-2 | 1.78 | −3.12e-3 | 1.83 | −6.29e-4 | 2.67 | −1.25e-3 | −1.0011 | −2.15e-3 |
+| 0.125 | −2.75e-3 | 1.87 | −7.64e-4 | 2.03 | −5.89e-5 | 3.42 | +6.6e-5 | −1.0004 | −4.14e-4 |
+
+The maximum nodal stress error of the cubic fit converges at order 2.2 (1.5e-2 p at h = 0.5).
+The blurred surface's σrr at the bore is −0.03 / −0.46 / −0.72 / −0.86 / −0.93 p for h = 2 …
+0.125; the ghost fill reaches −p within 0.2 % from h = 0.5.
+
+Kirsch hole (a = 5 in a disc R = 20 with the Kirsch traction on r = R, so the finite domain
+is exact; σθ at the hole edge extrapolated along the axis):
+
+| h | blurred σθ(a, 90°)/S (3) | σθ(a, 0°)/S (−1) | ghost quadratic | | ghost cubic | |
+|---|---|---|---|---|---|---|
+| 1 | 2.184 | −0.254 | 3.169 | −1.338 | 3.166 | −1.321 |
+| 0.5 | 2.693 | −0.668 | 3.056 | −1.111 | 3.010 | −1.054 |
+| 0.25 | 2.938 | −0.897 | 3.020 | −1.036 | 2.997 | −1.007 |
+| 0.125 | 3.002 | −0.972 | 3.006 | −1.011 | 2.998 | −1.000 |
+
+The blurred value at 90° crosses 3 S on its way from below (+0.05 % at h = 0.125 is a
+coincidence: its error around the hole oscillates between −0.02 S and +0.07 S at h = 0.25,
+against ±0.02 S for the cubic fit). Maximum nodal stress error: blurred 0.135 S, cubic 5.4e-3 S
+at h = 0.125.
+
+Rotating annulus (a = 10, b = 20, free surfaces, centrifugal body force, closed form
+u = C₁ r + C₂/r − K r³; non-harmonic):
+
+| h | blurred u_r(a) | σθ(a) | ghost cubic u_r(a) | σθ(a) | max σ error / σθ(a) |
+|---|---|---|---|---|---|
+| 1 | −7.8e-2 | −2.3e-2 | −1.96e-2 | −2.8e-2 | 2.5e-2 |
+| 0.5 | −2.4e-2 | +1.8e-2 | −3.0e-3 | −6.2e-3 | 5.6e-3 |
+| 0.25 | −6.8e-3 | +1.9e-2 | −4.8e-4 | −1.3e-3 | 1.2e-3 |
+
+(orders of the ghost fill 2.7 / 2.2 / 2.2; the blurred σθ(a) does not converge). The static
+answer no longer depends on the damping: u_r(a) at h = 1 equal to 2e-5 for γ × 0.5 and × 4
+(blurred: −7.9 % against −20.9 %).
+
+**Finite strain: neo-Hookean cylinder.** The decoupled neo-Hookean law of FieldCraft's FEM
+(μ, κ from E = 210000, ν = 0.3), bore pressure p = 8000 (p/E = 0.038; the linear solution
+scaled to it is u_r(a)/a = 7.3 %, the nonlinear one 8.2 %), applied in ten increments.
+Reference: FieldCraft's FEM, nonlinear static with follower pressure, plane-strain quad8
+quarter, converged by refinement (16 × 32 → 32 × 64: u_r(a) 0.815032 → 0.815032, σθ at r = 15
+in the deformed body 8777.3 → 8777.5).
+
+| | u_r(a) | σθ(r = 15) | σθ at the bore | σrr at the bore |
+|---|---|---|---|---|
+| linear Lamé scaled to p | 0.726 | 7407 | 13333 | −8000 |
+| FEM 32 × 64 | 0.815032 | 8777.5 | 14700 | −7998 |
+| ghost, h = 2 | 0.6440 | 7114 | 11548 | −7188 |
+| ghost, h = 1 | 0.7924 | 8471 | 13972 | −8151 |
+| ghost, h = 0.5 | 0.8108 | 8714 | 14558 | −8040 |
+| ghost, h = 0.25 | 0.8144 | 8765 | 14677 | −8009 |
+| ghost, h = 0.125 | 0.81499 (−4.7e-5) | 8777.9 | 14697 | −8004 |
+| Richardson (0.5, 0.25, 0.125) | 0.81510 (order 2.7) | 8782.5 (order 1.95) | 14701 (order 2.6) | |
+
+The blurred surface folds (det ∇ξ < 0) during the load ramp at every resolution at
+p = 8000 and at p = 4000, and at some resolutions at p = 2000–3000.
+
+**Cost** (Apple M4 Max, release build, one thread per run, cylinder, linear):
+
+| h | nodes | blurred steps | ms/step | wall s | ghost steps | ms/step | wall s | ghost u_r(a) error |
+|---|---|---|---|---|---|---|---|---|
+| 2 | 1089 | 780 | 0.15 | 0.1 | 1200 | 1.1 | 1.3 | 1.4e-1 |
+| 1 | 2809 | 1860 | 0.35 | 0.6 | 2140 | 2.3 | 4.9 | 2.6e-2 |
+| 0.5 | 8649 | 4240 | 0.93 | 3.9 | 4300 | 4.8 | 20.5 | 4.0e-3 |
+| 0.25 | 29929 | 7820 | 2.9 | 22.4 | 9120 | 10.6 | 96.5 | 6.3e-4 |
+| 0.125 | 110889 | 16480 | 9.8 | 161 | 17220 | 34.4 | 591 | 5.9e-5 |
+
+A profile at h = 0.25: ghost fits 65 %, grid neighbour lookups 12 %, the linear band fill 11 %,
+edge stresses and momentum 6 %. Steps to rest grow as 1/h, so a static answer by relaxation
+costs O(h⁻³) in 2D: 10³–10⁵ times the FEM, which reaches u_r(a) within 6e-3 on 1 × 2 quad8
+elements, 6e-4 on 2 × 4 and 4e-5 on 4 × 8 (121 nodes; σθ(15) within 8e-4), each in about
+1 ms, and the finite-strain case in 0.04–0.9 s (8 × 16 to 32 × 64).
+
 ## Papers
 
 All read from the open-access versions listed; journal details checked against the published
@@ -310,6 +430,25 @@ DOI records (Crossref) where marked.
 6. Y. Sun, *A lattice Boltzmann implementation of the reference map technique*, master's
    thesis, Harvard University (2020).
    <https://people.math.wisc.edu/~chr/publish/2020_Sun.pdf>.
+
+For the sharp boundaries (§9, §10), journal records checked against Crossref (metadata only;
+the methods were written from the equations, these are pointers to the established ideas, not
+sources of code or text):
+
+7. R. Mittal, H. Dong, M. Bozkurttas, F. M. Najjar, A. Vargas, A. von Loebbecke, *A versatile
+   sharp interface immersed boundary method for incompressible flows with complex
+   boundaries*, J. Comput. Phys. 227(10):4825–4852 (2008). doi:10.1016/j.jcp.2008.01.028
+   (verified): ghost cells with the boundary condition at the boundary intercept.
+8. P. T. Barton, D. Drikakis, *An Eulerian method for multi-component problems in non-linear
+   elasticity with sliding interfaces*, J. Comput. Phys. 229(15):5518–5540 (2010).
+   doi:10.1016/j.jcp.2010.04.012 (record verified; its ghost-fluid treatment not checked).
+9. T. D. Aslam, *A partial differential equation approach to multidimensional extrapolation*,
+   J. Comput. Phys. 193(1):349–355 (2004). doi:10.1016/j.jcp.2003.08.001 (verified).
+10. H. Johansen, P. Colella, *A Cartesian grid embedded boundary method for Poisson's equation
+    on irregular domains*, J. Comput. Phys. 147(1):60–85 (1998). doi:10.1006/jcph.1998.5965
+    (verified): conservative cut cells.
+11. C. S. Peskin, *The immersed boundary method*, Acta Numerica 11:479–517 (2002).
+    doi:10.1017/S0962492902000077 (verified).
 
 Background cited by these papers and used in the prototype: J. Bonet, R. D. Wood, *Nonlinear
 Continuum Mechanics for Finite Element Analysis*, 2nd ed., Cambridge 2008 (the compressible
