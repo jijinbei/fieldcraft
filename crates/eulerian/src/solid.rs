@@ -20,6 +20,7 @@ use crate::extrapolate::fit;
 use crate::grid::Grid;
 use crate::material::{Material, Stress, Tensor};
 use crate::shape::Shape;
+use crate::sharp;
 use crate::{Error, Limits, finite, positive};
 use std::sync::Arc;
 
@@ -61,6 +62,8 @@ pub struct Settings {
     pub band_layers: usize,
     /// How the surface carries its traction.
     pub boundary: Boundary,
+    /// Highest degree (2 or 3) of the ghost fit of [`Boundary::Ghost`].
+    pub ghost_degree: usize,
 }
 
 /// The treatment of the body's surface.
@@ -77,9 +80,19 @@ pub enum Boundary {
     /// damping and the artificial viscosity; this variant does not, and exposes the bias of
     /// the extrapolated ζ.
     BlurredBody,
+    /// A sharp traction boundary by ghost values: the solid stress alone on every edge that
+    /// touches the body, the first ring of nodes outside filled so that σ·n = σ_ambient·n
+    /// holds at the surface (module `sharp`), the momentum at the body's nodes only. Kept for
+    /// comparison studies.
+    Ghost,
 }
 
 impl Boundary {
+    /// Whether edge stresses are blended with the ambient stress.
+    pub(crate) fn blends(self) -> bool {
+        matches!(self, Boundary::Blurred | Boundary::BlurredBody)
+    }
+
     /// Whether the momentum is integrated at the body's nodes only.
     pub(crate) fn body_momentum(self) -> bool {
         self != Boundary::Blurred
@@ -88,7 +101,7 @@ impl Boundary {
 
 impl Default for Settings {
     fn default() -> Self {
-        Settings { cfl: 0.4, viscosity: 0.1, damping: 0.0, blur: 1.5, band_layers: 4, boundary: Boundary::Blurred }
+        Settings { cfl: 0.4, viscosity: 0.1, damping: 0.0, blur: 1.5, band_layers: 4, boundary: Boundary::Blurred, ghost_degree: 3 }
     }
 }
 
@@ -110,6 +123,9 @@ impl Settings {
         if self.band_layers < 2 || self.band_layers > 8 {
             return Err(Error::Invalid(format!("band_layers must lie in 2..=8, got {}", self.band_layers)));
         }
+        if !(2..=3).contains(&self.ghost_degree) {
+            return Err(Error::Invalid(format!("ghost_degree must be 2 or 3, got {}", self.ghost_degree)));
+        }
         if (self.band_layers as f64) < self.blur + 2.0 {
             return Err(Error::Invalid("the band must reach past the blur zone by two layers".into()));
         }
@@ -127,6 +143,10 @@ pub struct Relaxation {
     /// The largest node speed in the body at the end.
     pub max_speed: f64,
 }
+
+/// How deep (in grid spacings) a band node of the ghost-filled surface must lie inside the
+/// body to enter it (`Solid::rebuild`).
+const ENTRY_DEPTH: f64 = 0.1;
 
 /// Largest window half-width tried by the extrapolation.
 const MAX_WINDOW: isize = 4;
@@ -154,6 +174,10 @@ pub struct Solid {
     body: Option<Field<[f64; 2]>>,
     /// ζ prescribed outside the body instead of extrapolated (verification only).
     exterior: Option<Field<[f64; 2]>>,
+    /// Ghost nodes of the last rebuild that the ghost fill could not constrain.
+    fallbacks: usize,
+    /// Ghost nodes of the last rebuild filled by the linear constrained fit.
+    linear_fills: usize,
 }
 
 /// A field given as a function of position.
@@ -203,6 +227,8 @@ impl Solid {
             started: false,
             body: None,
             exterior: None,
+            fallbacks: 0,
+            linear_fills: 0,
         };
         for k in 0..n {
             if shape.phi0(s.grid.position(k)) < 0.0 {
@@ -251,6 +277,12 @@ impl Solid {
                 finite("ambient stress", c)?;
             }
             self.ambient[k] = s;
+        }
+        // The ghost values carry the traction: refit them for the new one.
+        if self.settings.boundary == Boundary::Ghost {
+            self.fallbacks = 0;
+            self.linear_fills = 0;
+            self.sharp_fill();
         }
         Ok(())
     }
@@ -344,6 +376,17 @@ impl Solid {
         let g = self.node_gradient(k)?;
         let f = invert(&identity_plus(&g))?;
         self.material.cauchy(&f).ok()
+    }
+
+    /// The ghost nodes of the last step that the ghost fill could not constrain (kept the
+    /// plain extrapolation); zero for the other surfaces.
+    pub fn surface_fallbacks(&self) -> usize {
+        self.fallbacks
+    }
+
+    /// The ghost nodes of the last step filled by the linear (not quadratic) constrained fit.
+    pub fn surface_linear_fills(&self) -> usize {
+        self.linear_fills
     }
 
     /// The largest node speed inside the body.
@@ -460,7 +503,8 @@ impl Solid {
             // ∇·σ: x-edges carry (σxx, σxy), y-edges (σxy, σyy).
             let mut div = [(fx[0] - bx[0] + fy[2] - by[2]) / h, (fx[2] - bx[2] + fy[1] - by[1]) / h];
             if let Some(b) = &self.body {
-                let w = 1.0 - heaviside(self.phi[k], eps);
+                // With a blended stress the force acts on the material's share of the node.
+                let w = if self.settings.boundary.blends() { 1.0 - heaviside(self.phi[k], eps) } else { 1.0 };
                 let f = (b.0)(self.grid.position(k));
                 div = [div[0] + w * f[0], div[1] + w * f[1]];
             }
@@ -574,8 +618,15 @@ impl Solid {
         if !ka.known() || !kb.known() {
             return Ok((amb, f64::NAN));
         }
-        let phi = 0.5 * (self.phi[k] + self.phi[b]);
-        let hv = heaviside(phi, eps);
+        let hv = if !self.settings.boundary.blends() {
+            // The solid stress alone, on every edge with a body node at either end.
+            if !ka.source() && !kb.source() {
+                return Ok((amb, f64::NAN));
+            }
+            0.0
+        } else {
+            heaviside(0.5 * (self.phi[k] + self.phi[b]), eps)
+        };
         if hv >= 1.0 {
             return Ok((amb, f64::NAN));
         }
@@ -658,16 +709,72 @@ impl Solid {
                 }
             }
         }
+        // Material entering: a band node whose extrapolated ξ lies inside the body. For the
+        // ghost-filled surface with hysteresis: a body node leaves at φ ≥ 0 but a band node
+        // enters only at φ < −h/10. Without it a node within a hair of a surface that settles
+        // on it flips between the two discrete systems (each puts the surface on the other side
+        // of the node by O(h²)) and keeps the body ringing (seen in the finite-strain
+        // cylinder); with it both states are consistent and either is an O(h²) answer.
+        let ghost = self.settings.boundary == Boundary::Ghost;
+        let enter = if ghost { -ENTRY_DEPTH * self.grid.h() } else { 0.0 };
         for k in 0..n {
             if filled[k] {
                 self.kind[k] = NodeKind::Band;
                 self.phi[k] = self.shape.phi0(self.xi(k));
-                if self.phi[k] < 0.0 {
+                if self.phi[k] < enter {
                     self.kind[k] = NodeKind::Solid;
                 }
             }
         }
+        self.fallbacks = 0;
+        self.linear_fills = 0;
+        if ghost {
+            self.sharp_fill();
+        }
         Ok(())
+    }
+
+    /// Refills the ghost ring (band nodes 8-adjacent to the body) with the traction-constrained
+    /// fit, then the outer band layers by the linear extrapolation from the body and the ghosts.
+    fn sharp_fill(&mut self) {
+        let n = self.grid.len();
+        let source: Vec<bool> = self.kind.iter().map(|k| k.source()).collect();
+        let ghosts: Vec<usize> = (0..n)
+            .filter(|&k| self.kind[k] == NodeKind::Band)
+            .filter(|&k| (-1..=1).any(|dj| (-1..=1).any(|di| self.grid.neighbour(k, di, dj).is_some_and(|m| source[m]))))
+            .collect();
+        let body = sharp::Body {
+            grid: &self.grid,
+            shape: &self.shape,
+            material: &self.material,
+            source: &source,
+            zeta: &self.zeta,
+            ambient: &self.ambient,
+            passes: 2,
+            degree: self.settings.ghost_degree,
+        };
+        let values: Vec<_> = ghosts.iter().map(|&g| sharp::ghost(&body, g)).collect();
+        let mut have = source;
+        for (&g, value) in ghosts.iter().zip(values) {
+            match value {
+                Some((z, kind)) => {
+                    if kind == sharp::Fill::Linear {
+                        self.linear_fills += 1;
+                    }
+                    self.zeta[g] = z
+                }
+                None => self.fallbacks += 1,
+            }
+            have[g] = true;
+        }
+        // The outer layers from the body and the new ghost values; their kinds are kept.
+        let target: Vec<bool> = (0..n).map(|k| self.kind[k] == NodeKind::Band && !have[k]).collect();
+        layered_fill(&self.grid, &have, &target, self.settings.band_layers.saturating_sub(1), &mut self.zeta);
+        for k in 0..n {
+            if self.kind[k] == NodeKind::Band {
+                self.phi[k] = self.shape.phi0(self.xi(k));
+            }
+        }
     }
 
     /// Extrapolates v from the nodes that carry it to the other known nodes.
@@ -811,6 +918,7 @@ mod tests {
             Settings { damping: f64::INFINITY, ..Settings::default() },
             Settings { blur: 0.0, ..Settings::default() },
             Settings { band_layers: 100, ..Settings::default() },
+            Settings { ghost_degree: 4, ..Settings::default() },
         ] {
             assert!(Solid::new(g.clone(), m, sh, bad, l).is_err(), "{bad:?}");
         }

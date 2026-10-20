@@ -11,6 +11,7 @@
 //! - [`material`]: plane-strain compressible neo-Hookean and small-strain linear elastic laws.
 //! - [`shape`]: reference shapes (their signed distance φ₀).
 //! - [`extrapolate`]: weighted least-squares linear extrapolation into the band outside the solid.
+//! - `sharp`: a sharp traction boundary by traction-constrained ghost values, [`Boundary::Ghost`].
 //! - [`solid`]: the state and the explicit time step.
 //!
 //! The scheme, in our own implementation from the published equations:
@@ -21,10 +22,12 @@
 //!   edge, tangential derivative the average of the four transverse differences), the stress
 //!   divergence at a node from its four edges (Kamrin, Rycroft & Nave 2012 §6.1; Rycroft et al.
 //!   2020 §3.3);
-//! - a blurred free surface: the edge stress is (1 − H_ε(φ)) σ_solid + H_ε(φ) σ_ambient with
-//!   the smoothed Heaviside of Rycroft et al. 2020, where σ_ambient is a prescribed stress
-//!   outside the body (zero for a free surface, −p I for a pressure), so the surface traction
-//!   is σ_ambient·n (Valkov, Rycroft & Kamrin 2015 for the blurred interface);
+//! - the surface traction is σ_ambient·n, σ_ambient a prescribed stress outside the body (zero
+//!   for a free surface, −p I for a pressure, any field), carried either by a blurred surface
+//!   (the edge stress is (1 − H_ε(φ)) σ_solid + H_ε(φ) σ_ambient with the smoothed Heaviside of
+//!   Rycroft et al. 2020; Valkov, Rycroft & Kamrin 2015) or by the sharp surface of
+//!   [`Boundary::Ghost`]: the solid stress alone, with ghost values outside the body fitted so
+//!   that σ·n = σ_ambient·n holds at the surface (second order; see `sharp`);
 //! - ξ in a band of a few nodes outside the solid rebuilt every step by a weighted linear
 //!   least-squares fit, layer by layer (after Rycroft et al. 2020 §3.2.2 and Sun & Rycroft 2025,
 //!   §3.2 of the preprint), and φ = φ₀(ξ) from it (Valkov et al. 2015);
@@ -61,6 +64,7 @@ pub mod extrapolate;
 pub mod grid;
 pub mod material;
 pub mod shape;
+mod sharp;
 pub mod solid;
 
 pub use grid::Grid;

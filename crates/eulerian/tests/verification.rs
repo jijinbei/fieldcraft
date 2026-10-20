@@ -3,7 +3,7 @@
 //! Each check states its tolerance and, where the answer is not exact, a convergence check
 //! between two resolutions. The numbers are summarised in docs/research/reference-map.md.
 
-use fieldcraft_eulerian::{Grid, Limits, Material, NodeKind, Settings, Shape, Solid};
+use fieldcraft_eulerian::{Boundary, Grid, Limits, Material, NodeKind, Settings, Shape, Solid};
 
 /// A grid of n × n nodes with spacing h, symmetric about the origin.
 fn centred_grid(n: usize, h: f64) -> Grid {
@@ -25,8 +25,15 @@ fn solid_nodes(s: &Solid) -> impl Iterator<Item = usize> + '_ {
 /// and the stress stays zero to round-off, also while the body moves across the grid.
 #[test]
 fn rigid_translation_is_exact() {
+    for boundary in [Boundary::Blurred, Boundary::Ghost] {
+        rigid_translation(boundary);
+    }
+}
+
+fn rigid_translation(boundary: Boundary) {
     let m = Material::neo_hookean(100.0, 0.3, 1.0).unwrap();
-    let mut s = Solid::new(centred_grid(41, 0.05), m, unit_block(), Settings::default(), Limits::default()).unwrap();
+    let settings = Settings { boundary, ..Settings::default() };
+    let mut s = Solid::new(centred_grid(41, 0.05), m, unit_block(), settings, Limits::default()).unwrap();
     let v = [0.7, -0.4];
     s.set_motion(|x| (x, v)).unwrap();
     let steps = 400;
@@ -40,7 +47,8 @@ fn rigid_translation_is_exact() {
         let xi = s.reference(k).unwrap();
         assert!((xi[0] - (x[0] - v[0] * t)).abs() < 1e-11 && (xi[1] - (x[1] - v[1] * t)).abs() < 1e-11, "ξ at {x:?}: {xi:?}");
         let vel = s.velocity(k).unwrap();
-        assert!((vel[0] - v[0]).abs() < 1e-11 && (vel[1] - v[1]).abs() < 1e-11);
+        // Round-off of the ghost fits (22 × 22 solves) reaches ~1e-11 in v after 400 steps.
+        assert!((vel[0] - v[0]).abs() < 1e-10 && (vel[1] - v[1]).abs() < 1e-10, "{boundary:?} v at {x:?}: {vel:?}");
         let st = s.stress(k).unwrap();
         assert!(st.iter().all(|c| c.abs() < 1e-8), "stress {st:?}");
         n += 1;
@@ -51,10 +59,11 @@ fn rigid_translation_is_exact() {
 
 /// The largest error of ξ and of the stress after a rotation by π/4 of the block about the
 /// origin under the prescribed rigid velocity field, at spacing h.
-fn rotation_errors(h: f64) -> (f64, f64) {
+fn rotation_errors(h: f64, boundary: Boundary) -> (f64, f64) {
     let m = Material::neo_hookean(100.0, 0.3, 1.0).unwrap();
     let n = (2.0 / h).round() as usize + 1;
-    let mut s = Solid::new(centred_grid(n, h), m, unit_block(), Settings::default(), Limits::default()).unwrap();
+    let settings = Settings { boundary, ..Settings::default() };
+    let mut s = Solid::new(centred_grid(n, h), m, unit_block(), settings, Limits::default()).unwrap();
     let omega = 1.0;
     let theta = std::f64::consts::FRAC_PI_4;
     let steps = (theta / omega / s.dt()).ceil() as usize;
@@ -79,12 +88,14 @@ fn rotation_errors(h: f64) -> (f64, f64) {
 /// time error of the explicit update; halving h (and Δt) halves the error.
 #[test]
 fn rigid_rotation_converges() {
-    let (xi_c, s_c) = rotation_errors(0.05);
-    let (xi_f, s_f) = rotation_errors(0.025);
-    eprintln!("rotation: |ξ error| {xi_c:.3e} → {xi_f:.3e}, |σ|/μ {s_c:.3e} → {s_f:.3e}");
-    assert!(xi_c < 2e-3 && xi_f < 1e-3, "ξ errors {xi_c} {xi_f}");
-    assert!(xi_f < 0.6 * xi_c, "ξ error must fall about linearly: {xi_c} → {xi_f}");
-    assert!(s_c < 1e-2 && s_f < 0.6 * s_c, "stress errors {s_c} {s_f}");
+    for boundary in [Boundary::Blurred, Boundary::Ghost] {
+        let (xi_c, s_c) = rotation_errors(0.05, boundary);
+        let (xi_f, s_f) = rotation_errors(0.025, boundary);
+        eprintln!("rotation ({boundary:?}): |ξ error| {xi_c:.3e} → {xi_f:.3e}, |σ|/μ {s_c:.3e} → {s_f:.3e}");
+        assert!(xi_c < 2e-3 && xi_f < 1e-3, "ξ errors {xi_c} {xi_f}");
+        assert!(xi_f < 0.6 * xi_c, "ξ error must fall about linearly: {xi_c} → {xi_f}");
+        assert!(s_c < 1e-2 && s_f < 0.6 * s_c, "stress errors {s_c} {s_f}");
+    }
 }
 
 // ------------------------------------------------------- 2. homogeneous finite strain
@@ -93,8 +104,15 @@ fn rigid_rotation_converges() {
 /// surface traction: the stress equals the closed form at every node and the block stays at
 /// rest (the linear reference map is reproduced exactly by the stencils and the extrapolation).
 fn homogeneous(f: [[f64; 2]; 2], expected: [f64; 3]) {
+    for boundary in [Boundary::Blurred, Boundary::Ghost] {
+        homogeneous_with(f, expected, boundary);
+    }
+}
+
+fn homogeneous_with(f: [[f64; 2]; 2], expected: [f64; 3], boundary: Boundary) {
     let m = Material::neo_hookean(100.0, 0.3, 1.0).unwrap();
-    let mut s = Solid::new(centred_grid(51, 0.05), m, unit_block(), Settings::default(), Limits::default()).unwrap();
+    let settings = Settings { boundary, ..Settings::default() };
+    let mut s = Solid::new(centred_grid(51, 0.05), m, unit_block(), settings, Limits::default()).unwrap();
     let det = f[0][0] * f[1][1] - f[0][1] * f[1][0];
     let finv = [[f[1][1] / det, -f[0][1] / det], [-f[1][0] / det, f[0][0] / det]];
     s.set_motion(|x| ([finv[0][0] * x[0] + finv[0][1] * x[1], finv[1][0] * x[0] + finv[1][1] * x[1]], [0.0, 0.0])).unwrap();
@@ -134,10 +152,10 @@ fn simple_shear_matches_the_closed_form() {
 
 /// The strains (εxx, εyy) in the middle of a free block pulled by the traction `t` on its x
 /// faces, relaxed to rest at spacing h.
-fn traction_strain(material: Material, h: f64, t: f64) -> (f64, f64) {
+fn traction_strain(material: Material, h: f64, t: f64, boundary: Boundary) -> (f64, f64) {
     let n = (2.0 / h).round() as usize + 1;
     let c = material.p_wave_speed();
-    let settings = Settings { damping: 2.0 * c, ..Settings::default() };
+    let settings = Settings { damping: 2.0 * c, boundary, ..Settings::default() };
     let mut s = Solid::new(centred_grid(n, h), material, unit_block(), settings, Limits::default()).unwrap();
     s.set_ambient(|_| [t, 0.0, 0.0]).unwrap();
     let young = 100.0;
@@ -171,9 +189,11 @@ fn small_strain_traction_matches_linear_elasticity() {
     for (name, m, tol) in
         [("linear", Material::linear_elastic(young, nu, 1.0).unwrap(), 1e-4), ("neo-Hookean", Material::neo_hookean(young, nu, 1.0).unwrap(), 5e-4)]
     {
-        let (a, b) = traction_strain(m, 0.1, t);
-        eprintln!("{name}: εxx {a:.6e} (exact {exx:.6e}), εyy {b:.6e} (exact {eyy:.6e})");
-        assert!(((a - exx) / exx).abs() < tol && ((b - eyy) / eyy).abs() < tol, "{name}: {a} {b}");
+        for boundary in [Boundary::Blurred, Boundary::Ghost] {
+            let (a, b) = traction_strain(m, 0.1, t, boundary);
+            eprintln!("{name} ({boundary:?}): εxx {a:.6e} (exact {exx:.6e}), εyy {b:.6e} (exact {eyy:.6e})");
+            assert!(((a - exx) / exx).abs() < tol && ((b - eyy) / eyy).abs() < tol, "{name}: {a} {b}");
+        }
     }
 }
 
@@ -228,23 +248,23 @@ fn wave_speeds_match_the_elastic_constants() {
 // ----------------------------------------------- 5. thick-walled cylinder (Lamé)
 
 /// The cylinder of the FEM oracle case `tests/oracle/lame-cylinder-plane-strain` (a = 10,
-/// b = 20, p = 100, E = 210000, ν = 0.3), plane strain, as a free ring with the pressure
-/// as the ambient stress in the bore, relaxed at spacing h. Returns u_r = A r + B/r fitted
-/// over the nodes clear of the blurred surfaces, at r = a and r = 15, and the hoop stress
-/// at the nodes nearest r = 15 (averaged).
-fn lame_cylinder(h: f64) -> (f64, f64, f64) {
-    let (a, b, p) = (10.0, 20.0, 100.0);
-    let m = Material::neo_hookean(210_000.0, 0.3, 1.0).unwrap();
+/// b = 20, E = 210000, ν = 0.3), plane strain, as a free ring with the pressure p as the ambient
+/// stress in the bore, relaxed at spacing h with the damping γ = `damping` · c_P / (2b).
+/// Returns u_r = A r + B/r fitted over the nodes with φ < −2h at r = a and r = 15, and the hoop
+/// stress at the nodes nearest r = 15 (averaged), all divided by p.
+fn lame_cylinder(h: f64, material: Material, p: f64, boundary: Boundary, damping: f64) -> (f64, f64, f64) {
+    let (a, b) = (10.0, 20.0);
     let n = (2.0 * (b + 5.0) / h).round() as usize + 1;
-    let c = m.p_wave_speed();
-    let settings = Settings { damping: 0.5 * c / b, ..Settings::default() };
-    let mut s = Solid::new(centred_grid(n, h), m, Shape::Annulus { center: [0.0, 0.0], inner: a, outer: b }, settings, Limits::default()).unwrap();
+    let c = material.p_wave_speed();
+    let settings = Settings { damping: damping * 0.5 * c / b, boundary, ..Settings::default() };
+    let mut s =
+        Solid::new(centred_grid(n, h), material, Shape::Annulus { center: [0.0, 0.0], inner: a, outer: b }, settings, Limits::default()).unwrap();
     s.set_ambient(|x| if x[0].hypot(x[1]) < 0.5 * (a + b) { [-p, -p, 0.0] } else { [0.0; 3] }).unwrap();
-    let ur_scale = 0.009;
-    let r = s.relax(1e-5 * ur_scale * c / b, 400_000).unwrap();
+    let ur_scale = 0.009 * p / 100.0;
+    let r = s.relax(1e-6 * ur_scale * c / b, 400_000).unwrap();
     assert!(r.converged, "{r:?}");
-    eprintln!("Lamé h = {h}: {} nodes, {} steps to rest", s.grid().len(), r.steps);
-    // Fit u_r = A r + B/r over nodes with φ < −2h (outside the blur zone).
+    assert_eq!(s.surface_fallbacks(), 0);
+    eprintln!("Lamé h = {h} ({boundary:?}): {} nodes, {} steps to rest", s.grid().len(), r.steps);
     let (mut m11, mut m12, mut m22, mut r1, mut r2) = (0.0, 0.0, 0.0, 0.0, 0.0);
     let (mut hoop, mut nh) = (0.0, 0.0);
     for k in solid_nodes(&s) {
@@ -270,47 +290,123 @@ fn lame_cylinder(h: f64) -> (f64, f64, f64) {
     let det = m11 * m22 - m12 * m12;
     let ca = (r1 * m22 - r2 * m12) / det;
     let cb = (m11 * r2 - m12 * r1) / det;
-    (ca * a + cb / a, ca * 15.0 + cb / 15.0, hoop / nh)
+    ((ca * a + cb / a) / p, (ca * 15.0 + cb / 15.0) / p, hoop / nh / p)
 }
 
-/// Lamé, plane strain: u_r = (1 + ν) p a² / (E (b² − a²)) ((1 − 2ν) r + b²/r),
-/// σ_θ = p a² / (b² − a²) (1 + b²/r²).
+/// Lamé, plane strain, per unit pressure: u_r = (1 + ν) a² / (E (b² − a²)) ((1 − 2ν) r + b²/r),
+/// σ_θ = a² / (b² − a²) (1 + b²/r²).
 fn lame_exact(r: f64) -> (f64, f64) {
-    let (a, b, p, e, nu) = (10.0f64, 20.0f64, 100.0, 210_000.0, 0.3);
-    let k = p * a * a / (b * b - a * a);
+    let (a, b, e, nu) = (10.0f64, 20.0f64, 210_000.0, 0.3);
+    let k = a * a / (b * b - a * a);
     ((1.0 + nu) * k / e * ((1.0 - 2.0 * nu) * r + b * b / r), k * (1.0 + b * b / (r * r)))
 }
 
-/// FieldCraft's FEM result for u_r at the bore (quad8, 8 × 16), frozen in
+/// FieldCraft's FEM result for u_r at the bore under p = 100 (quad8, 8 × 16), frozen in
 /// tests/oracle/lame-cylinder-plane-strain/fixture.json.
 const FEM_UR_BORE: f64 = 0.009079340794556473;
 
-fn lame_report(h: f64) -> (f64, f64, f64) {
-    let (ura, ur15, hoop) = lame_cylinder(h);
+fn lame_report(h: f64, material: Material, p: f64, boundary: Boundary) -> (f64, f64, f64) {
+    let (ura, ur15, hoop) = lame_cylinder(h, material, p, boundary, 1.0);
     let (ex_a, _) = lame_exact(10.0);
     let (ex15, hoop15) = lame_exact(15.0);
-    let e = (((ura - ex_a) / ex_a).abs(), ((ur15 - ex15) / ex15).abs(), ((hoop - hoop15) / hoop15).abs());
+    let e = ((ura - ex_a) / ex_a, (ur15 - ex15) / ex15, (hoop - hoop15) / hoop15);
     eprintln!(
-        "Lamé h = {h}: u_r(a) {ura:.6e} (exact {ex_a:.6e}, FEM {FEM_UR_BORE:.6e}), u_r(15) {ur15:.6e} (exact {ex15:.6e}), \
-         σθ(15) {hoop:.3} (exact {hoop15:.3}); rel. errors {:.2e} {:.2e} {:.2e}",
-        e.0, e.1, e.2
+        "Lamé h = {h} ({boundary:?}): u_r(a)/p {ura:.6e} (exact {ex_a:.6e}, FEM {:.6e}), u_r(15)/p {ur15:.6e} (exact {ex15:.6e}), \
+         σθ(15)/p {hoop:.4} (exact {hoop15:.4}); rel. errors {:+.2e} {:+.2e} {:+.2e}",
+        FEM_UR_BORE / 100.0,
+        e.0,
+        e.1,
+        e.2
     );
     e
 }
 
-/// Ten nodes across the wall: the blurred surfaces (±1.5 h) make the ring about 11 % too stiff.
+/// Ten nodes across the wall, neo-Hookean at p = 100 (strain 1e-3, the ghost fill's traction
+/// linearised about its own gradient): the ghost-filled surface is within 3 %, the blurred one about
+/// 11 % too stiff (its answer also depends on γ and κ, see below).
 #[test]
+#[ignore = "heavy: cargo xtask test --heavy (CI heavy job)"]
 fn thick_cylinder_matches_lame_coarse() {
-    let (ea, e15, eh) = lame_report(1.0);
-    assert!(ea < 0.15 && e15 < 0.15 && eh < 0.15, "{ea} {e15} {eh}");
+    let m = Material::neo_hookean(210_000.0, 0.3, 1.0).unwrap();
+    let (ea, e15, eh) = lame_report(1.0, m, 100.0, Boundary::Ghost);
+    assert!(ea.abs() < 0.03 && e15.abs() < 0.03 && eh.abs() < 0.03, "{ea} {e15} {eh}");
+    let (ea, _, _) = lame_report(1.0, m, 100.0, Boundary::Blurred);
+    assert!(ea.abs() < 0.15, "{ea}");
 }
 
-/// Halving h cuts the error by about 3.4 (order ≈ 1.8): within 4 % at 20 nodes across the wall.
+/// The static answer of the ghost-filled surface does not depend on the damping used to reach it;
+/// the original blurred surface's does (its band nodes integrate a velocity they never act on,
+/// and the artificial viscosity turns it into a surface stress).
+#[test]
+#[ignore = "heavy: cargo xtask test --heavy (CI heavy job)"]
+fn the_static_answer_does_not_depend_on_the_damping() {
+    let m = Material::linear_elastic(210_000.0, 0.3, 1.0).unwrap();
+    let low = lame_cylinder(1.0, m, 0.1, Boundary::Ghost, 0.5).0;
+    let high = lame_cylinder(1.0, m, 0.1, Boundary::Ghost, 4.0).0;
+    eprintln!("ghost: u_r(a)/p {low:.6e} (γ × 0.5), {high:.6e} (γ × 4)");
+    // Equal to the relaxation tolerance (the speed test leaves Δu ∝ v/γ).
+    assert!(((low - high) / low).abs() < 1e-4, "{low} {high}");
+    let low = lame_cylinder(1.0, m, 0.1, Boundary::Blurred, 0.5).0;
+    let high = lame_cylinder(1.0, m, 0.1, Boundary::Blurred, 4.0).0;
+    eprintln!("blurred: u_r(a)/p {low:.6e} (γ × 0.5), {high:.6e} (γ × 4)");
+    assert!(((low - high) / low).abs() > 0.05, "{low} {high}");
+}
+
+/// The ghost-filled surface converges at second order or better: within 0.5 % at twenty nodes
+/// across the wall (linear elastic at strain 1e-6, so geometric nonlinearity stays out).
 #[test]
 #[ignore = "heavy: cargo xtask test --heavy (CI heavy job)"]
 fn thick_cylinder_converges_to_lame() {
-    let coarse = lame_report(1.0);
-    let fine = lame_report(0.5);
-    assert!(fine.0 < 0.04 && fine.1 < 0.04 && fine.2 < 0.04, "{fine:?}");
-    assert!(fine.0 < 0.4 * coarse.0 && fine.1 < 0.4 * coarse.1, "{coarse:?} → {fine:?}");
+    let m = Material::linear_elastic(210_000.0, 0.3, 1.0).unwrap();
+    let coarse = lame_report(1.0, m, 0.1, Boundary::Ghost);
+    let fine = lame_report(0.5, m, 0.1, Boundary::Ghost);
+    assert!(fine.0.abs() < 0.005 && fine.1.abs() < 0.005 && fine.2.abs() < 0.006, "{fine:?}");
+    assert!(fine.0.abs() < 0.25 * coarse.0.abs() && fine.1.abs() < 0.25 * coarse.1.abs(), "{coarse:?} → {fine:?}");
+}
+
+// ------------------------------------------- 6. slab under a body force (linear stress)
+
+/// A slab |x| < L, periodic in y, under the body force ρ g sign(x) with free faces: σxx falls
+/// linearly to zero at each face, u is quadratic, and the ghost-filled surface reproduces it to the
+/// relaxation tolerance wherever the faces cut the grid; the blurred one is off by O(h)
+/// (an effective face shift of 0.06–2.5 h, depending on where the face sits between nodes).
+#[test]
+fn a_slab_under_a_body_force_is_exact_with_the_ghost_fill() {
+    let m = Material::linear_elastic(210_000.0, 0.3, 1.0).unwrap();
+    let (l, mu, _) = m.constants();
+    let modulus = l + 2.0 * mu;
+    let h = 1.0;
+    for offset in [0.0, 0.3, 0.7] {
+        let big_l = 10.0 + offset;
+        let g = 1e-6 * modulus / big_l;
+        let grid = Grid::new(37, 5, h, [-18.0, 0.0], [false, true], &Limits::default()).unwrap();
+        let c = m.p_wave_speed();
+        let settings = Settings { boundary: Boundary::Ghost, viscosity: 0.0, damping: 0.5 * c / big_l, ..Settings::default() };
+        let shape = Shape::Rectangle { min: [-big_l, -1e6], max: [big_l, 1e6] };
+        let mut s = Solid::new(grid, m, shape, settings, Limits::default()).unwrap();
+        s.set_body_force(move |x| {
+            [
+                if x[0] > 0.0 {
+                    g
+                } else if x[0] < 0.0 {
+                    -g
+                } else {
+                    0.0
+                },
+                0.0,
+            ]
+        })
+        .unwrap();
+        let u_face = g * big_l * big_l / (2.0 * modulus);
+        let r = s.relax(1e-7 * u_face * c / big_l, 200_000).unwrap();
+        assert!(r.converged, "{r:?}");
+        let mut worst: f64 = 0.0;
+        for k in solid_nodes(&s) {
+            let x = s.grid().position(k)[0];
+            let exact = g / modulus * (big_l * x - x * x.abs() / 2.0);
+            worst = worst.max((s.displacement(k).unwrap()[0] - exact).abs() / u_face);
+        }
+        eprintln!("slab, face {offset} h past a node: max |u error| / u(L) = {worst:.2e}");
+        assert!(worst < 1e-5, "{worst}");
+    }
 }
