@@ -13,8 +13,9 @@
 //! - [`extrapolate`]: weighted least-squares linear extrapolation into the band outside the solid.
 //! - `sharp`: a sharp traction boundary by traction-constrained ghost values, [`Boundary::Ghost`].
 //! - [`solid`]: the state and the explicit time step.
-//! - [`cut`] and [`mapped`]: the sharp boundary — cut cells with the traction imposed on the
-//!   curved surface and the deformation gradient near it from a surface-fitted map.
+//! - [`cut`] and [`mapped`]: the default surface, [`Boundary::Mapped`] — sharp cut cells with
+//!   the traction imposed on the curved surface and the deformation gradient near it from a
+//!   surface-fitted map.
 //!
 //! The scheme, in our own implementation from the published equations:
 //! - fields at nodes (the nodes a lattice Boltzmann fluid will share later): the reference map
@@ -25,11 +26,13 @@
 //!   divergence at a node from its four edges (Kamrin, Rycroft & Nave 2012 §6.1; Rycroft et al.
 //!   2020 §3.3);
 //! - the surface traction is σ_ambient·n, σ_ambient a prescribed stress outside the body (zero
-//!   for a free surface, −p I for a pressure, any field), carried either by a blurred surface
-//!   (the edge stress is (1 − H_ε(φ)) σ_solid + H_ε(φ) σ_ambient with the smoothed Heaviside of
-//!   Rycroft et al. 2020; Valkov, Rycroft & Kamrin 2015) or by the sharp surface of
-//!   [`Boundary::Ghost`]: the solid stress alone, with ghost values outside the body fitted so
-//!   that σ·n = σ_ambient·n holds at the surface (second order; see `sharp`);
+//!   for a free surface, −p I for a pressure, any field), carried by the mapped cut cells of
+//!   [`Boundary::Mapped`] (second order; see [`mapped`]), or, for the comparison studies, by
+//!   the blurred surface of the papers (the edge stress is (1 − H_ε(φ)) σ_solid + H_ε(φ)
+//!   σ_ambient with the smoothed Heaviside of Rycroft et al. 2020; Valkov, Rycroft & Kamrin
+//!   2015) or by the ghost fill of [`Boundary::Ghost`] (the solid stress alone, with ghost
+//!   values outside the body fitted so that σ·n = σ_ambient·n holds at the surface; see
+//!   `sharp`);
 //! - ξ in a band of a few nodes outside the solid rebuilt every step by a weighted linear
 //!   least-squares fit, layer by layer (after Rycroft et al. 2020 §3.2.2 and Sun & Rycroft 2025,
 //!   §3.2 of the preprint), and φ = φ₀(ξ) from it (Valkov et al. 2015);

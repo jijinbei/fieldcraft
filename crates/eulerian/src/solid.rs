@@ -2,12 +2,15 @@
 //!
 //! Per node: the reference map as ζ = ξ − x, the velocity v, the level set φ = φ₀(ξ) and the
 //! node's kind. Solid nodes (φ < 0) advect ζ; band nodes (a few layers outside) get ζ by
-//! extrapolation every step ([`crate::extrapolate`]); the momentum balance is integrated at
-//! every known node with H_ε(φ) < 1 (the solid and the inner part of the blur zone), and the
-//! velocity is extrapolated to the rest of the band.
+//! extrapolation every step ([`crate::extrapolate`]). The default surface, [`Boundary::Mapped`],
+//! integrates the momentum at the body's nodes over their cut control volumes
+//! ([`crate::mapped`]). The step of the other surfaces, below, integrates it at every known
+//! node with H_ε(φ) < 1 (the solid and the inner part of the blur zone; the body's nodes only
+//! for [`Boundary::BlurredBody`] and [`Boundary::Ghost`]), and the velocity is extrapolated to
+//! the rest of the band.
 //!
-//! One step (central differences, as the explicit FEM solver: v at half steps, the first step
-//! advancing it by half a step from the initial state):
+//! One step of the blurred and ghost-filled surfaces (central differences, as the explicit FEM
+//! solver: v at half steps, the first step advancing it by half a step from the initial state):
 //! 1. edge stresses from ζ and v: σ = (1 − H) (σ_solid(F) + μ_e (∇v + ∇vᵀ)) + H σ_ambient;
 //! 2. v ← (v + Δt ((∇·σ + f)/ρ − (v·∇)v)) / (1 + γ Δt) at the momentum nodes (the damping is
 //!    implicit, so it never limits Δt; Δt/2 in the first step);
@@ -66,13 +69,15 @@ pub struct Settings {
     pub ghost_degree: usize,
 }
 
-/// The treatment of the body's surface.
+/// The treatment of the body's surface. [`Boundary::Mapped`] is the default and the one the
+/// static solve and the later stages build on; the others are kept for the comparison studies
+/// (docs/research/reference-map.md).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Boundary {
-    /// The blurred interface: σ = (1 − H_ε) σ_solid + H_ε σ_ambient on every edge, the
-    /// momentum integrated wherever H_ε < 1 (Valkov et al. 2015; Rycroft et al. 2020),
-    /// including band nodes outside the body whose ζ is extrapolated.
-    #[default]
+    /// The blurred interface of the published RMT: σ = (1 − H_ε) σ_solid + H_ε σ_ambient on
+    /// every edge, the momentum integrated wherever H_ε < 1 (Valkov et al. 2015; Rycroft et al.
+    /// 2020), including band nodes outside the body whose ζ is extrapolated. First order at a
+    /// loaded surface, and its static answer depends on the damping.
     Blurred,
     /// The blurred stress, with the momentum integrated only at the body's nodes (φ < 0) and
     /// v extrapolated into the band. The band nodes of [`Boundary::Blurred`] never come to
@@ -87,7 +92,8 @@ pub enum Boundary {
     Ghost,
     /// Sharp cut cells (`crate::mapped`): momentum only at nodes inside the body, each over the
     /// solid part of its dual cell, the traction imposed on the curved surface, and the
-    /// deformation gradient near the surface from a surface-fitted map.
+    /// deformation gradient near the surface from a surface-fitted map. Second order.
+    #[default]
     Mapped,
 }
 
@@ -105,7 +111,7 @@ impl Boundary {
 
 impl Default for Settings {
     fn default() -> Self {
-        Settings { cfl: 0.4, viscosity: 0.1, damping: 0.0, blur: 1.5, band_layers: 4, boundary: Boundary::Blurred, ghost_degree: 3 }
+        Settings { cfl: 0.4, viscosity: 0.1, damping: 0.0, blur: 1.5, band_layers: 4, boundary: Boundary::Mapped, ghost_degree: 3 }
     }
 }
 
