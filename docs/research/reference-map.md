@@ -172,6 +172,8 @@ keeps velocity and ξ at grid nodes for that reason.
 
 `crates/eulerian` (`fieldcraft-eulerian`, layer 2, no command yet): 2D plane strain on a
 regular grid, f64, sequential and deterministic, no panics, capped sizes and step counts.
+This section describes the first version, which follows the published scheme with its blurred
+surface (`Boundary::Blurred`).
 
 - Nodes carry ζ = ξ − x (periodic when the motion is) and v — the nodes a lattice will share.
 - F on cell edges from compact differences; ∇·σ at nodes from the four edges.
@@ -209,6 +211,7 @@ Where it falls short:
   twenty (observed order ≈ 1.8, as the incompressible paper reports for its FSI tests). A wider
   blur is stiffer (ε = 1.0 h: −8.5 %; 2.5 h: −16.8 % at h = 1). Stresses at the surface itself
   are not usable; the numbers above are a node layer or more inside.
+  §8 finds the cause.
 - **Extrapolation** is linear: first-order wrong where the strain varies, and its fit needs
   three non-collinear nodes, so features thinner than about two cells are not represented.
 - **Statics by relaxation.** The cylinder takes 1200 steps (2601 nodes) at h = 1 and about
@@ -219,6 +222,64 @@ Where it falls short:
   current ∇ξ); second order in time would need a predictor–corrector or an RK stage.
 - Not done: 3D, threads, contact between bodies, prescribed moving boundaries, the
   incompressible law the LBRMT uses, the LB coupling (step 3).
+
+## 8. Why the blurred surface is biased
+
+Two suspects: the blur itself (the boundary condition spread over a band 2ε wide) and the
+band's ζ, a linear extrapolation that continues the interior strain past the surface. The
+`blur_diagnosis` example separates them on the Lamé cylinder (neo-Hookean, p = 100; errors of
+u_r(a) from the fit over φ < −2h, relative), with two switches the solid keeps for this:
+`Solid::set_exterior_map` prescribes the exact Lamé ζ in the band instead of extrapolating
+it, and `Boundary::BlurredBody` integrates the momentum only at the body's nodes (φ < 0) with
+v extrapolated into the band ("sm" in the study notes).
+
+| band ζ | momentum at | ε / h | κ | γ × | h = 1 | h = 0.5 | h = 0.25 |
+|---|---|---|---|---|---|---|---|
+| extrapolated | φ < ε (published) | 1.5 | 0.1 | 1 | −10.9 % | −3.17 % | −0.85 % |
+| exact | φ < ε | 1.5 | 0.1 | 1 | +0.30 % | +0.11 % | – (unstable) |
+| extrapolated | φ < 0 | 1.5 | 0.1 | 1 | −39.1 % | −24.2 % | −13.8 % |
+| exact | φ < 0 | 1.5 | 0.1 | 1 | +0.31 % | +0.088 % | +0.017 % |
+| exact | φ < ε | 1.0 / 2.0 | 0.1 | 1 | +0.15 % / +0.53 % | +0.075 % / +0.18 % | |
+| extrapolated | φ < ε | 1.0 / 2.0 | 0.1 | 1 | −8.5 % / −13.9 % | −2.3 % / −4.5 % | |
+| extrapolated | φ < ε | 1.5 | 0 | 1 | −39.2 % | −24.2 % | |
+| extrapolated | φ < ε | 1.5 | 0.1 | 0.5 / 2 / 4 | −7.5 % / −15.4 % / −20.7 % | | |
+| exact | φ < 0 | 1.5 | 0.1 | 0.5 / 2 / 4 | +0.31 % / +0.31 % / +0.31 % | | |
+
+What this shows:
+- **The extrapolation is the bias.** With the exact ζ in the band the published scheme is
+  within 0.3 % at h = 1; the blur width alone costs a few tenths of a percent (+0.15 / +0.30 /
+  +0.53 % for ε = 1.0 / 1.5 / 2.0 h).
+- **The published −10.9 % is a cancellation.** The band nodes with 0 < φ < ε integrate
+  momentum, but their ζ is overwritten by the extrapolation every step, so they never come to
+  rest, and the artificial viscosity turns their velocity into a surface stress that offsets
+  part of the extrapolation error. Without the
+  band's momentum (φ < 0), or without the viscosity, the true extrapolation error shows:
+  −39 % at h = 1, order 0.4–1.0.
+- **The static answer depends on the damping** used to reach it: −7.5 % to −20.7 % for
+  γ × 0.5 to × 4 at h = 1, and on κ. With the momentum in the body and the exact band, both
+  drop out.
+- Measured and dropped (not committed): quadratic least-squares extrapolation (−3.7 % at h = 1,
+  +0.16 % at h = 0.25, but noisy and divergent without viscosity), harmonic extensions (worse
+  and unstable), other blur kernels (none removes the bias; the best with the exact band gives
+  +0.10 % at h = 1), averaging over grid rotations (the angular spread also comes from the
+  extrapolation).
+
+A flat face isolates the same effect without curvature or staircase (a slab |x| < L under a
+body force, σxx falling linearly to zero at the faces): the blurred surface puts the face at
+an effective position off by a fixed fraction of h that depends mostly on where the face cuts
+the grid, so the stress error is O(1) · (dσ/dn) · h, first order.
+
+| | ε / h | face θ h past a node: 0 | 0.25 | 0.5 | 0.75 |
+|---|---|---|---|---|---|
+| blurred, effective face shift δ / h | 1.0 | +0.06 | +0.25 | +0.82 | +2.51 |
+| | 1.5 | +0.13 | +0.30 | +0.66 | +1.47 |
+| | 2.5 | +0.24 | +0.39 | +0.63 | +1.01 |
+| blurred, σxx error at the last node / (ρ g h) | 1.5 | 0.82 | 0.91 | 1.21 | 1.98 |
+
+δ / h is the same at h = 1, 0.5 and 0.25 (0.658 h at θ = 0.5, ε = 1.5 h): first order.
+
+So a sharp surface needs two things: the traction imposed where the surface is, by the
+solid's own stress (no blending), and no stress computed from extrapolated ζ.
 
 ## Papers
 
