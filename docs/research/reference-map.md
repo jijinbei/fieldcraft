@@ -709,6 +709,180 @@ Where it falls short:
 - Not done: 3D, a held (Dirichlet) part beside the free bodies (supported, untested here beyond
   the code path).
 
+## 12. Local refinement near the surface
+
+The mapped surface is second order, but on a uniform grid its accuracy costs the same
+resolution everywhere. `crates/eulerian/src/refine.rs` refines a band around φ = 0 instead: a
+quadtree stored level by level, each level a sparse uniform lattice (`Grid::sparse`: only the
+active nodes are stored and walked, so the whole `Solid` and the mapped boundary run on a level
+unchanged), the surface on the finest level only.
+
+- **Regions.** The finest region is the cells of level L − 1 within `band` (default 6) finest
+  cells of φ = 0, each split in four. Every coarser region contains the next one dilated by two
+  of its own cells (proper nesting, which implies the 2:1 balance across edges and corners).
+  A level assembles only its *leaf* cells (those not refined further); the base level keeps
+  only the cells touching the body.
+- **Roles.** On level l a node is interior (all its cells are leaves here), a *master* (on the
+  interface with level l − 1, at a coarse position; updated here), *hanging* (on that
+  interface between two masters), a *ghost* (two layers outside the region), or *held*
+  (on the interface with level l + 1, or under it in a buffer of two cells; copied from there).
+- **Hanging nodes.** Value: cubic along the interface through the two masters and the next
+  nodes on the line (quadratic at a corner). Mass and force: half to each master. With the
+  half-faces of the cells this keeps a constant stress free of net force (the patch test) for
+  any interpolation exact on linear fields; linear values (the transpose of the sharing) give
+  an O(h²) value error and a first-order stress error in the next cells (1.2 % at h₀ = 1 next
+  to the interface against 0.29 % with cubic values).
+- **Ghosts.** Biquadratic in the coarser level's advanced nodes and this level's masters (a
+  one-sided 3 × 3 window where the centred one reaches under the finer level), linear in time
+  between the coarse states before and after its step.
+- **Fluxes and the register.** Each half-face of a leaf carries the flux between two of its
+  corners, so every flux is computed once and given to both sides. A dual face that the
+  interface halves is integrated over the leaf's half with the midpoint rule (the stress a
+  quarter cell from the edge, ¾ of the edge's plus ¼ of the parallel edge's). The force of the
+  coarse leaves on an interface node, and their solid area, complete the finer level's master
+  there (the flux register): summed over every degree of freedom of every level, the impulses
+  of the internal fluxes cancel to round-off (`coarse_fine_fluxes_conserve_momentum`: 1e-16 of
+  Σ|impulse|).
+- **Time.** Berger–Oliger subcycling: a step of level l, then two of level l + 1 with Δt/2,
+  then the finer values copied onto the held nodes (velocities averaged over the two
+  substeps, which puts them at the coarse half step). With leapfrog, the coarse kick at tⁿ
+  stands for [tⁿ − Δt/2, tⁿ + Δt/2] and the fine kicks for [tⁿ − Δt/4, tⁿ + 3Δt/4]; holding
+  Fⁿ in the register through both substeps lags the coupling by a quarter coarse step, a
+  first-order error that a P wave shows as a reflection ∝ h/λ. The register is extrapolated
+  to each fine kick, Fⁿ + s(Fⁿ − Fⁿ⁻¹); the extra impulse, (Δt/4)(Fⁿ − Fⁿ⁻¹) per step,
+  telescopes (momentum in transit between the levels' clocks) and is reported by the audit.
+- **Statics.** `Hierarchy::residual` evaluates the composite equilibrium residual (all levels
+  at one time, ghosts and held nodes made consistent, the registers added): the operator a
+  static solver needs, independent of the time loop.
+- **Regridding.** `Hierarchy::regrid` (or every N coarse steps) re-flags from the current
+  surface and moves ζ by interpolation from the finest old level holding each point (exact for
+  linear maps) and v by the overlap of old and new control volumes, rasterised on quarter cells
+  of the finer of the two hierarchies (every piece of old mass finds new nodes; Σ m v is kept
+  for full cells; the cut cells next to the surface are rebuilt with the new band and move in
+  the eighth digit).
+
+Verification (`crates/eulerian/tests/refine.rs`; studies `examples/refine_cases.rs` and
+`examples/refine_wave.rs`):
+
+| check | result |
+|---|---|
+| patch tests: uniaxial stretch 1.25, simple shear 0.3, neo-Hookean disc, 1 and 2 levels | composite residual ≤ 1.1e-13 at every degree of freedom; at rest after 60 steps; σ exact to 1e-7 at every node of every level and at the surface |
+| no refinement | the hierarchy on one level equals the mapped solid on the full grid to 1e-15 |
+| control volumes | the composite solid area equals the uniform finest grid's to 1e-12 |
+| momentum | Σ impulses over all degrees of freedom of a free, stressed body, 2 levels subcycled: 1e-16 of Σ\|impulse\| per coarse step (after the register's in-transit part) |
+| rigid translation of a disc through 30 regrids (2 levels) | ξ to 6e-15, v to 2e-12, σ to 1.4e-11 |
+| regrid | every piece of old mass finds new nodes; Σ m v changes by 1.2e-8 (the rebuilt cut cells) |
+
+**A P wave across a refined strip** (periodic box, Gaussian pulse of half-width w coarse cells,
+linear elastic, κ = 0; reflected amplitude in % of the incident one, entry / exit):
+
+| w | 1 level | 2 levels | 3 levels | 1 level, register held at Fⁿ |
+|---|---|---|---|---|
+| 2 | 1.5 / 17 | 1.3 / 14 | 1.2 / 14 | 2.7 / 18 |
+| 4 | 0.43 / 0.43 | 0.49 / 0.50 | 0.44 / 0.45 | 1.25 / 1.46 |
+| 8 | 0.11 / 0.11 | 0.13 / 0.13 | 0.13 / 0.13 | 0.55 / 0.58 |
+| 16 | 0.027 / 0.027 | 0.033 / 0.033 | 0.035 / 0.035 | 0.27 / 0.27 |
+
+Second order in h/w (first order with the held register); every level at the finest Δt gives
+0.57, 0.15, 0.037 % (1 level), so the subcycled coupling reflects no more than the spatial one.
+At w = 2 the pulse is not resolved on the coarse grid and what the fine grid carries cannot
+leave it (17 % at the exit).
+
+**Stability.** Without artificial viscosity the coupled operator has slowly growing modes:
+the pulse's amplitude reaches 80 × (1 level, after 5–7 trips round the box) to 300 × (2
+levels) and saturates there; every level at the finest Δt grows too (10–40 × in 40 trips), so
+it is the spatial coupling, not the subcycling. The ghost-cell coupling is conservative but not
+variational (a fine stencil reads interpolated coarse values whose reaction no coarse node
+receives), as the mapped surface already is (§10: its eigenvalues grow by 0.5 % per step
+without damping). κ = 0.01 (1 level) and κ = 0.02 (2 and 3 levels) keep 40 trips decaying;
+the default κ = 0.1 has a wide margin. The explicit step with κ = 0.1 relaxes the refined
+Lamé cylinder at Δt = 0.6 h/c_P (the viscous cap is 0.625); with κ = 0.02 it relaxes at 0.5
+and diverges at 0.6 (late, t = 40) and 0.7, where the uniform mapped scheme still relaxes.
+
+**Statics.** Linear elastic, load × 0.01 (strain 1e-5), relaxed until the deformation speed
+stays below 1e-6 of its scale for a full period 2π b/c_P (a single mode passes through zero
+velocity everywhere at once, and stopping at the first quiet check left the free disc's
+displacements 10 × less accurate). Errors in % of σθ(a) exact (Lamé, disc) or 3S (Kirsch).
+Surface: the worst σθ at the bore's surface points (Kirsch: RMS of σθ around the hole);
+interior: the worst nodal stress component at nodes with a + 3 < r < b − 3. CPU on one core
+of a shared, heavily loaded machine (indicative only).
+
+| grid | finest h | Lamé surface | interior | Kirsch surface | interior | disc surface | interior | updates (Lamé) | CPU s (Lamé) |
+|---|---|---|---|---|---|---|---|---|---|
+| uniform | 1 | 1.403 | 0.476 | 3.651 | 0.698 | 0.894 | 0.316 | 2.78e+06 | 6 |
+| uniform | 0.5 | 0.316 | 0.132 | 0.535 | 0.194 | 0.201 | 0.086 | 2.31e+07 | 30 |
+| uniform | 0.25 | 0.082 | 0.035 | 0.119 | 0.051 | 0.052 | 0.023 | 1.84e+08 | 158 |
+| uniform | 0.125 | 0.027 | 0.010 | 0.027 | 0.013 | 0.017 | 0.006 | 1.47e+09 | 794 |
+| uniform | 0.0625 | 0.009 | 0.003 | 0.007 | 0.003 | 0.006 | 0.002 | 1.18e+10 | 4299 |
+| h₀ = 1, 1 level | 0.5 | 0.228 | 0.560 | 0.527 | 0.455 | 0.153 | 0.402 | 1.70e+07 | 30 |
+| h₀ = 1, 2 levels | 0.25 | 0.074 | 0.779 | 0.115 | 0.459 | 0.030 | 0.620 | 7.36e+07 | 142 |
+| h₀ = 1, 3 levels | 0.125 | 0.109 | 0.731 | 0.056 | 0.459 | 0.050 | 0.315 | 2.98e+08 | 544 |
+| h₀ = 0.5, 1 level | 0.25 | 0.058 | 0.151 | 0.120 | 0.164 | 0.039 | 0.101 | 8.05e+07 | 141 |
+| h₀ = 0.5, 2 levels | 0.125 | 0.040 | 0.149 | 0.038 | 0.168 | 0.021 | 0.099 | 3.05e+08 | 544 |
+| h₀ = 0.5, 3 levels | 0.0625 | 0.076 | 0.154 | 0.043 | 0.165 | 0.040 | 0.102 | 1.21e+09 | 2066 |
+
+- **The surface** reaches the uniform finest-grid accuracy while it is above the coarse floor,
+  and then stops: at h₀ = 0.5 two levels give 0.040 / 0.038 / 0.021 % (Lamé / Kirsch / disc),
+  uniform h = 0.125 0.027 / 0.027 / 0.017 %; a third level gives 0.076 / 0.043 / 0.040 %.
+  At h₀ = 1 the Lamé and disc surfaces stall at the second level (0.074 → 0.109 %, 0.030 →
+  0.050 %); Kirsch still gains at the third (0.115 → 0.056 %). The surface stress is set by the
+  whole wall's equilibrium, and the coarse interior's error reaches it: around the Kirsch hole
+  the refined runs carry a smooth cos 2θ offset of 0.05 % (h₀ = 1) and 0.025 % (h₀ = 0.5) on top
+  of the point-to-point scatter of the finest grid.
+- **The interior** keeps the error of h₀: 0.15 / 0.17 / 0.10 % at h₀ = 0.5 for every number of
+  levels (uniform h₀ = 0.5: 0.13 / 0.19 / 0.086 %), against 0.0095 / 0.013 / 0.006 % on the
+  uniform h = 0.125 grid and 0.003 / 0.003 / 0.002 % at 0.0625. At h₀ = 1 the refined bands fill
+  most of the 10 mm wall and the interior maximum (0.7 %) sits on level-1 nodes next to the
+  level-0 interface, about 1.5 × the coarse grid's own error. The payoff therefore exists only
+  where the interior error at h₀ is below the target: for these cases h₀ = 0.5 holds 0.1–0.2 %
+  in the interior, so refinement pays for a surface target between about 0.04 % and that level,
+  and not below.
+
+**Cost** in node updates (a degree of freedom advanced by one step of its level) to rest, and
+in CPU time:
+
+| grid | finest h | updates, uniform same h / refined (Lamé, Kirsch, disc) | CPU, same | uniform updates at the refined surface error / refined | CPU, same |
+|---|---|---|---|---|---|
+| h₀ = 1, 1 level | 0.5 | 1.4, 1.8, 1.4 | 1.0, 1.0, 1.0 | 2.2, 1.9, 2.1 | 1.5, 1.1, 1.4 |
+| h₀ = 1, 2 levels | 0.25 | 2.5, 3.7, 2.5 | 1.1, 1.3, 1.1 | 3.0, 3.9, 6.7 | 1.3, 1.4, 2.4 |
+| h₀ = 1, 3 levels | 0.125 | 4.9, 7.5, 5.0 | 1.5, 1.8, 1.5 | 0.4, 2.7, 0.7 | 0.2, 0.8, 0.3 |
+| h₀ = 0.5, 1 level | 0.25 | 2.3, 3.0, 2.3 | 1.1, 1.3, 1.1 | 4.4, 3.0, 3.8 | 1.9, 1.3, 1.7 |
+| h₀ = 0.5, 2 levels | 0.125 | 4.8, 7.0, 4.8 | 1.5, 1.8, 1.5 | 2.3, 4.4, 3.2 | 0.8, 1.2, 1.1 |
+| h₀ = 0.5, 3 levels | 0.0625 | 9.7, 14.6, 9.8 | 2.1, 2.7, 2.1 | 0.2, 1.0, 0.2 | 0.1, 0.3, 0.1 |
+
+At the same finest h the refined surface error is 0.6–1.0 × the uniform one with one level
+(and two at h₀ = 1), 1.3–1.5 × with two levels on h₀ = 0.5, and 2–9 × once it has stalled;
+the interior error is 2–77 × the uniform one (it is h₀'s).
+
+An estimate made before it was built (two levels near both surfaces on h₀ = 0.5, a band of ±4
+fine cells: about 6e4 node updates per coarse step against 4.4e5 for a uniform h = 0.125 grid,
+roughly 7 ×) holds for the count: Lamé at h₀ = 0.5 with two levels makes 5.0e4 updates per
+coarse step, the uniform h = 0.125 grid 2.4e5 (its 60300 degrees of freedom, not the 110889
+nodes of the box), 4.8 × at the same finest h (Kirsch 7.0 ×). At equal surface accuracy the
+saving in updates is 1.9–6.7 × before the stall and below 1 after it. In CPU time it is 0.8–2.4
+× before the stall: the hierarchy walks 3–4 active nodes per degree of freedom on the refined
+levels (level 2: 31584 active for 10972 degrees of freedom; level 1: 14320 for 1884: the outer
+half of the band, ghosts, hanging and held nodes, the covered buffers), and every per-node loop
+of the mapped solid (band fill, cut build, fluxes) visits them; per active node-step it costs
+the same as the uniform grid (0.56–0.76 µs). A narrower band (4 finest cells instead of 6)
+cuts 23 % of the updates but doubles the Kirsch surface error (RMS 0.069 % against 0.038 %).
+
+Where it falls short:
+- The interior error stays at h₀, so local refinement cannot reach a uniform accuracy target
+  cheaper unless h₀ already meets it, and the surface stalls after one or two levels, at a
+  floor set by the coarse interior (about 0.04 % here at h₀ = 0.5).
+- CPU savings are small (≤ 2.4 ×) because inactive-but-walked nodes dominate the refined
+  levels; skipping frozen and empty nodes in the solid's per-node loops, and not activating the
+  outside of the body beyond the band, would bring the CPU ratio towards the update ratio.
+- The coupling needs artificial viscosity (κ ≥ 0.02) for long undamped dynamics, and the
+  stable Δt with little viscosity is somewhat lower than on a uniform grid.
+- Static answers still come from dynamic relaxation with Δt set by the finest level's
+  subcycles; for statics the composite residual (`Hierarchy::residual`) is the operator the
+  Newton–Krylov solver of §11 should use, and its multigrid could reuse the levels.
+- Not done: regridding a body that moves more than the band between regrids (the transfer
+  needs the old band to hold the new surface), refinement on criteria other than the distance
+  to the surface, 3D.
+
 ## Papers
 
 All read from the open-access versions listed; journal details checked against the published
