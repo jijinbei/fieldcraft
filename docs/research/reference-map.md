@@ -4,7 +4,40 @@ Research notes for issue #594: solids described on a fixed grid (the lattice the
 already uses) instead of a separate FEM mesh, and the lattice Boltzmann coupling of such solids
 (LBRMT). This page is our own summary, written from the papers listed at the end; the papers
 themselves are kept locally and never committed. The prototype that follows these notes is
-`crates/eulerian` (solid only, 2D plane strain); fluid coupling is a later step.
+`crates/eulerian` (solid only, 2D plane strain), with `crates/eulerian-gpu` for its deep
+interior on a GPU; fluid coupling is a later step. Nothing here is a command yet: the crates
+are research code with tests and study examples.
+
+## Summary
+
+- **The published scheme is biased at loaded surfaces** (§8). Its blurred surface makes the
+  Lamé cylinder 10.9 % too stiff with ten nodes across the wall, and the cause is the linear
+  extrapolation of the reference map into the band, not the blur width: with the exact map
+  prescribed there the error is +0.30 %. Its static answer also depends on the relaxation
+  damping (−7.5 % to −20.7 % for γ × 0.5 to × 4), because band nodes integrate a velocity
+  they never act on.
+- **Mapped cut cells remove the bias** (§10) and are the default surface: momentum only in
+  the body's cut control volumes, the traction imposed on the curved surface, the
+  deformation gradient near it from a surface-fitted map. Lamé 0.023 % at h = 1, Kirsch RMS
+  0.53 % of 3S at h = 0.5, second order on stresses, independent of damping and viscosity.
+  A ghost-value fill (§9) gets second order too but is less accurate and slower per step; it
+  and the blurred surface stay only as options for the comparison studies.
+- **Statics no longer need relaxation** (§11): Newton–Krylov with a geometric multigrid
+  preconditioner solves the mapped equilibrium in O(n) with GMRES counts flat in h, about 430
+  times faster than dynamic relaxation at h = 0.125 (1.55 s against 661 s for the Lamé cylinder).
+  It is still about 200 times slower than FieldCraft's FEM for a solid alone.
+- **Local refinement near the surface** (§12) works (nested levels, refluxing to round-off
+  momentum, second-order subcycling) but pays modestly: at equal surface accuracy 1.9–6.7
+  times fewer node updates and 0.8–2.4 times less CPU, and only for one or two levels,
+  because the interior error stays at the coarse spacing.
+- **Threads and a GPU** (§13): the step is deterministic on any thread count (bit for bit),
+  but scales only 2.1–3.3 times on 8–10 cores because the surface work and the full-grid scans
+  around it dominate. On the GPU the deep interior runs at 1.7–2.0 × 10⁹ node updates/s,
+  70–80 times ten CPU threads, accurate in single precision once the stress is formed from
+  small quantities; with the surface still on the CPU the hybrid step gains at most 13 %.
+- **What blocks FSI** (§15): the surface work on the CPU, and the time step of a stiff solid,
+  hundreds of times below the lattice's; then the line-search stalls of the static solve after
+  topology changes, and everything in 3D.
 
 ## 1. The idea
 
@@ -173,7 +206,8 @@ keeps velocity and ξ at grid nodes for that reason.
 ## 7. The prototype and its verification
 
 `crates/eulerian` (`fieldcraft-eulerian`, layer 2, no command yet): 2D plane strain on a
-regular grid, f64, sequential and deterministic, no panics, capped sizes and step counts.
+regular grid, f64, deterministic on any number of threads (§13), no panics, capped sizes and
+step counts.
 This section describes the first version, which follows the published scheme with its blurred
 surface (`Boundary::Blurred`).
 The default surface is now the mapped one of §10; the blurred one stays for the comparison
@@ -229,8 +263,8 @@ Where it falls short:
   not competitive with the FEM; its case is FSI with large solid motion on the fluid's grid.
 - **Rotation** is transported with a first-order time error (explicit update of ξ with the
   current ∇ξ); second order in time would need a predictor–corrector or an RK stage.
-- Not done: 3D, threads, contact between bodies, prescribed moving boundaries, the
-  incompressible law the LBRMT uses, the LB coupling (step 3).
+- Not done: 3D, contact between bodies, prescribed moving boundaries, the incompressible law
+  the LBRMT uses, the LB coupling (step 3).
 
 ## 8. Why the blurred surface is biased
 
@@ -883,6 +917,230 @@ Where it falls short:
   needs the old band to hold the new surface), refinement on criteria other than the distance
   to the surface, 3D.
 
+## 13. Threads and the GPU
+
+**Threads.** Every loop of the explicit step over nodes, cells, faces and surface points runs on
+`fieldcraft-parallel`'s pool (`map_indexed`: results written in place, at least a fixed grain
+of indices per task). Each value is computed by the operations of the sequential loop and every
+sum a node gathers (face fluxes in face order, dual-cell areas in the order of their cells, the
+shares of control volumes and forces) is formed in the sequential scatter's order, so the step
+gives the sequential numbers bit for bit on any thread count (`tests/threads.rs`: 1, 2 and 7
+threads, mapped, blurred and ghost-filled; checked also against checksums of the sequential
+code for the static solve and the refined hierarchy). The surface chains are solved one after
+another; within a chain the residuals and the Jacobian's columns run in parallel.
+
+One explicit step of the Lamé cylinder by phase (`examples/rmt_profile.rs`; Apple M4 Max, ms,
+one thread):
+
+| h | nodes | interior faces | mapped faces | surface forces | momentum | advection | band | cut cells | surface points | Newton | step |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| 0.125 | 160801 | 6.1 | 3.7 | 3.0 | 3.2 | 0.9 | 5.2 | 7.9 | 0.5 | 2.6 | 33.1 |
+| 0.0625 | 641601 | 23.8 | 8.3 | 11.6 | 11.8 | 2.8 | 16.2 | 32.4 | 1.2 | 4.7 | 112.7 |
+
+Speed-up of the whole step over one thread (10 performance and 4 efficiency cores):
+
+| threads | 2 | 4 | 8 | 10 | 14 |
+|---|---|---|---|---|---|
+| h = 0.125 | 1.53 | 1.89 | 2.12 | 2.03 | 1.95 |
+| h = 0.0625 | 1.72 | 2.64 | 3.34 | 3.31 | 3.23 |
+
+The pure stencil phases scale 6–7 × on 8 threads (interior faces, advection), the surface
+ones barely: the Newton chains not at all, the mapped faces and surface points 1–2 ×, and
+the band and cut-cell scans, which walk the whole grid to find the few nodes near the surface,
+1.6–2.3 × and 2.5–3.9 ×. These measurements were made on the mapped step before it was
+merged with the static solve's held-topology structures; the merged step gives the same
+numbers bit for bit and costs about 18 % more per step (38–39 against 32–33 ms at h = 0.125
+on one thread, measured back to back): the static solve's per-topology structure, its face
+list with the compact stencils' nodes, is rebuilt every explicit step.
+
+**The deep interior on the GPU** (`crates/eulerian-gpu`, layer 7, research only). Far from the
+surface the mapped step is a pure stencil on full cells (the compact edge stress, the momentum
+of a full control volume, the upwind advection of ζ). `Solid::set_remote` lets a device take
+the solid nodes more than six rings inside (`CPU_RINGS`: the band's extrapolation windows, the
+surface map and the cut cells' corners need the CPU's own values that deep); `GpuSolid` steps
+them in a wgpu compute shader while the CPU steps everything else at the same time, and each
+step exchanges the values within two rings of the seam. With no surface (a periodic wave)
+every node is on the device and steps go in chunks of 64 without exchange.
+
+Single precision needs care: the stress formed as written loses the strain to cancellation
+(F ≈ I). The shader forms it from small quantities: H = F − I = −F G with G = ∇ζ, B − I =
+H + Hᵀ + H Hᵀ, ln J = −log1p(tr G + det G) by its series. Lamé cylinder at h = 0.25 after
+8000 steps, largest stress difference from the CPU (double precision) over p, and the largest
+stress error against the closed form over the nodes 2h inside:
+
+| load (strain) | GPU, stable stress | GPU, stress as written | error vs closed form: CPU / stable / as written |
+|---|---|---|---|
+| p = 100 (1e-3) | 6.3e-6 | 3.3e-4 | 5.25e-3 / 5.25e-3 / 5.31e-3 |
+| p = 1 (1e-5) | 1.1e-5 | 2.9e-2 | 1.49e-3 / 1.49e-3 / 2.7e-2 |
+
+The device's error is two to three orders below the discretisation error (`tests/agreement.rs`:
+a periodic shear wave, the pressurised ring, a disc translating across the grid while the
+split follows it, against the CPU; skipped without an adapter unless `FIELDCRAFT_REQUIRE_GPU=1`).
+
+Throughput (`examples/rmt_gpu.rs`; Apple M4 Max; ms per step):
+
+| shear wave, nodes | 4096 | 16384 | 65536 | 262144 | 1048576 | 3686400 |
+|---|---|---|---|---|---|---|
+| CPU, 1 thread | 0.84 | 3.3 | 13.3 | 55.9 | 240 | 846 |
+| CPU, 10 threads | 0.78 | 1.8 | 3.1 | 11.0 | 39.4 | 150 |
+| GPU, every node | 0.034 | 0.041 | 0.063 | 0.15 | 0.53 | 1.92 |
+| GPU, 10⁹ node updates/s | 0.12 | 0.40 | 1.0 | 1.7 | 2.0 | 1.9 |
+
+The interior stencil runs 70–80 × faster on the GPU than on ten CPU threads from a quarter of a
+million nodes up, at 1.7–2.0 × 10⁹ node updates per second (the lattice Boltzmann GPU backend
+on the same machine: 0.87–1.31 × 10⁹ D3Q19 cell updates per second).
+
+With a surface it does not pay yet. Lamé cylinder, ten CPU threads (ms per step):
+
+| h | nodes | nodes on the GPU | CPU alone | GPU interior + CPU surface | CPU part of it | wait for the GPU |
+|---|---|---|---|---|---|---|
+| 0.25 | 40401 | 7364 | 8.4 | 8.5 | 8.3 | 0.05 |
+| 0.125 | 160801 | 44928 | 17.9 | 16.6 | 16.4 | 0.07 |
+| 0.0625 | 641601 | 210544 | 36.2 | 32.9 | 32.5 | 0.12 |
+| 0.03125 | 2563201 | 903620 | 93.5 | 83.7 | 82.9 | 0.24 |
+
+The device finishes long before the CPU (the wait is under 0.3 ms), so the hybrid step is the
+CPU's surface work, 0–13 % below the CPU alone over two runs. Marking the deep interior remote
+leaves the CPU step at 16–17 / 33–35 ms on ten threads (h = 0.125 / 0.0625), the same as with
+every node on the CPU (16.3 / 34.1): what remains are the band, the cut cells and the faces
+next to the surface, and the full-grid scans that find them (widening the grid around the same
+cylinder from 160801 to 1442401 nodes takes the CPU step from 16 to 41 ms with or without the
+remote interior).
+
+What it would take, in order: active-node lists and persistent buffers so the CPU's work
+scales with the surface rather than the grid; the cut cells and mapped faces on the device;
+the surface chains last (their Newton is sequential along a chain).
+
+## 14. Coupling to the lattice, and the momentum risk
+
+In the blurred LBRMT the fluid stress never appears: the solid's force density
+∇·[(1 − H) τ_s] goes to the LB collision, and momentum is conserved because the force density
+is the divergence of one stress field (the edge sums telescope). With a sharp solid surface the
+solid needs the fluid's traction σ_f·n on the surface: the pressure from the density and the
+viscous stress from the non-equilibrium moments (σ'_f = −(1 − 1/(2τ)) Π^neq, local at every
+lattice node), at the surface's Gauss points; that is the ambient stress field the mapped
+surface integrates now (`Solid::set_ambient_field`). The fluid must then see the solid as a
+moving wall. The risk is momentum: the solid's momentum change is the balance of its own
+control volumes, and the fluid's comes from its own boundary scheme; if the two compute the
+exchanged force separately they differ by a truncation error, a free body drifts and the total
+momentum is not conserved to round-off as in the blend. The cut cells hold what a conservative
+coupling needs: the exact solid fraction of every cell (the input of partially saturated cells,
+Noble & Torczynski 1998) and the surface pieces of every cut cell (the links a momentum
+exchange crosses, Ladd 1994; Aidun et al. 1998). Computing the exchanged force once and
+applying it to both sides makes the coupling conservative by construction. Not measured here
+(no fluid yet).
+
+## 15. What still falls short
+
+- **For a solid alone the FEM wins.** The static solve (§11) is about 200 times slower than
+  FieldCraft's FEM at equal accuracy (0.18 s against about 1 ms for the Lamé cylinder). The
+  RMT's case is FSI with large solid motion on the fluid's grid, not structural analysis.
+- **FSI blockers.**
+  - *The surface is on the CPU.* The deep interior runs at GPU speed (§13), but the surface
+    work (band, cut cells, surface map, Newton chains) and the full-grid scans that find it set
+    the step; a lattice on the GPU with a solid surface on the CPU would wait on the CPU every
+    step.
+  - *Stiff solids.* The explicit solid step is bounded by 0.4 h/c_P, while the LBM steps at the
+    lattice's own (low-Mach) speed scale: for an engineering metal in a slow flow the solid's
+    stable step is hundreds of times below the lattice's (about 700 times in the estimate made
+    for the GPU study). A soft solid (the LBRMT's examples) avoids it; a stiff one needs an
+    implicit or subcycled solid step (the static solve's Newton–Krylov machinery is the
+    starting point) or a rigid-body treatment.
+- **Line-search stalls after topology changes** in the finite-strain static solve (§11): the
+  increment is halved 1–2 times per solve at h ≤ 0.125, most likely at surface points a node
+  only just behind the surface.
+- **Refinement pays modestly** (§12): the interior error stays at the coarse spacing.
+- **The ghost-filled and mapped surfaces are not symmetric** and need artificial viscosity
+  (κ ≥ 0.02–0.1) for long undamped dynamics.
+- Not done: 3D; contact between bodies; prescribed moving boundaries; the incompressible law the
+  LBRMT uses; thin features below about two cells; the LB coupling itself.
+
+## 16. Related work and what appears new
+
+A literature search (Crossref and the open literature to October 2026, about 110 papers) found
+the following. It is a search, not a proof: some relevant texts could not be read (the Valkov
+MIT thesis, Lin's Harvard thesis, both Lara & Kamrin CMAME papers on RMT contact, the full text
+of Richter 2013), and they may contradict the claims below.
+
+**Closest published methods.**
+- *Sharp traction on Cartesian grids, small strain*: cut-cell finite volumes with the traction
+  integrated over the true boundary segment (Theillard et al. 2013) and ghost points with
+  σ·n = t imposed at the closest boundary point plus geometric multigrid (Coco et al. 2014),
+  both second order in displacement. They are the closest analogues of the mapped cut cells and
+  the static solve, at small strain. The explicit simplified interface method (Lombard &
+  Piraux 2004/2006) builds the interface condition into a least-squares extension and keeps
+  second order only with extension order ≥ 3, as our ghost fill found for its cubic fit.
+- *Finite-strain Eulerian solids with sharp interfaces* (the Godunov line of Barton, Drikakis,
+  Pullin; Gorsse, Iollo & Milcent's backward characteristics, which are the reference map)
+  impose interface conditions through Riemann ghost states but report no interface order.
+- *Fully Eulerian FSI*: the finite element line (Dunne 2006; Richter & Wick 2010; Richter 2013;
+  Frei & Richter 2014) defines the solid by the Initial Point Set, which is the reference map
+  under another name, and solves it implicitly by Newton with multigrid; it reaches optimal
+  order only by fitting the interface (locally modified parametric elements, the closest
+  precedent for our surface-fitted map). The finite-difference line (Sugiyama et al. 2011;
+  the RMT papers of Kamrin, Rycroft, Jain, Lin, Wang, Sun) is explicit with a blended band and
+  first order at the interface: Sugiyama et al. measure it against an exact solution, the LBRMT
+  reports about 1.4 in self-convergence, Wang et al. 2022 show second order only towards the
+  model with a frozen blur width.
+- *Unfitted finite elements*: merged control volumes ≈ aggregated unfitted FEM (Badia et al.
+  2018); the ghost-cell preconditioner matrix ≈ in spirit the ghost penalty (Burman 2010);
+  cut-cell-aware coarsening ≈ immersed multigrid with Schwarz smoothers (de Prenter et al.
+  2020); the shifted boundary method (Main & Scovazzi 2018; Atallah et al. 2021) is the
+  strongest alternative to cut cells, optimal for linear elasticity, with no finite-strain
+  version found.
+- *Static equilibrium in the inverse motion* on body-fitted meshes: Govindjee & Mihalic 1996.
+- *GPU*: no GPU implementation of the RMT, the LBRMT, the full-Eulerian method or a Godunov
+  Eulerian solid was found; the only GPU Eulerian solids are unvalidated graphics papers
+  (Levin et al. 2011; Fan et al. 2013).
+
+**What appears new (hedged).**
+1. The stiffness bias of the linear least-squares extrapolation of ξ, measured against an
+   analytic static solution (§8). The ingredients are published (first-order ξ in the band,
+   Valkov et al. 2015; a grid-independent det F error of about 14 % in the band, Jain et al.
+   2019; second order only towards the frozen-blur model, Wang et al. 2022), but we found no
+   paper linking them to a stiffness error, and every published extrapolation test uses an
+   affine ξ, for which a linear fit is exact. The Valkov thesis is the most likely place for an
+   earlier static test.
+2. The dependence of a blurred RMT's static answer on the damping, through band nodes that
+   integrate momentum while their ξ is overwritten (§8). Not found.
+3. An implicit static RMT: Newton–Krylov with geometric multigrid and h-independent iteration
+   counts (§11). New for the RMT as far as we can tell, but not the first implicit Eulerian
+   solid (Richter & Wick 2010; Richter 2013) nor the first static solve in the inverse motion
+   (Govindjee & Mihalic 1996).
+4. A measured second-order surface stress for a finite-strain reference-map solid with sharp
+   traction on a fixed grid (§10, §11). The individual techniques have precedents (above); their
+   combination in an RMT with the traction on the true surface, and the measured order at
+   finite strain, appear unreported.
+5. Verification against exact solutions instead of self-convergence: the blurred RMT is −11 %
+   at ten nodes across a wall while its self-convergence looks healthy. Wang et al. 2022's
+   frozen-blur appendix comes closest to saying so.
+6. An RMT solid on a GPU (§13), with the caveat that only its deep interior runs there.
+
+## 17. Next steps
+
+In order of payoff for the goal (FSI with large solid motion on the GPU lattice):
+
+1. **The LB coupling** (step 3 of #594): monolithic and conservative through the cut-cell data
+   (§14): partially saturated cells driven by the cut cells' solid fractions, or a momentum
+   exchange on the cut links with covered and uncovered nodes accounted for (Wen et al. 2014's
+   Galilean-invariant form for moving walls), one velocity field as in the LBRMT. Risk: how a
+   sharp solid traction and a one-cell-diffuse PSM force agree at second order is unproven;
+   the fallback is LBRMT-style forcing on the true solid fraction (first order, still
+   conservative).
+2. **The stiff-solid time step**: an implicit or subcycled solid step built on the static
+   solve's Newton–Krylov and multigrid, or a rigid-body limit for very stiff parts (Wang et
+   al. 2022's projection; Millet & Liberge 2026).
+3. **The surface on the GPU**: active-node lists so the CPU's work scales with the surface;
+   the cut cells and mapped faces on the device; then the chains. A head-to-head with the
+   shifted boundary method (whole-cell stencils, no cut integration, no chains) is the
+   alternative if the chains do not port.
+4. **A condition-built, higher-order extension at the surface** (in the spirit of Lombard &
+   Piraux and Coco et al.): the traction built into a quadratic or cubic fit replacing the 1/s
+   weights near nodes just behind the surface, to remove the line-search stalls of §11 and give
+   a band accurate for dynamics. Schwarz-patch smoothing (de Prenter et al. 2020) for the
+   V-cycle's creep.
+5. **3D** once the coupling works in 2D.
+
 ## Papers
 
 All read from the open-access versions listed; journal details checked against the published
@@ -931,6 +1189,69 @@ sources of code or text):
     (verified): conservative cut cells.
 11. C. S. Peskin, *The immersed boundary method*, Acta Numerica 11:479–517 (2002).
     doi:10.1017/S0962492902000077 (verified).
+
+Related work (§16; DOIs checked on Crossref by the literature search; read in full where open
+copies existed, else from abstracts):
+
+12. M. Theillard, L. Djodom, J. Vié, F. Gibou, *A second-order sharp numerical method for
+    solving the linear elasticity equations on irregular domains and adaptive grids –
+    Application to shape optimization*, J. Comput. Phys. 233:430–448 (2013).
+    doi:10.1016/j.jcp.2012.09.002.
+13. A. Coco, G. Currenti, C. Del Negro, G. Russo, *A second order finite-difference ghost-point
+    method for elasticity problems on unbounded domains with applications to volcanology*,
+    Commun. Comput. Phys. 16(4):983–1009 (2014). doi:10.4208/cicp.210713.010414a.
+14. B. Lombard, J. Piraux, *Numerical treatment of two-dimensional interfaces for acoustic and
+    elastic waves*, J. Comput. Phys. 195(1):90–116 (2004). doi:10.1016/j.jcp.2003.09.024.
+15. S. Jain, K. Kamrin, A. Mani, *A conservative and non-dissipative Eulerian formulation for
+    the simulation of soft solids in fluids*, J. Comput. Phys. 399:108922 (2019).
+    doi:10.1016/j.jcp.2019.108922.
+16. Y. Lin, N. Derr, C. Rycroft, *Eulerian simulation of complex suspensions and
+    biolocomotion in three dimensions*, Proc. Natl. Acad. Sci. 119:e2105338118 (2022).
+    doi:10.1073/pnas.2105338118.
+17. X. Wang, K. Kamrin, C. Rycroft, *An incompressible Eulerian method for fluid–structure
+    interaction with mixed soft and rigid solids*, Phys. Fluids 34:033604 (2022).
+    doi:10.1063/5.0082233.
+18. K. Sugiyama, S. Ii, S. Takeuchi, S. Takagi, Y. Matsumoto, *A full Eulerian finite
+    difference approach for solving fluid–structure coupling problems*, J. Comput. Phys.
+    230(3):596–627 (2011). doi:10.1016/j.jcp.2010.09.032.
+19. T. Richter, T. Wick, *Finite elements for fluid–structure interaction in ALE and fully
+    Eulerian coordinates*, Comput. Methods Appl. Mech. Eng. 199:2633–2642 (2010).
+    doi:10.1016/j.cma.2010.04.016.
+20. T. Richter, *A fully Eulerian formulation for fluid–structure-interaction problems*, J.
+    Comput. Phys. 233:227–240 (2013). doi:10.1016/j.jcp.2012.08.047.
+21. S. Frei, T. Richter, *A locally modified parametric finite element method for interface
+    problems*, SIAM J. Numer. Anal. 52(5):2315–2334 (2014). doi:10.1137/130919489.
+22. S. Govindjee, P. Mihalic, *Computational methods for inverse finite elastostatics*,
+    Comput. Methods Appl. Mech. Eng. 136:47–57 (1996). doi:10.1016/0045-7825(96)01045-6.
+23. S. Badia, F. Verdugo, A. Martín, *The aggregated unfitted finite element method for
+    elliptic problems*, Comput. Methods Appl. Mech. Eng. 336:533–553 (2018).
+    doi:10.1016/j.cma.2018.03.022.
+24. E. Burman, *Ghost penalty*, C. R. Math. 348:1217–1220 (2010). doi:10.1016/j.crma.2010.10.006.
+25. F. de Prenter, C. Verhoosel, E. van Brummelen, J. Evans, C. Messe, J. Benzaken, K. Maute,
+    *Multigrid solvers for immersed finite element methods and immersed isogeometric analysis*, Comput. Mech. 65:807–838 (2020). doi:10.1007/s00466-019-01796-y.
+26. A. Main, G. Scovazzi, *The shifted boundary method for embedded domain computations. Part
+    I: Poisson and Stokes problems*, J. Comput. Phys. 372:972–995 (2018).
+    doi:10.1016/j.jcp.2017.10.026.
+27. N. Atallah, C. Canuto, G. Scovazzi, *The shifted boundary method for solid mechanics*,
+    Int. J. Numer. Methods Eng. 122(20):5935–5970 (2021). doi:10.1002/nme.6779.
+28. D. Noble, J. Torczynski, *A lattice-Boltzmann method for partially saturated
+    computational cells*, Int. J. Mod. Phys. C 9(8):1189–1201 (1998).
+    doi:10.1142/s0129183198001084.
+29. A. Ladd, *Numerical simulations of particulate suspensions via a discretized
+    Boltzmann equation. Part 1. Theoretical foundation*, J. Fluid Mech. 271:285–309 (1994).
+    doi:10.1017/s0022112094001771.
+30. C. Aidun, Y. Lu, E. Ding, *Direct analysis of particulate suspensions with inertia
+    using the discrete Boltzmann equation*, J. Fluid Mech. 373:287–311 (1998).
+    doi:10.1017/s0022112098002493.
+31. B. Wen, C. Zhang, Y. Tu, C. Wang, H. Fang, *Galilean invariant fluid–solid interfacial
+    dynamics in lattice Boltzmann simulations*, J. Comput. Phys. 266:161–170 (2014).
+    doi:10.1016/j.jcp.2014.02.018.
+32. D. Levin, J. Litven, G. Jones, S. Sueda, D. Pai, *Eulerian solid simulation with
+    contact*, ACM Trans. Graph. 30(4) (2011). doi:10.1145/2010324.1964931.
+33. Y. Fan, J. Litven, D. Levin, D. Pai, *Eulerian-on-Lagrangian simulation*, ACM
+    Trans. Graph. 32(3) (2013). doi:10.1145/2487228.2487230.
+34. T. Millet, E. Liberge, *A monolithic lattice Boltzmann–fictitious domain method for particle
+    sedimentation*, Results Eng. 30:110942 (2026). doi:10.1016/j.rineng.2026.110942.
 
 Background cited by these papers and used in the prototype: J. Bonet, R. D. Wood, *Nonlinear
 Continuum Mechanics for Finite Element Analysis*, 2nd ed., Cambridge 2008 (the compressible
