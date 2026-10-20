@@ -9,7 +9,7 @@
 //! One step (central differences, as the explicit FEM solver: v at half steps, the first step
 //! advancing it by half a step from the initial state):
 //! 1. edge stresses from ζ and v: σ = (1 − H) (σ_solid(F) + μ_e (∇v + ∇vᵀ)) + H σ_ambient;
-//! 2. v ← (v + Δt ((∇·σ)/ρ − (v·∇)v)) / (1 + γ Δt) at the momentum nodes (the damping is
+//! 2. v ← (v + Δt ((∇·σ + f)/ρ − (v·∇)v)) / (1 + γ Δt) at the momentum nodes (the damping is
 //!    implicit, so it never limits Δt; Δt/2 in the first step);
 //! 3. ζ ← ζ − Δt (v + (v·∇)ζ) at the solid nodes with the new v (from ∂ξ/∂t + (v·∇)ξ = 0);
 //! 4. φ from the new ζ; nodes that left the body drop out, the band is rebuilt, band nodes
@@ -150,6 +150,8 @@ pub struct Solid {
     time: f64,
     /// Whether a dynamic step was taken (the first one advances v by half a step).
     started: bool,
+    /// Body force per unit current volume, as a function of position.
+    body: Option<Field<[f64; 2]>>,
     /// ζ prescribed outside the body instead of extrapolated (verification only).
     exterior: Option<Field<[f64; 2]>>,
 }
@@ -199,6 +201,7 @@ impl Solid {
             dt,
             time: 0.0,
             started: false,
+            body: None,
             exterior: None,
         };
         for k in 0..n {
@@ -249,6 +252,20 @@ impl Solid {
             }
             self.ambient[k] = s;
         }
+        Ok(())
+    }
+
+    /// Sets a body force f per unit current volume as a function of the grid position (a
+    /// centrifugal load ρω²x, gravity ρg). Zero by default. The blurred surface applies it at
+    /// the nodes weighted by the material's share 1 − H(φ) (as the LBRMT weights the solid's
+    /// external force).
+    pub fn set_body_force(&mut self, force: impl Fn([f64; 2]) -> [f64; 2] + Send + Sync + 'static) -> Result<(), Error> {
+        for k in 0..self.grid.len() {
+            let b = force(self.grid.position(k));
+            finite("body force", b[0])?;
+            finite("body force", b[1])?;
+        }
+        self.body = Some(Field(Arc::new(force)));
         Ok(())
     }
 
@@ -441,7 +458,12 @@ impl Solid {
             let fy = edge[k][1];
             let by = back(1);
             // ∇·σ: x-edges carry (σxx, σxy), y-edges (σxy, σyy).
-            let div = [(fx[0] - bx[0] + fy[2] - by[2]) / h, (fx[2] - bx[2] + fy[1] - by[1]) / h];
+            let mut div = [(fx[0] - bx[0] + fy[2] - by[2]) / h, (fx[2] - bx[2] + fy[1] - by[1]) / h];
+            if let Some(b) = &self.body {
+                let w = 1.0 - heaviside(self.phi[k], eps);
+                let f = (b.0)(self.grid.position(k));
+                div = [div[0] + w * f[0], div[1] + w * f[1]];
+            }
             // ρ = ρ₀ det ∇ξ, averaged over the node's edges with a solid stress.
             let mut dets = 0.0;
             let mut count = 0.0;
@@ -759,6 +781,21 @@ mod tests {
         let mut s = block();
         s.run(50).unwrap();
         assert_eq!(s.max_speed(), 0.0);
+    }
+
+    /// A uniform body force accelerates the middle of a free block at f/ρ (no strain there
+    /// until the surface's signal arrives).
+    #[test]
+    fn a_body_force_accelerates_the_body() {
+        let mut s = block();
+        s.set_body_force(|_| [2.0, -1.0]).unwrap();
+        s.run(4).unwrap();
+        let k = s.grid().index(11, 11);
+        let t = s.time() - 0.5 * s.dt();
+        let v = s.velocity(k).unwrap();
+        // To the density change of the moving body's first steps (1e-6 relative).
+        assert!((v[0] / (2.0 * t) - 1.0).abs() < 1e-5 && (v[1] / -t - 1.0).abs() < 1e-5, "{v:?} at t = {t}");
+        assert!(s.set_body_force(|_| [f64::NAN, 0.0]).is_err());
     }
 
     #[test]

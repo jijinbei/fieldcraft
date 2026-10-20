@@ -4,7 +4,7 @@
 //! stores the reference position ξ(x, t) of the material at x, advected with the material,
 //! ∂ξ/∂t + (v·∇)ξ = 0; the deformation gradient is F = (∇ξ)⁻¹, a hyperelastic law gives the
 //! Cauchy stress, and the velocity follows from the Eulerian momentum balance
-//! ρ(∂v/∂t + (v·∇)v) = ∇·σ. No mesh: the solid is the set of nodes where φ₀(ξ) < 0 for a
+//! ρ(∂v/∂t + (v·∇)v) = ∇·σ + f. No mesh: the solid is the set of nodes where φ₀(ξ) < 0 for a
 //! signed distance φ₀ of the body in its reference configuration.
 //!
 //! - [`grid`]: the regular 2D grid of nodes (periodic or bounded per axis).
