@@ -5,7 +5,8 @@
 //!   the device): seconds per step on the device and on the CPU (`threads=`), and the
 //!   difference of the fields after S steps.
 //! - `lame h=H steps=S`: the Lamé cylinder with the deep interior on the device and the surface
-//!   on the CPU: seconds per step and where they went, against the CPU alone.
+//!   on the CPU: seconds per step and where they went, against the CPU alone (`pad=` widens
+//!   the grid around the same cylinder).
 //! - `relax h=H steps=S load=L`: the Lamé cylinder (bore pressure 100 L) relaxed for S steps on
 //!   the CPU, on the device with the stable stress and with the stress as written: the stress
 //!   differences against the CPU and the errors against the closed form.
@@ -31,13 +32,18 @@ fn wave(n: usize) -> Solid {
     s
 }
 
-fn lame(h: f64) -> Solid {
-    lame_loaded(h, 1.0)
+fn lame(h: f64, pad: f64) -> Solid {
+    lame_on(h, 1.0, pad)
 }
 
 fn lame_loaded(h: f64, load: f64) -> Solid {
+    lame_on(h, load, 0.0)
+}
+
+/// The cylinder on a grid reaching `pad` beyond the usual 5 past the outer surface.
+fn lame_on(h: f64, load: f64, pad: f64) -> Solid {
     let (a, b) = (10.0, 20.0);
-    let n = (2.0 * (b + 5.0) / h).round() as usize + 1;
+    let n = (2.0 * (b + 5.0 + pad) / h).round() as usize + 1;
     let o = -0.5 * (n as f64 - 1.0) * h;
     let g = Grid::new(n, n, h, [o, o], [false; 2], &Limits::default()).unwrap();
     let m = Material::neo_hookean(210_000.0, 0.3, 1.0).unwrap();
@@ -176,7 +182,8 @@ fn main() {
     let (solid, scale, label) = match case.as_str() {
         "lame" => {
             let h: f64 = get("h", "0.125").parse().unwrap();
-            (lame(h), 100.0, format!("\"h\":{h}"))
+            let pad: f64 = get("pad", "0").parse().unwrap();
+            (lame(h, pad), 100.0, format!("\"h\":{h},\"pad\":{pad}"))
         }
         _ => {
             let n: usize = get("n", "256").parse().unwrap();
