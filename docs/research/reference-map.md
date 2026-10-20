@@ -147,6 +147,7 @@ keeps velocity and ξ at grid nodes for that reason.
   interface (O(h) zone); the free surface sits
   somewhere in a zone ±ε wide, and ξ in that zone is extrapolated. Stresses at the surface (the
   numbers an analyst wants, e.g. the hoop stress at a bore) are the least accurate.
+  §8 measures the bias; §10 removes it.
 - **Extrapolation robustness**: thin parts a cell or two thick, sharp corners, near-contact,
   points that enter the solid with an extrapolated reference position.
 - **Mixing / large distortion.** ξ keeps the link to the reference configuration, so extreme
@@ -174,6 +175,8 @@ keeps velocity and ξ at grid nodes for that reason.
 regular grid, f64, sequential and deterministic, no panics, capped sizes and step counts.
 This section describes the first version, which follows the published scheme with its blurred
 surface (`Boundary::Blurred`).
+The default surface is now the mapped one of §10; the blurred one stays for the comparison
+studies.
 
 - Nodes carry ζ = ξ − x (periodic when the motion is) and v — the nodes a lattice will share.
 - F on cell edges from compact differences; ∇·σ at nodes from the four edges.
@@ -206,6 +209,8 @@ Verification (`crates/eulerian/tests/verification.rs`):
 u_r(a) is evaluated from a fit u_r = A r + B/r over the nodes with φ < −2h; the FEM gets the
 same number to 3e-6 on a 8 × 16 quad8 quarter.
 The checks except the Lamé ones now run with the blurred and the ghost-filled surfaces (§9).
+The rigid motions, patch tests and wave speeds also run with the mapped surface
+(`tests/mapped.rs`, §10).
 
 Where it falls short:
 - **The free surface.** Homogeneous states are exact (linear fields are reproduced by every
@@ -400,6 +405,111 @@ edge stresses and momentum 6 %. Steps to rest grow as 1/h, so a static answer by
 costs O(h⁻³) in 2D: 10³–10⁵ times the FEM, which reaches u_r(a) within 6e-3 on 1 × 2 quad8
 elements, 6e-4 on 2 × 4 and 4e-5 on 4 × 8 (121 nodes; σθ(15) within 8e-4), each in about
 1 ms, and the finite-strain case in 0.04–0.9 s (8 × 16 to 32 × 64).
+
+## 10. Mapped cut cells (the default surface)
+
+`Boundary::Mapped` (`crates/eulerian/src/{cut,mapped}.rs`) is the default surface. It removes
+both causes of §8: no blending, no stress from extrapolated ξ, momentum only inside the body.
+
+- **Control volumes.** A node inside the body (φ < 0) carries momentum for the solid part of
+  its dual cell. The surface in each cut grid cell is a quadratic curve through its two edge
+  crossings and a third point on φ₀(ξ) = 0 above the chord. Areas, centroids, the solid
+  pieces of the faces and the surface pieces of each quarter cell come from Green's theorem
+  over that curve (three Gauss points per side, exact for it), so every control volume closes
+  exactly and a constant stress puts no net force on any cut cell. The lumped mass is ρ times
+  the true solid area. Solid in the dual cell of an outside node is shared between the inside
+  neighbours across the surface along x and along y, with smooth weights in |∂φ/∂x| against
+  |∂φ/∂y|; its net force and mass go with it. A control volume below a quarter of h² would
+  join its deepest inside neighbour (never needed in the cases below).
+- **Fluxes.** Faces between full cells keep the compact interior stencil. Faces next to a cut
+  cell integrate σ(F)·n with two Gauss points on each solid piece; on the curved side the flux
+  is the prescribed traction σ_ambient·n with the curve's line Jacobian.
+- **The deformation gradient near the surface** comes from a surface-fitted map. Where a grid
+  line along axis d crosses the surface (up to about 72° from the normal) there is a surface
+  point with its own value ξ_S. Between neighbouring lines, T(u, η) = (x_d′ = (l + u) h,
+  x_d = Y(u) − σ η h) maps the unit square onto a cell whose side η = 0 is the surface, Y(u)
+  the crossings interpolated with the same Lagrange shape functions in u as the field;
+  ζ(u, η) = Σ L_l(u) p_l(η), p_l quadratic through ξ_S and the two inside nodes on line l;
+  ∇ζ = (∂ζ/∂u, ∂ζ/∂η) T′⁻¹ and F = (I + ∇ζ)⁻¹. Near the diagonal both families of lines give
+  a map and the two are blended smoothly.
+- **Surface values** satisfy σ(F)·n = t at every surface point: Newton on the conditions of
+  each chain of points along the surface, banded finite-difference Jacobian, LU with partial
+  pivoting, warm-started from the previous step (two or three iterations).
+- **The band** is still filled by the linear least-squares extrapolation, but only the ξ
+  advection (upwind neighbours) and the crossing positions use it.
+
+Three things the first version got wrong and the final one fixes: a discrete choice that can
+flip between steps makes the force discontinuous and the explicit scheme chatters instead of
+coming to rest (the family of lines chosen at 45°, the inside node that takes an outside
+node's solid); Gauss–Seidel along the surface diverges at the ends of a family of lines on a
+tight curve (hence the banded Newton); the cut state must belong to the configuration it is
+used with (it is rebuilt at the end of each step).
+
+Verification (`crates/eulerian/tests/mapped.rs`, and the `rmt_cases` example for the
+studies; same cases and metrics as before, u_r(a) from the fit over φ < −2h):
+
+| check | result |
+|---|---|
+| uniaxial stretch 1.25, simple shear 0.3 (neo-Hookean disc held by the matching ambient stress) | exact to 1e-9 at every node and surface point, at rest |
+| rigid translation of a disc across the grid | exact to round-off; the surface map amplifies it where the surface passes very close to a node (1/s weights): v to 5e-10, σ to 4e-9 (blurred: 1e-11) |
+| rigid rotation of a free disc by 90° (dynamic) | ‖σ‖/μ 3.0e-3 (the centrifugal response ρω²R²/μ = 6.5e-3), ξ within 2e-3 |
+| P- and S-wave speeds (no surface) | the plain stencil: same as §7 |
+
+Lamé cylinder, |u_r(a) error| (%):
+
+| h | blurred | blur + exact ξ in band (§8) | mapped, p = 100 neo-Hookean | mapped, small strain (load × 0.01) |
+|---|---|---|---|---|
+| 2 | 30.3 | – | 0.85 | 0.99 |
+| 1 | 10.9 | 0.31 | 0.154 | 0.023 |
+| 0.5 | 3.17 | 0.088 | 0.181 | 0.0004 |
+| 0.25 | 0.85 | 0.017 | 0.184 | 0.0018 |
+| 0.125 | 0.11 | – | 0.185 | 0.0016 |
+
+The mapped error at p = 100 levels at +0.18 %: that is the finite-strain answer (the pressure
+acts on the expanded bore, u is measured at the current position), not a discretisation
+error; with the load cut a hundredfold it falls to 0.0018 %, the same floor scaled. Below h =
+0.5 the small-strain error sits on that floor, so the order is read off the stresses: the
+worst σθ over the bore surface points (small strain) is 6.7, 1.4, 0.32, 0.082, 0.026 % for h =
+2 … 0.125 (orders 2.3, 2.2, 2.0, 1.7). Rotating disc (ρω² = 0.5, both surfaces free): u_r(a)
+small strain −6.9, −0.015, +0.003, +0.002, +0.001 %; worst bore σθ 4.2, 0.89, 0.20, 0.052,
+0.017 % (blurred u_r(a): −47, −7.6, −2.2, −0.54, −0.04 %). Kirsch hole (a = 5 in a disc of
+radius 20 with the exact traction outside): RMS error of σθ around the hole edge 3.4, 3.7,
+0.53, 0.12, 0.027 % of 3S (orders 2.8, 2.2, 2.1 from h = 1); σθ(a, 90°) within 0.04 % of 3S
+from h = 0.5; the blurred surface's worst node next to the hole is 30, 18, 6.2, 3.6, 2.1 % off.
+
+- **Damping** no longer moves the answer: u_r(a) at h = 0.5 is 0.00022 / 0.00036 / 0.00041 %
+  for γ × 0.5 / 1 / 4 (blurred: −1.9 / −3.2 / −7.7 %), nor does the artificial viscosity
+  (κ = 0.02: +0.150 % against +0.154 % at h = 1; blurred −22.6 % against −10.9 %).
+- **The band** decides nothing measurable: 2, 4 or 6 extrapolation layers give identical
+  results; prescribing the exact ξ there moves u_r(a) by 0.004 % (h = 1) and 0.015 % (0.5).
+- **Time step.** With κ = 0.02 (so the viscous limit does not cap Δt) the mapped scheme relaxes
+  up to Δt = 0.7 h/c_P at h = 1 and 0.8 at 0.5, the blurred one up to 0.8; the default 0.4 has
+  margin. The largest eigenvalue of the mapped operator is 0.22–0.26 of the explicit limit at
+  0.4. The operator is not symmetric near the surface (asymmetry 0.17 of its largest entry at
+  h = 1); its complex eigenvalues grow by up to 0.5 % per step without damping, so undamped
+  dynamics need the artificial viscosity (κ = 0.1 suffices; the blurred scheme without it
+  diverges at t = 0.5).
+- **Cost** per step on one core (Lamé; blurred / mapped, ms): h = 2: 0.10 / 0.66; 1: 0.31 /
+  1.5; 0.5: 1.0 / 3.5; 0.25: 3.6 / 9.0; 0.125: 13.8 / 26.6. The cut cells (≈ 0.9 ms at h =
+  0.5) and the surface solve (≈ 0.6 ms) grow with the surface, about × 2.2 and × 1.5 per
+  halving of h; the rest is the interior's O(n) work, so the ratio falls from 6.6 to 1.9.
+
+**The three surfaces side by side** (small strain; the blurred and ghost columns from §9's
+study at strain 1e-6, the mapped one from this section's at load × 0.01; per-step costs from
+the two studies' own runs on one core):
+
+| | h | blurred | ghost fill (cubic) | mapped |
+|---|---|---|---|---|
+| Lamé u_r(a) error | 1 | −11.2 % | −2.57 % | 0.023 % |
+| | 0.5 | −3.45 % | −0.40 % | 0.0004 % |
+| | 0.25 | −1.01 % | −0.063 % | 0.0018 % (floor) |
+| Kirsch σθ(a, 90°)/S (exact 3) | 0.5 | 2.693 | 3.010 | within 0.04 % of 3 |
+| | 0.25 | 2.938 | 2.997 | within 0.04 % of 3 |
+| rotating disc u_r(a) error | 1 | −7.8 % | −1.96 % | −0.015 % |
+| | 0.5 | −2.4 % | −0.30 % | +0.003 % |
+| static answer, γ × 0.5 against × 4 | 1 / 0.5 | −7.9 / −20.9 % (h = 1) | equal to 2e-5 (h = 1) | 0.00022 / 0.00041 % (h = 0.5) |
+| order of the surface stress | | none (σθ(a) does not converge) | 2.2 | 2.0–2.3 |
+| ms per step, h = 0.125 | | 9.8–13.8 | 34.4 | 26.6 |
 
 ## Papers
 
