@@ -66,7 +66,7 @@ pub mod solid;
 pub use grid::Grid;
 pub use material::Material;
 pub use shape::Shape;
-pub use solid::{NodeKind, Relaxation, Settings, Solid};
+pub use solid::{Boundary, NodeKind, Relaxation, Settings, Solid};
 
 /// Errors of the Eulerian solver.
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]

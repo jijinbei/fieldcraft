@@ -21,6 +21,7 @@ use crate::grid::Grid;
 use crate::material::{Material, Stress, Tensor};
 use crate::shape::Shape;
 use crate::{Error, Limits, finite, positive};
+use std::sync::Arc;
 
 /// What a node holds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -58,11 +59,36 @@ pub struct Settings {
     pub blur: f64,
     /// Number of node layers in the extrapolation band.
     pub band_layers: usize,
+    /// How the surface carries its traction.
+    pub boundary: Boundary,
+}
+
+/// The treatment of the body's surface.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Boundary {
+    /// The blurred interface: σ = (1 − H_ε) σ_solid + H_ε σ_ambient on every edge, the
+    /// momentum integrated wherever H_ε < 1 (Valkov et al. 2015; Rycroft et al. 2020),
+    /// including band nodes outside the body whose ζ is extrapolated.
+    #[default]
+    Blurred,
+    /// The blurred stress, with the momentum integrated only at the body's nodes (φ < 0) and
+    /// v extrapolated into the band. The band nodes of [`Boundary::Blurred`] never come to
+    /// rest (their ζ does not follow their velocity), so its static answer depends on the
+    /// damping and the artificial viscosity; this variant does not, and exposes the bias of
+    /// the extrapolated ζ.
+    BlurredBody,
+}
+
+impl Boundary {
+    /// Whether the momentum is integrated at the body's nodes only.
+    pub(crate) fn body_momentum(self) -> bool {
+        self != Boundary::Blurred
+    }
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Settings { cfl: 0.4, viscosity: 0.1, damping: 0.0, blur: 1.5, band_layers: 4 }
+        Settings { cfl: 0.4, viscosity: 0.1, damping: 0.0, blur: 1.5, band_layers: 4, boundary: Boundary::Blurred }
     }
 }
 
@@ -124,6 +150,18 @@ pub struct Solid {
     time: f64,
     /// Whether a dynamic step was taken (the first one advances v by half a step).
     started: bool,
+    /// ζ prescribed outside the body instead of extrapolated (verification only).
+    exterior: Option<Field<[f64; 2]>>,
+}
+
+/// A field given as a function of position.
+#[derive(Clone)]
+pub(crate) struct Field<T>(pub(crate) Arc<dyn Fn([f64; 2]) -> T + Send + Sync>);
+
+impl<T> std::fmt::Debug for Field<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Field(..)")
+    }
 }
 
 impl Solid {
@@ -161,6 +199,7 @@ impl Solid {
             dt,
             time: 0.0,
             started: false,
+            exterior: None,
         };
         for k in 0..n {
             if shape.phi0(s.grid.position(k)) < 0.0 {
@@ -211,6 +250,13 @@ impl Solid {
             self.ambient[k] = s;
         }
         Ok(())
+    }
+
+    /// For verification only: prescribes ζ = ξ − x outside the body (in the band) instead of
+    /// extrapolating it, to measure how much a result depends on the extrapolation.
+    pub fn set_exterior_map(&mut self, zeta: impl Fn([f64; 2]) -> [f64; 2] + Send + Sync + 'static) -> Result<(), Error> {
+        self.exterior = Some(Field(Arc::new(zeta)));
+        self.rebuild()
     }
 
     /// Holds the solid nodes where `clamp(x)` is true at their current ζ and v.
@@ -368,7 +414,7 @@ impl Solid {
             }
         }
 
-        // 2. Momentum at the nodes with H < 1.
+        // 2. Momentum at the momentum nodes.
         let mut live = vec![false; n];
         let mut v_new = self.v.clone();
         for k in 0..n {
@@ -377,7 +423,10 @@ impl Solid {
                 live[k] = true;
                 continue;
             }
-            if !kind.known() || heaviside(self.phi[k], eps) >= 1.0 {
+            // The body's own nodes, or (Blurred) every node with some material weight.
+            let moves =
+                if self.settings.boundary.body_momentum() { kind == NodeKind::Solid } else { kind.known() && heaviside(self.phi[k], eps) < 1.0 };
+            if !moves {
                 continue;
             }
             let back = |d: usize| -> [f64; 3] {
@@ -580,6 +629,13 @@ impl Solid {
         let source: Vec<bool> = self.kind.iter().map(|k| k.source()).collect();
         let target = vec![true; n];
         let filled = layered_fill(&self.grid, &source, &target, self.settings.band_layers, &mut self.zeta);
+        if let Some(f) = &self.exterior {
+            for k in 0..n {
+                if filled[k] {
+                    self.zeta[k] = (f.0)(self.grid.position(k));
+                }
+            }
+        }
         for k in 0..n {
             if filled[k] {
                 self.kind[k] = NodeKind::Band;
