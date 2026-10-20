@@ -1115,7 +1115,7 @@ impl Hierarchy {
             let lv = &self.levels[l];
             (0..lv.role.len()).map(|k| lv.role[k].dof() && lv.solid.kind[k].source()).collect()
         };
-        self.levels[l].solid.step_mapped().map_err(|e| match e {
+        self.levels[l].solid.step_mapped(&mut |_| {}).map_err(|e| match e {
             Error::Diverged(m) => Error::Diverged(format!("level {l}: {m}")),
             e => e,
         })?;

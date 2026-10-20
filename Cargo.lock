@@ -1338,6 +1338,7 @@ dependencies = [
 name = "fieldcraft-eulerian"
 version = "0.7.0"
 dependencies = [
+ "fieldcraft-parallel",
  "thiserror 2.0.21",
 ]
 

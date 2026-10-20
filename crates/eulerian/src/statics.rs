@@ -415,7 +415,7 @@ impl Solid {
         self.started = false;
         // The force scale: the largest external force on a control volume at the full load.
         self.rebuild()?;
-        let st = self.build_cut_with(self.cut.as_ref(), None, false, true)?;
+        let st = self.build_cut_with(self.cut.as_ref(), None, false, true, &mut |_| {})?;
         let loads = self.mapped_loads(&st);
         let scale = loads.iter().fold(0.0f64, |m, f| m.max(f[0].abs()).max(f[1].abs()));
         run.report.force_scale = scale;
@@ -682,7 +682,7 @@ impl Solid {
         let phi = self.phi.clone();
         self.zeta = ctx.base.clone();
         self.rebuild()?;
-        let st = self.build_cut_with(Some(&ctx.cut), None, false, false)?;
+        let st = self.build_cut_with(Some(&ctx.cut), None, false, false, &mut |_| {})?;
         let topo = st.topology(&self.kind);
         self.kind = kind;
         self.zeta = zeta;
@@ -697,12 +697,13 @@ impl Solid {
         let plan = Arc::new(self.fill_plan());
         self.refill_planned(&plan);
         let prev = warm.map(|c| &c.cut).or(self.cut.as_ref());
-        let st0 = self.build_cut_with(prev, None, false, false)?;
+        let st0 = self.build_cut_with(prev, None, false, false, &mut |_| {})?;
         let topo = st0.topology(&self.kind);
         // With the topology held as decided, solve the surface (reusing the factorisations of
         // the warm state when its topology is the same).
         let same = warm.is_some_and(|w| w.topo == topo);
-        let cut = self.build_cut_with(if same { warm.map(|w| &w.cut) } else { prev }, Some(&topo), same && run.set.reuse_surface_lu, true)?;
+        let cut =
+            self.build_cut_with(if same { warm.map(|w| &w.cut) } else { prev }, Some(&topo), same && run.set.reuse_surface_lu, true, &mut |_| {})?;
         run.report.surface_factorizations += cut.stats().factorizations;
         run.report.surface_traction_evals += cut.stats().traction_evals;
         let n = self.grid.len();
@@ -823,11 +824,11 @@ impl Solid {
     fn held_on(&mut self, ctx: &Context, reuse_lu: bool, faces: Option<&[bool]>, run: &mut Run) -> Result<Eval, Error> {
         run.report.evaluations += 1;
         let t0 = run.now();
-        let mut cut = self.build_cut_with(Some(&ctx.cut), Some(&ctx.topo), reuse_lu, true)?;
+        let mut cut = self.build_cut_with(Some(&ctx.cut), Some(&ctx.topo), reuse_lu, true, &mut |_| {})?;
         let t1 = run.now();
         run.report.surface_factorizations += cut.stats().factorizations;
         run.report.surface_traction_evals += cut.stats().traction_evals;
-        let force = self.mapped_forces_on(&mut cut, 0.0, faces)?;
+        let force = self.mapped_forces_on(&mut cut, 0.0, faces, &mut |_| {})?;
         run.report.times.cut += t1 - t0;
         run.report.times.forces += run.now() - t1;
         let r: Vec<f64> = ctx.unknowns.iter().flat_map(|&k| force[k]).collect();

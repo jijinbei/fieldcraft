@@ -9,4 +9,5 @@ license.workspace = true
 workspace = true
 
 [dependencies]
+fieldcraft-parallel = { workspace = true }
 thiserror = { workspace = true }

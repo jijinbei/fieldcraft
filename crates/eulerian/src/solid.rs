@@ -22,6 +22,7 @@
 use crate::extrapolate::{fit, fit_weights};
 use crate::grid::Grid;
 use crate::material::{Material, Stress, Tensor};
+use crate::par;
 use crate::shape::Shape;
 use crate::sharp;
 use crate::{Error, Limits, finite, positive};
@@ -152,6 +153,47 @@ pub struct Relaxation {
     pub converged: bool,
     /// The largest node speed in the body at the end.
     pub max_speed: f64,
+}
+
+/// The parts of one explicit step, reported to the observer of [`Solid::run_observed`] as each
+/// one finishes (for profiling; the step does the same work with or without an observer).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum Phase {
+    /// The stress on the faces between full cells (the compact stencil) or, for the blurred
+    /// and ghost-filled surfaces, on every edge.
+    InteriorFaces,
+    /// The stress on the faces next to a cut cell, through the surface-fitted map.
+    MappedFaces,
+    /// The traction on the curved surface, the body force and the sharing of the net forces
+    /// between control volumes.
+    SurfaceForces,
+    /// The velocity update.
+    Momentum,
+    /// The advection of the reference map.
+    Advection,
+    /// The level set, the node kinds and the extrapolation of ζ and v into the band.
+    Band,
+    /// The surface crossings, the cut cells and the control volumes.
+    CutCells,
+    /// The surface points, their matching along the surface and their normals.
+    SurfacePoints,
+    /// The surface values: Newton on the traction conditions of each chain.
+    Newton,
+}
+
+impl Phase {
+    /// Every phase, in step order.
+    pub const ALL: [Phase; 9] = [
+        Phase::InteriorFaces,
+        Phase::MappedFaces,
+        Phase::SurfaceForces,
+        Phase::Momentum,
+        Phase::Advection,
+        Phase::Band,
+        Phase::CutCells,
+        Phase::SurfacePoints,
+        Phase::Newton,
+    ];
 }
 
 /// How deep (in grid spacings) a band node of the ghost-filled surface must lie inside the
@@ -508,9 +550,15 @@ impl Solid {
 
     /// Advances `steps` dynamic steps.
     pub fn run(&mut self, steps: usize) -> Result<(), Error> {
+        self.run_observed(steps, &mut |_| {})
+    }
+
+    /// Advances `steps` dynamic steps, calling `observer` as each [`Phase`] of a step finishes
+    /// (a profiler reads a clock there; the results are those of [`Solid::run`]).
+    pub fn run_observed(&mut self, steps: usize, observer: &mut (dyn FnMut(Phase) + Send)) -> Result<(), Error> {
         self.check_steps(steps)?;
         for _ in 0..steps {
-            self.step()?;
+            self.step(observer)?;
         }
         Ok(())
     }
@@ -522,7 +570,7 @@ impl Solid {
         self.check_steps(max_steps)?;
         let mut steps = 0;
         while steps < max_steps {
-            self.step()?;
+            self.step(&mut |_| {})?;
             steps += 1;
             if steps % 20 == 0 && self.max_speed() < speed {
                 return Ok(Relaxation { steps, converged: true, max_speed: self.max_speed() });
@@ -565,9 +613,14 @@ impl Solid {
     }
 
     /// One dynamic step.
-    fn step(&mut self) -> Result<(), Error> {
+    fn step(&mut self, obs: &mut (dyn FnMut(Phase) + Send)) -> Result<(), Error> {
+        // Inside the pool for the whole step: the loops then run on it without a hand-off each.
+        fieldcraft_parallel::with_threads(fieldcraft_parallel::current_threads(), || self.step_on_pool(obs))
+    }
+
+    fn step_on_pool(&mut self, obs: &mut (dyn FnMut(Phase) + Send)) -> Result<(), Error> {
         if self.settings.boundary == Boundary::Mapped {
-            return self.step_mapped();
+            return self.step_mapped(obs);
         }
         let n = self.grid.len();
         let (_, _, rho0) = self.material.constants();
@@ -580,30 +633,26 @@ impl Solid {
         let mu_e = self.settings.viscosity * rho0 * self.material.p_wave_speed() * h;
 
         // 1. Edge stresses: edge d (0 = +x, 1 = +y) of node k joins k and its +d neighbour.
-        let mut edge = vec![[[0.0f64; 3]; 2]; n];
-        let mut edge_det = vec![[f64::NAN; 2]; n];
-        for k in 0..n {
-            for d in 0..2 {
-                let (s, det) = self.edge_stress(k, d, eps, mu_e)?;
-                edge[k][d] = s;
-                edge_det[k][d] = det;
-            }
-        }
+        let edges = par::try_map(n, |k| -> Result<([[f64; 3]; 2], [f64; 2]), Error> {
+            let (s0, d0) = self.edge_stress(k, 0, eps, mu_e)?;
+            let (s1, d1) = self.edge_stress(k, 1, eps, mu_e)?;
+            Ok(([s0, s1], [d0, d1]))
+        })?;
+        let edge: Vec<[[f64; 3]; 2]> = edges.iter().map(|e| e.0).collect();
+        let edge_det: Vec<[f64; 2]> = edges.iter().map(|e| e.1).collect();
+        obs(Phase::InteriorFaces);
 
         // 2. Momentum at the momentum nodes.
-        let mut live = vec![false; n];
-        let mut v_new = self.v.clone();
-        for k in 0..n {
+        let updated = par::map(n, |k| -> Option<[f64; 2]> {
             let kind = self.kind[k];
             if kind == NodeKind::Fixed {
-                live[k] = true;
-                continue;
+                return Some(self.v[k]);
             }
             // The body's own nodes, or (Blurred) every node with some material weight.
             let moves =
                 if self.settings.boundary.body_momentum() { kind == NodeKind::Solid } else { kind.known() && heaviside(self.phi[k], eps) < 1.0 };
             if !moves {
-                continue;
+                return None;
             }
             let back = |d: usize| -> [f64; 3] {
                 let (di, dj) = if d == 0 { (-1, 0) } else { (0, -1) };
@@ -648,43 +697,52 @@ impl Solid {
             for c in 0..2 {
                 out[c] = (v[c] + kick * (div[c] / rho - adv[c])) / (1.0 + self.settings.damping * kick);
             }
-            v_new[k] = out;
-            live[k] = true;
-        }
+            Some(out)
+        });
+        let live: Vec<bool> = updated.iter().map(Option::is_some).collect();
+        let v_new: Vec<[f64; 2]> = updated.iter().zip(&self.v).map(|(u, v)| u.unwrap_or(*v)).collect();
         self.v = v_new;
+        obs(Phase::Momentum);
 
         // 3. Reference map with the new velocity.
         self.advect_reference()?;
         self.time += dt;
+        obs(Phase::Advection);
 
         // 4. Body, band and velocities.
         self.rebuild()?;
-        self.v_live = (0..n).map(|k| live[k] && self.kind[k].known()).collect();
+        self.v_live = par::map(n, |k| live[k] && self.kind[k].known());
         self.extrapolate_velocity();
-        for k in 0..n {
-            if self.kind[k].known() && self.v[k].iter().chain(self.zeta[k].iter()).any(|x| !x.is_finite()) {
-                return Err(Error::Diverged(format!("non-finite value at node {k} at t = {}", self.time)));
-            }
-        }
+        self.check_finite()?;
+        obs(Phase::Band);
         Ok(())
     }
 
     /// ζ ← ζ − Δt (v + (v·∇)ζ) at the solid nodes.
     pub(crate) fn advect_reference(&mut self) -> Result<(), Error> {
-        let n = self.grid.len();
-        let mut z_new = self.zeta.clone();
-        for k in 0..n {
+        let z_new = par::map(self.grid.len(), |k| {
             if self.kind[k] != NodeKind::Solid {
-                continue;
+                return self.zeta[k];
             }
             let v = self.v[k];
             let a = [self.upwind_dot(k, v, |m| self.zeta[m][0]), self.upwind_dot(k, v, |m| self.zeta[m][1])];
+            let mut z = self.zeta[k];
             for c in 0..2 {
-                z_new[k][c] = self.zeta[k][c] - self.dt * (v[c] + a[c]);
+                z[c] = self.zeta[k][c] - self.dt * (v[c] + a[c]);
             }
-        }
+            z
+        });
         self.zeta = z_new;
         Ok(())
+    }
+
+    /// An error naming the first known node whose ζ or v is not a finite number.
+    pub(crate) fn check_finite(&self) -> Result<(), Error> {
+        let bad = par::first(self.grid.len(), |k| self.kind[k].known() && self.v[k].iter().chain(self.zeta[k].iter()).any(|x| !x.is_finite()));
+        match bad {
+            Some(k) => Err(Error::Diverged(format!("non-finite value at node {k} at t = {}", self.time))),
+            None => Ok(()),
+        }
     }
 
     /// (v·∇)a at node k by second-order one-sided upwind differences of the field `a`, first
@@ -830,35 +888,35 @@ impl Solid {
     /// Updates φ, drops nodes that left the body, rebuilds the band and admits entering material.
     pub(crate) fn rebuild(&mut self) -> Result<(), Error> {
         let n = self.grid.len();
-        for k in 0..n {
+        let updated = par::map(n, |k| {
             if self.frozen(k) {
-                if self.kind[k].known() {
-                    self.phi[k] = self.shape.phi0(self.xi(k));
-                }
-                continue;
+                // Set by the refined hierarchy: φ only.
+                let phi = if self.kind[k].known() { self.shape.phi0(self.xi(k)) } else { self.phi[k] };
+                return (self.kind[k], phi);
             }
             match self.kind[k] {
                 NodeKind::Solid | NodeKind::Fixed => {
-                    let xi = self.xi(k);
-                    self.phi[k] = self.shape.phi0(xi);
-                    if self.kind[k] == NodeKind::Solid && !(self.phi[k] < 0.0) {
-                        self.kind[k] = NodeKind::Empty;
-                    }
+                    let phi = self.shape.phi0(self.xi(k));
+                    let leaves = self.kind[k] == NodeKind::Solid && !(phi < 0.0);
+                    (if leaves { NodeKind::Empty } else { self.kind[k] }, phi)
                 }
-                NodeKind::Band | NodeKind::Empty => self.kind[k] = NodeKind::Empty,
+                NodeKind::Band | NodeKind::Empty => (NodeKind::Empty, self.phi[k]),
             }
+        });
+        for (k, (kind, phi)) in updated.into_iter().enumerate() {
+            self.kind[k] = kind;
+            self.phi[k] = phi;
         }
-        if !self.kind.iter().any(|k| k.source()) {
+        let source: Vec<bool> = par::map(n, |k| self.kind[k].source());
+        if !source.iter().any(|&s| s) {
             return Err(Error::Diverged("no grid node lies inside the body".into()));
         }
-        let source: Vec<bool> = self.kind.iter().map(|k| k.source()).collect();
-        let target: Vec<bool> = (0..n).map(|k| !self.frozen(k)).collect();
-        let filled = layered_fill(&self.grid, &source, &target, self.settings.band_layers, &mut self.zeta);
+        let level = self.level.as_deref();
+        let frozen = |k: usize| level.is_some_and(|l| l.frozen.get(k).copied().unwrap_or(false));
+        let filled = layered_fill(&self.grid, &source, &|k| !frozen(k), self.settings.band_layers, &mut self.zeta);
         if let Some(f) = &self.exterior {
-            for k in 0..n {
-                if filled[k] {
-                    self.zeta[k] = (f.0)(self.grid.position(k));
-                }
+            for &k in &filled {
+                self.zeta[k] = (f.0)(self.grid.position(k));
             }
         }
         // Material entering: a band node whose extrapolated ξ lies inside the body. For the
@@ -869,14 +927,10 @@ impl Solid {
         // cylinder); with it both states are consistent and either is an O(h²) answer.
         let ghost = self.settings.boundary == Boundary::Ghost;
         let enter = if ghost { -ENTRY_DEPTH * self.grid.h() } else { 0.0 };
-        for k in 0..n {
-            if filled[k] {
-                self.kind[k] = NodeKind::Band;
-                self.phi[k] = self.shape.phi0(self.xi(k));
-                if self.phi[k] < enter {
-                    self.kind[k] = NodeKind::Solid;
-                }
-            }
+        let phis = par::map_items(filled.len(), |i| filled.get(i).map_or(0.0, |&k| self.shape.phi0(self.xi(k))));
+        for (&k, phi) in filled.iter().zip(phis) {
+            self.phi[k] = phi;
+            self.kind[k] = if phi < enter { NodeKind::Solid } else { NodeKind::Band };
         }
         self.fallbacks = 0;
         self.linear_fills = 0;
@@ -888,13 +942,13 @@ impl Solid {
 
     /// Refills the ghost ring (band nodes 8-adjacent to the body) with the traction-constrained
     /// fit, then the outer band layers by the linear extrapolation from the body and the ghosts.
+    /// Every ghost is fitted from body nodes only, so the fits run in parallel.
     fn sharp_fill(&mut self) {
         let n = self.grid.len();
-        let source: Vec<bool> = self.kind.iter().map(|k| k.source()).collect();
-        let ghosts: Vec<usize> = (0..n)
-            .filter(|&k| self.kind[k] == NodeKind::Band)
-            .filter(|&k| (-1..=1).any(|dj| (-1..=1).any(|di| self.grid.neighbour(k, di, dj).is_some_and(|m| source[m]))))
-            .collect();
+        let source: Vec<bool> = par::map(n, |k| self.kind[k].source());
+        let ghosts = par::filter(n, |k| {
+            self.kind[k] == NodeKind::Band && (-1..=1).any(|dj| (-1..=1).any(|di| self.grid.neighbour(k, di, dj).is_some_and(|m| source[m])))
+        });
         let body = sharp::Body {
             grid: &self.grid,
             shape: &self.shape,
@@ -905,8 +959,8 @@ impl Solid {
             passes: 2,
             degree: self.settings.ghost_degree,
         };
-        let values: Vec<_> = ghosts.iter().map(|&g| sharp::ghost(&body, g)).collect();
-        let mut have = source;
+        let values = par::map_items(ghosts.len(), |i| ghosts.get(i).and_then(|&g| sharp::ghost(&body, g)));
+        let mut have = source.clone();
         for (&g, value) in ghosts.iter().zip(values) {
             match value {
                 Some((z, kind)) => {
@@ -920,12 +974,13 @@ impl Solid {
             have[g] = true;
         }
         // The outer layers from the body and the new ghost values; their kinds are kept.
-        let target: Vec<bool> = (0..n).map(|k| self.kind[k] == NodeKind::Band && !have[k]).collect();
-        layered_fill(&self.grid, &have, &target, self.settings.band_layers.saturating_sub(1), &mut self.zeta);
-        for k in 0..n {
-            if self.kind[k] == NodeKind::Band {
-                self.phi[k] = self.shape.phi0(self.xi(k));
-            }
+        let kind = &self.kind;
+        let ghost_set = &have;
+        layered_fill(&self.grid, &have, &|k| kind[k] == NodeKind::Band && !ghost_set[k], self.settings.band_layers.saturating_sub(1), &mut self.zeta);
+        let band = par::filter(n, |k| self.kind[k] == NodeKind::Band);
+        let phis = par::map_items(band.len(), |i| band.get(i).map_or(0.0, |&k| self.shape.phi0(self.xi(k))));
+        for (&k, phi) in band.iter().zip(phis) {
+            self.phi[k] = phi;
         }
     }
 
@@ -974,15 +1029,21 @@ impl Solid {
     /// Extrapolates v from the nodes that carry it to the other known nodes.
     pub(crate) fn extrapolate_velocity(&mut self) {
         let n = self.grid.len();
-        let source: Vec<bool> = (0..n).map(|k| self.v_live[k] && self.kind[k].known()).collect();
-        let target: Vec<bool> = (0..n).map(|k| self.kind[k].known() && !self.frozen(k)).collect();
+        let source: Vec<bool> = par::map(n, |k| self.v_live[k] && self.kind[k].known());
+        let kind = &self.kind;
+        let level = self.level.as_deref();
+        let target = |k: usize| kind[k].known() && !level.is_some_and(|l| l.frozen.get(k).copied().unwrap_or(false));
         let filled = layered_fill(&self.grid, &source, &target, 2 * self.settings.band_layers, &mut self.v);
-        for k in 0..n {
-            if target[k] && !source[k] && !filled[k] {
-                // Isolated: no velocity information nearby.
-                self.v[k] = [0.0; 2];
-            }
+        let mut done = source;
+        for &k in &filled {
+            done[k] = true;
         }
+        par::update(&mut self.v, |k, v| {
+            if target(k) && !done[k] {
+                // Isolated: no velocity information nearby.
+                *v = [0.0; 2];
+            }
+        });
     }
 
     /// Whether the hierarchy sets node k (never changed by this solid).
@@ -1003,23 +1064,38 @@ impl Solid {
 
 /// Fills `field` at target nodes within `layers` layers (8-neighbour rings) of the source
 /// nodes, ring by ring, each node by a linear fit to the nodes of earlier rings (so the result
-/// does not depend on the node order). Returns the filled nodes.
-fn layered_fill(grid: &Grid, source: &[bool], target: &[bool], layers: usize, field: &mut [[f64; 2]]) -> Vec<bool> {
+/// does not depend on the node order). Returns the filled nodes, ascending within each ring.
+fn layered_fill(grid: &Grid, source: &[bool], target: &(dyn Fn(usize) -> bool + Sync), layers: usize, field: &mut [[f64; 2]]) -> Vec<usize> {
     let n = grid.len();
     let mut have = source.to_vec();
-    let mut filled = vec![false; n];
-    let mut samples = Vec::with_capacity(81);
-    for _ in 0..layers {
-        let ring: Vec<usize> = (0..n)
-            .filter(|&k| !have[k] && target[k])
-            .filter(|&k| (-1..=1).any(|dj| (-1..=1).any(|di| grid.neighbour(k, di, dj).is_some_and(|m| have[m]))))
-            .collect();
+    let mut filled = Vec::new();
+    let next_to_have = |k: usize, have: &[bool]| (-1..=1).any(|dj| (-1..=1).any(|di| grid.neighbour(k, di, dj).is_some_and(|m| have[m])));
+    // The first ring by a search of the grid; each later one among the nodes next to the
+    // last ring (a node joins a ring once a neighbour has a value, so the rings are the same).
+    let mut ring = par::filter(n, |k| !have[k] && target(k) && next_to_have(k, &have));
+    // Which layer last listed a node, to list each candidate once.
+    let mut listed = vec![usize::MAX; n];
+    for layer in 0..layers {
+        if layer > 0 {
+            ring.retain(|&k| {
+                let fresh = listed[k] != layer;
+                listed[k] = layer;
+                fresh && !have[k]
+            });
+            ring.sort_unstable();
+            let candidates = ring;
+            ring = par::filter(candidates.len(), |i| target(candidates[i]) && next_to_have(candidates[i], &have))
+                .into_iter()
+                .map(|i| candidates[i])
+                .collect();
+        }
         if ring.is_empty() {
             break;
         }
-        let mut values = Vec::with_capacity(ring.len());
-        for &k in &ring {
-            let mut value = None;
+        let f: &[[f64; 2]] = field;
+        let values = par::map_items(ring.len(), |i| {
+            let k = ring.get(i).copied()?;
+            let mut samples = Vec::with_capacity(81);
             for r in 2..=MAX_WINDOW {
                 samples.clear();
                 for dj in -r..=r {
@@ -1027,24 +1103,34 @@ fn layered_fill(grid: &Grid, source: &[bool], target: &[bool], layers: usize, fi
                         if let Some(m) = grid.neighbour(k, di, dj)
                             && have[m]
                         {
-                            samples.push(([di as f64, dj as f64], field[m]));
+                            samples.push(([di as f64, dj as f64], f[m]));
                         }
                     }
                 }
-                value = fit(&samples);
-                if value.is_some() {
-                    break;
+                if let Some(v) = fit(&samples) {
+                    return Some(v);
                 }
             }
-            values.push(value);
-        }
+            None
+        });
+        let mut next = Vec::with_capacity(4 * ring.len());
         for (&k, value) in ring.iter().zip(values) {
-            if let Some(v) = value {
-                field[k] = v;
-                have[k] = true;
-                filled[k] = true;
+            match value {
+                Some(v) => {
+                    field[k] = v;
+                    have[k] = true;
+                    filled.push(k);
+                    for dj in -1..=1 {
+                        for di in -1..=1 {
+                            next.extend(grid.neighbour(k, di, dj));
+                        }
+                    }
+                }
+                // Tried again in the next ring.
+                None => next.push(k),
             }
         }
+        ring = next;
     }
     filled
 }

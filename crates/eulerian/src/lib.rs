@@ -63,8 +63,13 @@
 //! - J. Bonet, R. D. Wood, *Nonlinear Continuum Mechanics for Finite Element Analysis*, 2nd
 //!   ed., Cambridge University Press 2008 (the compressible neo-Hookean law).
 //!
-//! Sequential and deterministic: every loop runs in node order, so the same input gives the
-//! same numbers bit for bit. Sizes and step counts are capped by [`Limits`].
+//! Deterministic on any number of threads: the step's loops over nodes, cells and surface
+//! points run on `fieldcraft-parallel`'s pool, every value is computed by the operations of the
+//! sequential loop and every sum is formed in its order, so the same input gives the same
+//! numbers bit for bit on one thread or many. The surface chains' Newton iterations stay in
+//! chain order (each chain sees the values the earlier ones just took).
+//! [`Solid::run_observed`] reports the step's [`Phase`]s for profiling. Sizes and step counts
+//! are capped by [`Limits`].
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 #![forbid(unsafe_code)]
 // Small fixed-size tensor kernels read as the textbook formulas with index loops.
@@ -76,6 +81,7 @@ pub mod grid;
 pub mod mapped;
 pub mod material;
 pub mod multigrid;
+mod par;
 pub mod refine;
 pub mod shape;
 mod sharp;
@@ -88,7 +94,7 @@ pub use material::Material;
 pub use multigrid::MultigridStats;
 pub use refine::{Hierarchy, NodeRef, Refinement, ResidualEntry, Role};
 pub use shape::Shape;
-pub use solid::{Boundary, NodeKind, Relaxation, Settings, Solid};
+pub use solid::{Boundary, NodeKind, Phase, Relaxation, Settings, Solid};
 pub use statics::{LinearTest, NewtonStep, PreconditionerMatrix, StaticReport, StaticSettings, StaticTimes};
 
 /// Errors of the Eulerian solver.

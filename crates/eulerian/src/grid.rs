@@ -154,6 +154,7 @@ impl Grid {
 
     /// The index of node (i, j). On a sparse grid, the index of an active node and `len()`
     /// (out of range) for any other; [`Grid::try_index`] says which.
+    #[inline]
     pub fn index(&self, i: usize, j: usize) -> usize {
         match &self.sparse {
             None => i + self.nx * j,
@@ -162,6 +163,7 @@ impl Grid {
     }
 
     /// The lattice (i, j) of a node index.
+    #[inline]
     pub fn ij(&self, k: usize) -> (usize, usize) {
         match &self.sparse {
             None => (k % self.nx, k / self.nx),
@@ -170,12 +172,14 @@ impl Grid {
     }
 
     /// The position of node k.
+    #[inline]
     pub fn position(&self, k: usize) -> [f64; 2] {
         let (i, j) = self.ij(k);
         [self.origin[0] + i as f64 * self.h, self.origin[1] + j as f64 * self.h]
     }
 
     /// The node at offset (di, dj) from node k, wrapping periodic axes; `None` off a bounded edge.
+    #[inline]
     pub fn neighbour(&self, k: usize, di: isize, dj: isize) -> Option<usize> {
         let (i, j) = self.ij(k);
         if i >= self.nx || j >= self.ny {
@@ -190,6 +194,7 @@ impl Grid {
     }
 }
 
+#[inline]
 fn shift(i: usize, d: isize, n: usize, periodic: bool) -> Option<usize> {
     let n = n as isize;
     let t = i as isize + d;

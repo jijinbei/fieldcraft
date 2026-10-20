@@ -44,8 +44,9 @@
 use crate::Error;
 use crate::cut::{self, CellCut, CellInput, Curve, GAUSS2, GAUSS3, P2};
 use crate::material::{Stress, Tensor};
-use crate::solid::{NodeKind, Solid, identity_plus, invert};
-use std::collections::HashMap;
+use crate::par;
+use crate::solid::{NodeKind, Phase, Solid, identity_plus, invert};
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 /// The smallest |n_d| of a surface point on a grid line along axis d.
@@ -136,6 +137,9 @@ pub struct CutStats {
     pub traction_evals: usize,
     /// The largest force component through one face in the last force evaluation.
     pub max_flux: f64,
+    /// Chains of surface points solved together, and the points of the longest.
+    pub chains: usize,
+    pub longest_chain: usize,
 }
 
 /// The cut cells, control volumes and surface of one step.
@@ -186,9 +190,30 @@ struct Structure {
     near_cells: Vec<bool>,
     /// Outside nodes whose dual cell holds solid.
     orphans: Vec<usize>,
-    /// The faces with solid on them, in node order (k, then d): the compact stencil's nodes
-    /// for a face between two full cells, `None` for a face next to a cut cell.
-    faces: Vec<(usize, usize, Option<[usize; 5]>)>,
+    /// The faces (k, d) from node k to its +d neighbour, by node: whether solid is on them
+    /// and how their flux is computed.
+    faces: Vec<[Face; 2]>,
+}
+
+/// How a face carries its flux.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Face {
+    /// No solid on it.
+    None,
+    /// Between two full cells: the compact stencil on its nodes [b, k₊, k₋, b₊, b₋].
+    Full([u32; 5]),
+    /// Next to a cut cell (or a coarse–fine interface): through the map.
+    Mapped,
+}
+
+/// The solid of one node's dual cell: from the full cells, and with the cut cells added.
+struct DualCell {
+    area_full: f64,
+    moment_full: P2,
+    area: f64,
+    moment: P2,
+    /// A corner of a cut cell.
+    near: bool,
 }
 
 /// Stage one of a cut state: crossings, cells, control volumes and shares.
@@ -336,13 +361,7 @@ impl CutState {
 
     /// The solid area of the control volume held by each node.
     pub(crate) fn control_volumes(&self) -> Vec<f64> {
-        let mut cv = vec![0.0; self.area.len()];
-        for (k, sh) in self.share.iter().enumerate() {
-            for (o, w) in sh.iter().flatten() {
-                cv[*o] += w * self.area[k];
-            }
-        }
-        cv
+        share_sum(&self.share, &|k| self.area[k])
     }
 
     /// Nodes where the discretisation departs from the interior stencil: corners of cut cells,
@@ -362,7 +381,12 @@ impl CutState {
 
     /// The faces between two full cells with their compact stencil nodes [b, k₊, k₋, b₊, b₋].
     pub(crate) fn full_faces(&self) -> impl Iterator<Item = (usize, usize, [usize; 5])> + '_ {
-        self.structure.faces.iter().filter_map(|&(k, d, f)| f.map(|nodes| (k, d, nodes)))
+        self.structure.faces.iter().enumerate().flat_map(|(k, fs)| {
+            fs.iter().enumerate().filter_map(move |(d, f)| match f {
+                Face::Full(nodes) => Some((k, d, nodes.map(|m| m as usize))),
+                _ => None,
+            })
+        })
     }
 
     /// How the solid of node k's dual cell is shared between control volumes.
@@ -376,8 +400,10 @@ impl CutState {
         self.structure
             .faces
             .iter()
-            .map(|&(k, d, full)| {
-                if full.is_some() {
+            .enumerate()
+            .flat_map(|(k, fs)| fs.iter().enumerate().filter(|(_, f)| **f != Face::None).map(move |(d, f)| (k, d, *f)))
+            .map(|(k, d, face)| {
+                if matches!(face, Face::Full(_)) {
                     return (k, d, 1.0);
                 }
                 let lower = if d == 0 { solid.grid.neighbour(k, 0, -1).map(|c| (c, 2)) } else { solid.grid.neighbour(k, -1, 0).map(|c| (c, 1)) };
@@ -426,7 +452,7 @@ impl Solid {
             }
             // The blended map the fluxes use (a point on lines that meet the surface obliquely
             // is weighted out where the other family is steeper).
-            let Some(g) = self.reconstruct(st, pt.position()).or_else(|| self.surface_gradient(&st.points, p, pt.zeta)) else {
+            let Some(g) = self.reconstruct(st, pt.position()).or_else(|| self.surface_gradient(&st.points, p, pt.zeta, None)) else {
                 continue;
             };
             let Some(f) = invert(&identity_plus(&g)) else {
@@ -580,12 +606,12 @@ impl Solid {
     /// Builds the cut cells, the control volumes and the surface, and solves the surface
     /// values.
     pub(crate) fn build_cut(&self) -> Result<CutState, Error> {
-        self.build_cut_from(self.cut.as_ref())
+        self.build_cut_from(self.cut.as_ref(), &mut |_| {})
     }
 
     /// As [`Solid::build_cut`], warm-starting the surface values from `prev`.
-    fn build_cut_from(&self, prev: Option<&CutState>) -> Result<CutState, Error> {
-        self.build_cut_with(prev, None, false, true)
+    pub(crate) fn build_cut_from(&self, prev: Option<&CutState>, obs: &mut (dyn FnMut(Phase) + Send)) -> Result<CutState, Error> {
+        self.build_cut_with(prev, None, false, true, obs)
     }
 
     /// Builds the cut state, warm-starting the surface values from `prev`. With `frozen`, the
@@ -595,8 +621,14 @@ impl Solid {
     /// Jacobians of `prev` (refreshed when a chain converges slowly); without it every
     /// iteration refactorises, as in the dynamic step. Without `solve` the surface values are
     /// left at their warm start (for reading the topology only).
-    pub(crate) fn build_cut_with(&self, prev: Option<&CutState>, frozen: Option<&Topology>, reuse_lu: bool, solve: bool) -> Result<CutState, Error> {
-        let n = self.grid.len();
+    pub(crate) fn build_cut_with(
+        &self,
+        prev: Option<&CutState>,
+        frozen: Option<&Topology>,
+        reuse_lu: bool,
+        solve: bool,
+        obs: &mut (dyn FnMut(Phase) + Send),
+    ) -> Result<CutState, Error> {
         let h = self.grid.h();
         let mut stats = CutStats::default();
         let geo = match (frozen, prev) {
@@ -607,6 +639,7 @@ impl Solid {
         stats.cut_cells = cells.len();
         stats.merged = merges.len();
         stats.lost_area = structure.orphans.iter().filter(|&&k| share[k].is_none()).map(|&k| area[k]).sum();
+        obs(Phase::CutCells);
 
         // Surface points.
         // Warm start: the previous step's surface value as a deviation from the linear
@@ -619,44 +652,43 @@ impl Solid {
             Some(prev) => prev.points.iter().map(|p| ((p.n1, p.d, p.sigma > 0.0), p.deviation)).collect(),
             None => HashMap::new(),
         };
+        // A point on every edge the surface crosses, in the order of the crossings.
+        let found = par::map_items(structure.cross.len(), |i| {
+            let (&(k, d), &t) = (structure.cross.get(i)?, cross_t.get(i)?);
+            let b = self.along(k, d, 1)?;
+            let (n1, out, sigma, s) = if self.inside(k) { (k, b, 1.0, t) } else { (b, k, -1.0, 1.0 - t) };
+            let n2 = self.along(n1, d, if sigma > 0.0 { -1 } else { 1 }).filter(|&m| self.inside(m))?;
+            let s = s.max(1e-9);
+            let p1 = self.grid.position(n1);
+            let g = lerp(self.phi_gradient(n1), self.phi_gradient(out), s);
+            let gl = g[0].hypot(g[1]);
+            let valid = gl > 0.0 && sigma * g[d] / gl >= MIN_NORMAL;
+            let lin = linear(n1, n2, s);
+            let dev = previous.get(&(n1, d, sigma > 0.0)).copied().unwrap_or([0.0; 2]);
+            let (i, j) = self.grid.ij(n1);
+            Some(SurfacePoint {
+                d,
+                line: if d == 0 { j } else { i },
+                sigma,
+                n1,
+                n2,
+                s,
+                coord: p1[d] + sigma * s * h,
+                across: p1[1 - d],
+                valid,
+                nb: [None; 5],
+                normal: [0.0; 2],
+                zeta: [lin[0] + dev[0], lin[1] + dev[1]],
+                deviation: dev,
+            })
+        });
         let mut points = Vec::new();
         let mut lines: [Vec<Vec<usize>>; 2] = [vec![Vec::new(); self.grid.ny()], vec![Vec::new(); self.grid.nx()]];
-        for (&(k, d), &t) in structure.cross.iter().zip(&cross_t) {
-            {
-                let Some(b) = self.along(k, d, 1) else {
-                    continue;
-                };
-                let (n1, out, sigma, s) = if self.inside(k) { (k, b, 1.0, t) } else { (b, k, -1.0, 1.0 - t) };
-                let Some(n2) = self.along(n1, d, if sigma > 0.0 { -1 } else { 1 }).filter(|&m| self.inside(m)) else {
-                    continue;
-                };
-                let s = s.max(1e-9);
-                let p1 = self.grid.position(n1);
-                let g = lerp(self.phi_gradient(n1), self.phi_gradient(out), s);
-                let gl = g[0].hypot(g[1]);
-                let valid = gl > 0.0 && sigma * g[d] / gl >= MIN_NORMAL;
-                let lin = linear(n1, n2, s);
-                let dev = previous.get(&(n1, d, sigma > 0.0)).copied().unwrap_or([0.0; 2]);
-                let zeta = [lin[0] + dev[0], lin[1] + dev[1]];
-                let (i, j) = self.grid.ij(n1);
-                let line = if d == 0 { j } else { i };
-                lines[d][line].push(points.len());
-                points.push(SurfacePoint {
-                    d,
-                    line,
-                    sigma,
-                    n1,
-                    n2,
-                    s,
-                    coord: p1[d] + sigma * s * h,
-                    across: p1[1 - d],
-                    valid,
-                    nb: [None; 5],
-                    normal: [0.0; 2],
-                    zeta,
-                    deviation: dev,
-                });
+        for pt in found.into_iter().flatten() {
+            if let Some(l) = lines[pt.d].get_mut(pt.line) {
+                l.push(points.len());
             }
+            points.push(pt);
         }
         stats.surface_points = points.len();
         if let Some(t) = frozen {
@@ -674,61 +706,67 @@ impl Solid {
         // Match each point with the points of the same family and orientation on the
         // neighbouring lines (the nearest along the line), then drop points without neighbours.
         for _ in 0..if frozen.is_some() { 0 } else { 2 } {
-            for p in 0..points.len() {
+            let nbs = par::map_items(points.len(), |p| {
                 let mut nb = [None; 5];
-                if points[p].valid {
-                    nb[2] = Some(p);
-                    let (d, line, sigma, coord) = (points[p].d, points[p].line as isize, points[p].sigma, points[p].coord);
-                    for off in [-2isize, -1, 1, 2] {
-                        let l = line + off;
-                        if l < 0 || l as usize >= lines[d].len() {
+                let Some(pt) = points.get(p).filter(|pt| pt.valid) else {
+                    return nb;
+                };
+                nb[2] = Some(p);
+                let (d, line, sigma, coord) = (pt.d, pt.line as isize, pt.sigma, pt.coord);
+                for off in [-2isize, -1, 1, 2] {
+                    let l = line + off;
+                    if l < 0 || l as usize >= lines[d].len() {
+                        continue;
+                    }
+                    let mut best: Option<(usize, f64)> = None;
+                    for &q in &lines[d][l as usize] {
+                        let pq = &points[q];
+                        if !pq.valid || pq.sigma != sigma {
                             continue;
                         }
-                        let mut best: Option<(usize, f64)> = None;
-                        for &q in &lines[d][l as usize] {
-                            let pq = &points[q];
-                            if !pq.valid || pq.sigma != sigma {
-                                continue;
-                            }
-                            let gap = (pq.coord - coord).abs();
-                            if gap <= 3.5 * off.unsigned_abs() as f64 * h && best.is_none_or(|b| gap < b.1) {
-                                best = Some((q, gap));
-                            }
+                        let gap = (pq.coord - coord).abs();
+                        if gap <= 3.5 * off.unsigned_abs() as f64 * h && best.is_none_or(|b| gap < b.1) {
+                            best = Some((q, gap));
                         }
-                        nb[(off + 2) as usize] = best.map(|b| b.0);
                     }
+                    nb[(off + 2) as usize] = best.map(|b| b.0);
                 }
-                points[p].nb = nb;
-            }
-            for pt in points.iter_mut() {
+                nb
+            });
+            for (pt, nb) in points.iter_mut().zip(nbs) {
+                pt.nb = nb;
                 if pt.valid && pt.nb[1].is_none() && pt.nb[3].is_none() {
                     pt.valid = false;
                 }
             }
         }
         // Normals from the surface curve through the matched crossings.
-        for p in 0..points.len() {
-            if !points[p].valid {
-                continue;
+        let normals = par::map_items(points.len(), |p| {
+            let pt = points.get(p)?;
+            if !pt.valid {
+                return Some(pt.normal);
             }
-            let Some((offs, cnt)) = tangent_stencil(&points[p].nb) else {
-                points[p].valid = false;
-                continue;
-            };
+            let (offs, cnt) = tangent_stencil(&pt.nb)?;
             let xs = offs.map(|o| o as f64);
             let (_, dw) = lagrange(&xs[..cnt], 0.0);
             let mut yp = 0.0;
             for m in 0..cnt {
-                if let Some(q) = points[p].nb[(offs[m] + 2) as usize] {
+                if let Some(q) = pt.nb[(offs[m] + 2) as usize] {
                     yp += dw[m] * points[q].coord;
                 }
             }
-            let (d, sigma) = (points[p].d, points[p].sigma);
+            let (d, sigma) = (pt.d, pt.sigma);
             let len = h.hypot(yp);
             let mut nrm = [0.0; 2];
             nrm[d] = sigma * h / len;
             nrm[1 - d] = -sigma * yp / len;
-            points[p].normal = nrm;
+            Some(nrm)
+        });
+        for (pt, nrm) in points.iter_mut().zip(normals) {
+            match nrm {
+                Some(nrm) => pt.normal = nrm,
+                None => pt.valid = false,
+            }
         }
         for pt in &points {
             if pt.valid {
@@ -737,24 +775,25 @@ impl Solid {
             }
         }
         stats.valid_points = points.iter().filter(|p| p.valid).count();
+        obs(Phase::SurfacePoints);
 
         // Surface values from the traction condition: Newton on the coupled conditions of each
         // chain of matched points (one family's points on consecutive lines), the Jacobian by
         // finite differences, banded (a point's condition involves the points up to two lines
-        // away), solved by LU with partial pivoting.
+        // away), solved by LU with partial pivoting. The chains are solved one after another
+        // (each sees the values the earlier ones just took); within a chain the residuals and
+        // the Jacobian's columns are computed in parallel.
         let tol = 1e-13 * h;
-        let targets: Vec<P2> = points
-            .iter()
-            .map(|pt| {
-                if pt.valid {
-                    let x = pt.position();
-                    traction(&self.ambient_at(x, self.cell_of(x)), pt.normal)
-                } else {
-                    [0.0; 2]
-                }
-            })
-            .collect();
+        let targets: Vec<P2> = par::map_items(points.len(), |p| match points.get(p) {
+            Some(pt) if pt.valid => {
+                let x = pt.position();
+                traction(&self.ambient_at(x, self.cell_of(x)), pt.normal)
+            }
+            _ => [0.0; 2],
+        });
         let chains = surface_chains(&points);
+        stats.chains = chains.len();
+        stats.longest_chain = chains.iter().map(Vec::len).max().unwrap_or(0);
         let chord = reuse_lu && frozen.is_some();
         let mut lus: Vec<Option<Arc<BandLu>>> = match prev {
             Some(p) if chord && p.chains == chains => p.lus.clone(),
@@ -765,17 +804,18 @@ impl Solid {
             let mut change: f64 = 0.0;
             for (ci, ch) in chains.iter().enumerate() {
                 let m = ch.len();
-                let mut r = vec![0.0; 2 * m];
-                let mut folded = false;
                 stats.traction_evals += m;
-                for (i, &p) in ch.iter().enumerate() {
-                    match self.traction_residual(&points, p, points[p].zeta, targets[p]) {
-                        Ok(v) => {
-                            r[2 * i] = v[0];
-                            r[2 * i + 1] = v[1];
-                        }
-                        Err(_) => {
-                            // The guess folds the map: restart from the linear extrapolation.
+                let residuals = par::map_chain(m, |i| {
+                    let p = ch.get(i).copied().unwrap_or(0);
+                    self.traction_residual(&points, p, points[p].zeta, targets[p], None)
+                });
+                let mut folded = false;
+                if let Some(f) = residuals.iter().position(Result::is_err) {
+                    // A guess folds the map: restart the failing points from the linear
+                    // extrapolation, in chain order (each later residual sees the earlier
+                    // restarts).
+                    for &p in &ch[f..] {
+                        if self.traction_residual(&points, p, points[p].zeta, targets[p], None).is_err() {
                             let lin = linear(points[p].n1, points[p].n2, points[p].s);
                             if points[p].zeta == lin {
                                 return Err(Error::Diverged(format!("the map folded at the surface by node {}", points[p].n1)));
@@ -790,27 +830,41 @@ impl Solid {
                     lus[ci] = None;
                     continue;
                 }
+                let mut r = vec![0.0; 2 * m];
+                for (i, v) in residuals.into_iter().enumerate() {
+                    if let Ok(v) = v {
+                        r[2 * i] = v[0];
+                        r[2 * i + 1] = v[1];
+                    }
+                }
                 let lu = match lus.get(ci).and_then(|l| l.clone()) {
                     Some(lu) if chord => lu,
                     _ => {
-                        let mut jac = Band::new(2 * m, 5, 5);
-                        for (i, &p) in ch.iter().enumerate() {
+                        let columns = par::map_chain(m, |i| {
+                            let mut out: Vec<(usize, usize, f64)> = Vec::with_capacity(20);
+                            let Some(&p) = ch.get(i) else {
+                                return out;
+                            };
                             let eps = 1e-7 * h * points[p].s.max(1e-3);
                             for c in 0..2 {
-                                let z0 = points[p].zeta;
-                                points[p].zeta[c] += eps;
+                                let mut zp = points[p].zeta;
+                                zp[c] += eps;
                                 for j in i.saturating_sub(2)..=(i + 2).min(m - 1) {
                                     let q = ch[j];
-                                    stats.traction_evals += 1;
-                                    let rq = self.traction_residual(&points, q, points[q].zeta, targets[q]);
-                                    if let Ok(rq) = rq {
+                                    let zq = if q == p { zp } else { points[q].zeta };
+                                    if let Ok(rq) = self.traction_residual(&points, q, zq, targets[q], Some((p, zp))) {
                                         for row in 0..2 {
-                                            jac.set(2 * j + row, 2 * i + c, (rq[row] - r[2 * j + row]) / eps);
+                                            out.push((2 * j + row, 2 * i + c, (rq[row] - r[2 * j + row]) / eps));
                                         }
                                     }
                                 }
-                                points[p].zeta = z0;
                             }
+                            out
+                        });
+                        stats.traction_evals += (0..m).map(|i| 2 * ((i + 2).min(m - 1) + 1 - i.saturating_sub(2))).sum::<usize>();
+                        let mut jac = Band::new(2 * m, 5, 5);
+                        for (row, col, v) in columns.into_iter().flatten() {
+                            jac.set(row, col, v);
                         }
                         stats.factorizations += 1;
                         let lu = Arc::new(jac.factor().ok_or_else(|| Error::Diverged("the surface conditions are singular".into()))?);
@@ -846,8 +900,8 @@ impl Solid {
             let lin = linear(pt.n1, pt.n2, pt.s);
             pt.deviation = [pt.zeta[0] - lin[0], pt.zeta[1] - lin[1]];
         }
+        obs(Phase::Newton);
 
-        let _ = n;
         Ok(CutState { structure, class, cells, points, lines, owner, share, area, moment, near, merges, chains, lus, stats })
     }
 
@@ -872,17 +926,65 @@ impl Solid {
             .ok_or_else(|| Error::Diverged(format!("inconsistent surface crossings in the cell at node {c0}")))
     }
 
-    /// Adds the solid of a cut cell's quarters to its corners' dual cells.
-    fn add_cut_cell(&self, c0: usize, cell: &CellCut, area: &mut [f64], moment: &mut [P2]) {
-        let Some(c) = self.cell_corners(c0) else {
-            return;
-        };
-        let o = self.grid.position(c0);
-        for (q, &k) in c.iter().enumerate() {
-            area[k] += cell.area[q];
-            moment[k][0] += cell.moment[q][0] + cell.area[q] * o[0];
-            moment[k][1] += cell.moment[q][1] + cell.area[q] * o[1];
+    /// The cells around node k that hold solid (full or cut) with k's corner index in each,
+    /// in the order of their lower-left nodes (the order a scatter over the cells adds them in).
+    fn cells_around(&self, class: &[CellClass], k: usize) -> [Option<(usize, usize)>; 4] {
+        let mut around: [(usize, usize); 4] = [(usize::MAX, 0); 4];
+        for (slot, (di, dj, q)) in around.iter_mut().zip([(-1, -1, 2), (0, -1, 3), (-1, 0, 1), (0, 0, 0)]) {
+            // A full or cut cell exists, and k is its corner q.
+            if let Some(c0) = self.grid.neighbour(k, di, dj)
+                && matches!(class[c0], CellClass::Full | CellClass::Cut(_))
+            {
+                *slot = (c0, q);
+            }
         }
+        around.sort_unstable();
+        around.map(|(c0, q)| (c0 != usize::MAX).then_some((c0, q)))
+    }
+
+    /// The solid area and first moment of each node's dual cell from the full cells' quarters
+    /// alone, then with the cut cells' quarters added on top, each in the order of the cells'
+    /// lower-left nodes, and whether the node is a corner of a cut cell. With `full` given (a
+    /// held structure), the full cells' part is taken from it.
+    fn dual_cells(&self, class: &[CellClass], cells: &[(usize, CellCut)], full: Option<(&[f64], &[P2])>) -> Vec<DualCell> {
+        let h = self.grid.h();
+        let quarter = 0.25 * h * h;
+        par::map(self.grid.len(), |k| {
+            let around = self.cells_around(class, k);
+            let (mut area_full, mut moment_full) = (0.0, [0.0; 2]);
+            match full {
+                Some((a, m)) => (area_full, moment_full) = (a[k], m[k]),
+                None => {
+                    for (c0, q) in around.into_iter().flatten() {
+                        if class[c0] == CellClass::Full {
+                            let o = self.grid.position(c0);
+                            let qc = match q {
+                                0 => [0.25 * h, 0.25 * h],
+                                1 => [0.75 * h, 0.25 * h],
+                                2 => [0.75 * h, 0.75 * h],
+                                _ => [0.25 * h, 0.75 * h],
+                            };
+                            area_full += quarter;
+                            moment_full[0] += quarter * (o[0] + qc[0]);
+                            moment_full[1] += quarter * (o[1] + qc[1]);
+                        }
+                    }
+                }
+            }
+            let (mut area, mut moment, mut near) = (area_full, moment_full, false);
+            for (c0, q) in around.into_iter().flatten() {
+                if let CellClass::Cut(i) = class[c0] {
+                    near = true;
+                    if let Some((_, cell)) = cells.get(i) {
+                        let o = self.grid.position(c0);
+                        area += cell.area[q];
+                        moment[0] += cell.moment[q][0] + cell.area[q] * o[0];
+                        moment[1] += cell.moment[q][1] + cell.area[q] * o[1];
+                    }
+                }
+            }
+            DualCell { area_full, moment_full, area, moment, near }
+        })
     }
 
     /// Stage one from scratch: scans the whole grid.
@@ -891,126 +993,125 @@ impl Solid {
         let h = self.grid.h();
         // Crossings on every grid edge between an inside and an outside node (on a level of a
         // refined hierarchy, the edges of its own leaf cells: the surface lives there).
-        let mut cross_at = vec![[None::<usize>; 2]; n];
+        let crossed = |k: usize, d: usize| -> Option<usize> {
+            let b = self.along(k, d, 1)?;
+            (self.inside(k) != self.inside(b)
+                && (self.level.is_none() || self.own_cell(k) || self.along(k, 1 - d, -1).is_some_and(|m| self.own_cell(m))))
+            .then_some(b)
+        };
         let mut cross = Vec::new();
         let mut cross_t = Vec::new();
+        let mut cross_at = vec![[None::<usize>; 2]; n];
         for d in 0..2 {
-            for k in 0..n {
-                if let Some(b) = self.along(k, d, 1)
-                    && self.inside(k) != self.inside(b)
-                    && (self.level.is_none() || self.own_cell(k) || self.along(k, 1 - d, -1).is_some_and(|m| self.own_cell(m)))
-                {
-                    cross_at[k][d] = Some(cross.len());
-                    cross.push((k, d));
-                    cross_t.push(self.edge_crossing(k, b, d)?);
+            let ks = par::filter(n, |k| crossed(k, d).is_some());
+            let ts = par::try_map_items(ks.len(), |i| {
+                let k = ks.get(i).copied().unwrap_or(0);
+                match crossed(k, d) {
+                    Some(b) => self.edge_crossing(k, b, d),
+                    None => Ok(0.0),
                 }
+            })?;
+            for (&k, t) in ks.iter().zip(ts) {
+                cross_at[k][d] = Some(cross.len());
+                cross.push((k, d));
+                cross_t.push(t);
             }
         }
-        // Cells.
-        let mut class = vec![CellClass::Empty; n];
-        let mut cell_list = Vec::new();
-        let mut cells = Vec::new();
-        for c0 in 0..n {
+        // Cells: classified, then the cut ones cut.
+        let mut class = par::try_map(n, |c0| {
             let Some(c) = self.cell_corners(c0) else {
-                continue;
+                return Ok(CellClass::Empty);
             };
             if !self.own_cell(c0) {
-                class[c0] = CellClass::Foreign;
-                continue;
+                return Ok(CellClass::Foreign);
             }
             let ins = c.map(|k| self.inside(k));
             if ins.iter().all(|&b| b) {
-                class[c0] = CellClass::Full;
-                continue;
+                return Ok(CellClass::Full);
             }
             if !ins.iter().any(|&b| b) {
-                continue;
+                return Ok(CellClass::Empty);
             }
             if c.iter().any(|&k| !self.kind[k].known()) {
                 return Err(Error::Diverged(format!("a cut cell at node {c0} has a corner outside the extrapolation band")));
             }
+            Ok(CellClass::Cut(0))
+        })?;
+        let cut_at = par::filter(n, |c0| matches!(class[c0], CellClass::Cut(_)));
+        let cut_cells = par::try_map_items(cut_at.len(), |i| {
+            let c0 = cut_at.get(i).copied().unwrap_or(0);
+            let c = self.cell_corners(c0).ok_or_else(|| Error::Diverged(format!("no cell at node {c0}")))?;
             let edges = [cross_at[c[0]][0], cross_at[c[1]][1], cross_at[c[3]][0], cross_at[c[0]][1]];
-            let cr = crossings_of(&edges, &cross_t);
-            let cell = self.cut_geometry(c0, c, cr)?;
-            class[c0] = CellClass::Cut(cells.len());
-            cell_list.push((c0, edges));
-            cells.push((c0, cell));
+            let cell = self.cut_geometry(c0, c, crossings_of(&edges, &cross_t))?;
+            Ok(((c0, edges), (c0, cell)))
+        })?;
+        let mut cell_list = Vec::with_capacity(cut_cells.len());
+        let mut cells = Vec::with_capacity(cut_cells.len());
+        for (i, (entry, cell)) in cut_cells.into_iter().enumerate() {
+            class[entry.0] = CellClass::Cut(i);
+            cell_list.push(entry);
+            cells.push(cell);
         }
         // Solid area and first moment of each node's dual cell: the full cells, then the cut ones.
-        let mut area_full = vec![0.0; n];
-        let mut moment_full = vec![[0.0; 2]; n];
-        let mut near_cells = vec![false; n];
-        let quarter = 0.25 * h * h;
-        for c0 in 0..n {
-            let Some(c) = self.cell_corners(c0) else {
-                continue;
-            };
-            let o = self.grid.position(c0);
-            match class[c0] {
-                CellClass::Empty | CellClass::Foreign => {}
-                CellClass::Full => {
-                    for (q, &k) in c.iter().enumerate() {
-                        let qc = match q {
-                            0 => [0.25 * h, 0.25 * h],
-                            1 => [0.75 * h, 0.25 * h],
-                            2 => [0.75 * h, 0.75 * h],
-                            _ => [0.25 * h, 0.75 * h],
-                        };
-                        area_full[k] += quarter;
-                        moment_full[k][0] += quarter * (o[0] + qc[0]);
-                        moment_full[k][1] += quarter * (o[1] + qc[1]);
-                    }
-                }
-                CellClass::Cut(_) => {
-                    for &k in &c {
-                        near_cells[k] = true;
-                    }
-                }
-            }
-        }
-        let mut area = area_full.clone();
-        let mut moment = moment_full.clone();
-        for (c0, cell) in &cells {
-            self.add_cut_cell(*c0, cell, &mut area, &mut moment);
-        }
+        let dual = self.dual_cells(&class, &cells, None);
+        let area_full: Vec<f64> = dual.iter().map(|d| d.area_full).collect();
+        let moment_full: Vec<P2> = dual.iter().map(|d| d.moment_full).collect();
+        let area: Vec<f64> = dual.iter().map(|d| d.area).collect();
+        let moment: Vec<P2> = dual.iter().map(|d| d.moment).collect();
+        let near_cells: Vec<bool> = dual.iter().map(|d| d.near).collect();
 
         // Shares: inside nodes keep their control volume; solid in the dual cell of an outside
-        // node goes to inside neighbours.
-        let mut share: Vec<Option<[(usize, f64); 2]>> = vec![None; n];
-        let mut orphans = Vec::new();
-        for k in 0..n {
+        // node goes to inside neighbours; a hanging node of a refined level gives its solid to
+        // its two masters.
+        let shares = par::map(n, |k| {
             if !(area[k] > 0.0) {
-                continue;
+                return (None, false);
             }
-            // A hanging node of a refined level gives its solid to its two masters.
             let slave = self.level.as_ref().and_then(|l| l.slave.get(k).copied().flatten());
-            share[k] = if let Some(sl) = slave {
-                Some(sl)
+            if let Some(sl) = slave {
+                (Some(sl), false)
             } else if self.inside(k) {
-                Some([(k, 1.0), (k, 0.0)])
+                (Some([(k, 1.0), (k, 0.0)]), false)
             } else {
-                orphans.push(k);
-                self.orphan_shares(k)
-            };
-        }
+                (self.orphan_shares(k), true)
+            }
+        });
+        let orphans: Vec<usize> = par::filter(n, |k| shares[k].1);
+        let mut share: Vec<Option<[(usize, f64); 2]>> = shares.into_iter().map(|s| s.0).collect();
         // Small control volumes join their deepest inside edge neighbour (never one the
-        // hierarchy sets, nor one on the interface with the coarser level).
-        let mut cv = self.level.as_ref().map_or_else(|| vec![0.0; n], |l| l.ext_area.clone());
-        cv.resize(n, 0.0);
-        for k in 0..n {
-            for (o, w) in share[k].into_iter().flatten() {
-                cv[o] += w * area[k];
+        // hierarchy sets, nor one on the interface with the coarser level), in node order: a
+        // merge only grows the volume it joins, so the candidates are among the first ones.
+        let mut cv = share_sum(&share, &|k| area[k]);
+        if let Some(l) = self.level.as_ref() {
+            for (c, e) in cv.iter_mut().zip(&l.ext_area) {
+                *c += e;
             }
         }
         let mut merges = Vec::new();
+        let mut naming: Option<BTreeMap<usize, Vec<usize>>> = None;
         let mut merge = |k: usize, m: usize, share: &mut Vec<Option<[(usize, f64); 2]>>, cv: &mut Vec<f64>| {
-            for sh in share.iter_mut().flatten() {
-                for e in sh.iter_mut() {
+            // The nodes whose shares name each node, built at the first merge.
+            let names = naming.get_or_insert_with(|| {
+                let mut names: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
+                for j in par::filter(n, |j| share[j].is_some()) {
+                    for (o, _) in share[j].into_iter().flatten() {
+                        let list = names.entry(o).or_default();
+                        if list.last() != Some(&j) {
+                            list.push(j);
+                        }
+                    }
+                }
+                names
+            });
+            let moved = names.remove(&k).unwrap_or_default();
+            for &j in &moved {
+                for e in share[j].iter_mut().flatten() {
                     if e.0 == k {
                         e.0 = m;
                     }
                 }
             }
+            names.entry(m).or_default().extend(moved);
             cv[m] += cv[k];
             cv[k] = 0.0;
             merges.push((k, m));
@@ -1020,10 +1121,13 @@ impl Solid {
                 merge(k, m, &mut share, &mut cv);
             }
         } else {
-            for k in 0..n {
+            let small = |k: usize, share: &[Option<[(usize, f64); 2]>], cv: &[f64]| {
                 let own = share[k].is_some_and(|sh| sh[0] == (k, 1.0));
                 let interface = self.level.as_ref().is_some_and(|l| l.master.get(k).copied().unwrap_or(false));
-                if !own || self.kind[k] == NodeKind::Fixed || self.frozen(k) || interface || cv[k] >= MERGE_FRACTION * h * h {
+                own && self.kind[k] != NodeKind::Fixed && !self.frozen(k) && !interface && cv[k] < MERGE_FRACTION * h * h
+            };
+            for k in par::filter(n, |k| small(k, &share, &cv)) {
+                if !small(k, &share, &cv) {
                     continue;
                 }
                 let mut best: Option<usize> = None;
@@ -1042,24 +1146,29 @@ impl Solid {
                 }
             }
         }
-        let owner: Vec<Option<usize>> = share.iter().map(|sh| sh.map(owner_of)).collect();
+        let owner: Vec<Option<usize>> = par::map(n, |k| share[k].map(owner_of));
         let near = near_cells.clone();
-        // Faces with solid: both halves full (the compact stencil), or one of them cut.
-        let mut faces = Vec::new();
-        for k in 0..n {
-            for d in 0..2 {
+        // Faces with solid: both halves full (the compact stencil, when its nodes are known), or
+        // one of them cut.
+        let faces = par::map(n, |k| {
+            let mut out = [Face::None; 2];
+            for (d, slot) in out.iter_mut().enumerate() {
                 if self.along(k, d, 1).is_none() {
                     continue;
                 }
-                let lower = if d == 0 { self.grid.neighbour(k, 0, -1) } else { self.grid.neighbour(k, -1, 0) };
-                let classes = [lower.map_or(CellClass::Empty, |c| class[c]), class[k]];
+                let classes = self.face_halves(k, d).map(|hf| hf.map_or(CellClass::Empty, |(c, _)| class[c]));
                 if classes.iter().all(|c| matches!(c, CellClass::Empty | CellClass::Foreign)) {
                     continue;
                 }
-                let full = classes.iter().all(|c| *c == CellClass::Full);
-                faces.push((k, d, if full { self.compact_nodes(k, d) } else { None }));
+                *slot = if classes.iter().all(|c| *c == CellClass::Full) {
+                    // Node indices are below Limits::max_nodes, far below u32::MAX.
+                    self.compact_nodes(k, d).map_or(Face::None, |nodes| Face::Full(nodes.map(|m| m as u32)))
+                } else {
+                    Face::Mapped
+                };
             }
-        }
+            out
+        });
         let class = Arc::new(class);
         let structure = Arc::new(Structure { kind: self.kind.clone(), cross, cells: cell_list, area_full, moment_full, near_cells, orphans, faces });
         Ok(Geometry { structure, class, cross_t, cells, area, moment, near, share, owner, merges })
@@ -1070,25 +1179,24 @@ impl Solid {
     /// recomputed.
     fn geometry_held(&self, base: &CutState, topo: &Topology) -> Result<Geometry, Error> {
         let structure = base.structure.clone();
-        let mut cross_t = Vec::with_capacity(structure.cross.len());
-        for &(k, d) in &structure.cross {
+        let cross_t = par::try_map_items(structure.cross.len(), |i| {
+            let (k, d) = structure.cross.get(i).copied().unwrap_or((0, 0));
             let b = self.along(k, d, 1).ok_or_else(|| Error::Diverged("a held crossing left the grid".into()))?;
-            cross_t.push(self.edge_crossing(k, b, d)?);
-        }
-        let mut cells = Vec::with_capacity(structure.cells.len());
-        let mut area = structure.area_full.clone();
-        let mut moment = structure.moment_full.clone();
-        for &(c0, edges) in &structure.cells {
+            self.edge_crossing(k, b, d)
+        })?;
+        let cells = par::try_map_items(structure.cells.len(), |i| {
+            let (c0, edges) = structure.cells.get(i).copied().unwrap_or((0, [None; 4]));
             let c = self.cell_corners(c0).ok_or_else(|| Error::Diverged("a held cut cell left the grid".into()))?;
-            let cell = self.cut_geometry(c0, c, crossings_of(&edges, &cross_t))?;
-            self.add_cut_cell(c0, &cell, &mut area, &mut moment);
-            cells.push((c0, cell));
-        }
+            Ok((c0, self.cut_geometry(c0, c, crossings_of(&edges, &cross_t))?))
+        })?;
+        let dual = self.dual_cells(&base.class, &cells, Some((&structure.area_full, &structure.moment_full)));
+        let area: Vec<f64> = dual.iter().map(|d| d.area).collect();
+        let moment: Vec<P2> = dual.iter().map(|d| d.moment).collect();
         let mut share = base.share.clone();
         let mut owner = base.owner.clone();
-        for &k in &structure.orphans {
+        let orphan_shares = par::map_items(structure.orphans.len(), |i| {
             // The orphan's shares, then the held merges in order.
-            let mut sh = self.orphan_shares(k);
+            let mut sh = structure.orphans.get(i).and_then(|&k| self.orphan_shares(k));
             if let Some(s) = sh.as_mut() {
                 for &(from, to) in &topo.merges {
                     for e in s.iter_mut() {
@@ -1098,6 +1206,9 @@ impl Solid {
                     }
                 }
             }
+            sh
+        });
+        for (&k, sh) in structure.orphans.iter().zip(orphan_shares) {
             share[k] = sh;
             owner[k] = sh.map(owner_of);
         }
@@ -1151,8 +1262,9 @@ impl Solid {
     }
 
     /// σ(F)·n − t at surface point p with its surface value set to z.
-    fn traction_residual(&self, points: &[SurfacePoint], p: usize, z: P2, t: P2) -> Result<P2, Error> {
-        let g = self.surface_gradient(points, p, z).ok_or_else(|| Error::Diverged(format!("no surface map at node {}", points[p].n1)))?;
+    /// `over` = (q, z_q) replaces the surface value of another point q.
+    fn traction_residual(&self, points: &[SurfacePoint], p: usize, z: P2, t: P2, over: Option<(usize, P2)>) -> Result<P2, Error> {
+        let g = self.surface_gradient(points, p, z, over).ok_or_else(|| Error::Diverged(format!("no surface map at node {}", points[p].n1)))?;
         let jinv = identity_plus(&g);
         let f = invert(&jinv).ok_or_else(|| Error::Diverged(format!("the reference map folded at the surface by node {}", points[p].n1)))?;
         let s = self.material.cauchy(&f).map_err(|e| Error::Diverged(format!("{e} at the surface by node {}", points[p].n1)))?;
@@ -1163,7 +1275,7 @@ impl Solid {
     /// ∇ζ at surface point p (η = 0) with its surface value set to z: the normal derivative
     /// from the one-sided quadratic along its line, the tangential one from the surface values
     /// of the neighbouring lines, through T′⁻¹.
-    fn surface_gradient(&self, points: &[SurfacePoint], p: usize, z: P2) -> Option<Tensor> {
+    fn surface_gradient(&self, points: &[SurfacePoint], p: usize, z: P2, over: Option<(usize, P2)>) -> Option<Tensor> {
         let pt = &points[p];
         let (offs, cnt) = tangent_stencil(&pt.nb)?;
         let xs = offs.map(|o| o as f64);
@@ -1172,7 +1284,11 @@ impl Solid {
         let mut yp = 0.0;
         for m in 0..cnt {
             let q = pt.nb[(offs[m] + 2) as usize]?;
-            let zq = if q == p { z } else { points[q].zeta };
+            let zq = match over {
+                _ if q == p => z,
+                Some((o, zo)) if o == q => zo,
+                _ => points[q].zeta,
+            };
             for c in 0..2 {
                 zu[c] += dw[m] * zq[c];
             }
@@ -1319,7 +1435,7 @@ impl Solid {
     }
 
     /// One dynamic step with the mapped boundary.
-    pub(crate) fn step_mapped(&mut self) -> Result<(), Error> {
+    pub(crate) fn step_mapped(&mut self, obs: &mut (dyn FnMut(Phase) + Send)) -> Result<(), Error> {
         let n = self.grid.len();
         let (_, _, rho0) = self.material.constants();
         let h = self.grid.h();
@@ -1334,15 +1450,10 @@ impl Solid {
             Some(st) => st,
             None => self.build_cut()?,
         };
-        let mut force = self.mapped_forces(&mut st, mu_e)?;
+        let mut force = self.mapped_forces_on(&mut st, mu_e, None, obs)?;
         // 3. Momentum of each control volume (lumped: ρ times its solid area), with the
         // coarser level's part of the interface nodes' control volumes on a refined level.
-        let mut cv = vec![0.0; n];
-        for k in 0..n {
-            for (o, w) in st.share[k].into_iter().flatten() {
-                cv[o] += w * st.area[k];
-            }
-        }
+        let mut cv = st.control_volumes();
         if let Some(l) = self.level.as_mut() {
             l.force.clone_from(&force);
             l.area.clone_from(&cv);
@@ -1352,16 +1463,13 @@ impl Solid {
                 force[k][1] += l.ext_force[k][1];
             }
         }
-        let mut v_new = self.v.clone();
-        let mut live = vec![false; n];
-        for k in 0..n {
+        let updated = par::map(n, |k| -> Option<P2> {
             let kind = self.kind[k];
             if !kind.source() {
-                continue;
+                return None;
             }
-            live[k] = true;
             if kind == NodeKind::Fixed || st.owner[k] != Some(k) || !(cv[k] > 0.0) {
-                continue;
+                return Some(self.v[k]);
             }
             let det = self.node_gradient(k).map(|g| {
                 let j = identity_plus(&g);
@@ -1373,33 +1481,35 @@ impl Solid {
             };
             let v = self.v[k];
             let adv = [self.upwind_dot(k, v, |m| self.v[m][0]), self.upwind_dot(k, v, |m| self.v[m][1])];
+            let mut out = v;
             for c in 0..2 {
-                v_new[k][c] = (v[c] + kick * (force[k][c] / (rho * cv[k]) - adv[c])) / (1.0 + self.settings.damping * kick);
+                out[c] = (v[c] + kick * (force[k][c] / (rho * cv[k]) - adv[c])) / (1.0 + self.settings.damping * kick);
             }
-        }
-        for k in 0..n {
-            if self.kind[k] == NodeKind::Solid
-                && let Some(o) = st.owner[k]
-                && o != k
-            {
+            Some(out)
+        });
+        let live: Vec<bool> = updated.iter().map(Option::is_some).collect();
+        let mut v_new: Vec<P2> = updated.iter().zip(&self.v).map(|(u, v)| u.unwrap_or(*v)).collect();
+        // Nodes merged into another control volume move with it.
+        let merged = par::filter(n, |k| self.kind[k] == NodeKind::Solid && st.owner[k].is_some_and(|o| o != k));
+        for k in merged {
+            if let Some(o) = st.owner[k] {
                 v_new[k] = v_new[o];
             }
         }
         self.v = v_new;
+        obs(Phase::Momentum);
 
         // 4. Reference map, body, band and velocities as for the blurred boundary.
         self.advect_reference()?;
         self.time += dt;
+        obs(Phase::Advection);
         self.rebuild()?;
-        self.v_live = (0..n).map(|k| live[k] && self.kind[k].known()).collect();
+        self.v_live = par::map(n, |k| live[k] && self.kind[k].known());
         self.extrapolate_velocity();
-        for k in 0..n {
-            if self.kind[k].known() && self.v[k].iter().chain(self.zeta[k].iter()).any(|x| !x.is_finite()) {
-                return Err(Error::Diverged(format!("non-finite value at node {k} at t = {}", self.time)));
-            }
-        }
+        self.check_finite()?;
+        obs(Phase::Band);
         // The cut state of the new configuration, for the next step and the accessors.
-        let mut next = self.build_cut_from(Some(&st))?;
+        let mut next = self.build_cut_from(Some(&st), obs)?;
         next.stats.mapped_faces = st.stats.mapped_faces;
         next.stats.fallback_points = st.stats.fallback_points;
         self.cut = Some(next);
@@ -1410,17 +1520,11 @@ impl Solid {
     /// configuration, without stepping (the residual of the static problem); with the
     /// coarser level's register on a refined level.
     pub(crate) fn level_forces(&mut self) -> Result<(Vec<[f64; 2]>, Vec<f64>), Error> {
-        let n = self.grid.len();
         let (_, _, rho0) = self.material.constants();
         let mu_e = self.settings.viscosity * rho0 * self.material.p_wave_speed() * self.grid.h();
-        let mut st = self.build_cut_from(self.cut.as_ref())?;
+        let mut st = self.build_cut_from(self.cut.as_ref(), &mut |_| {})?;
         let force = self.mapped_forces(&mut st, mu_e)?;
-        let mut cv = vec![0.0; n];
-        for k in 0..n {
-            for (o, w) in st.share[k].into_iter().flatten() {
-                cv[o] += w * st.area[k];
-            }
-        }
+        let cv = st.control_volumes();
         if let Some(l) = self.level.as_mut() {
             l.force.clone_from(&force);
             l.area.clone_from(&cv);
@@ -1447,150 +1551,199 @@ impl Solid {
     /// The net force on every control volume (at the node that holds it): fluxes through the faces,
     /// the traction on the curved surface and the body force.
     pub(crate) fn mapped_forces(&self, st: &mut CutState, mu_e: f64) -> Result<Vec<[f64; 2]>, Error> {
-        self.mapped_forces_on(st, mu_e, None)
+        self.mapped_forces_on(st, mu_e, None, &mut |_| {})
     }
 
     /// As [`Solid::mapped_forces`], with only the faces that touch a node of `mask` (when given):
     /// the forces are then exact at the control volumes whose own node and whose sharing
     /// neighbours all lie in the mask.
-    pub(crate) fn mapped_forces_on(&self, st: &mut CutState, mu_e: f64, mask: Option<&[bool]>) -> Result<Vec<[f64; 2]>, Error> {
+    pub(crate) fn mapped_forces_on(
+        &self,
+        st: &mut CutState,
+        mu_e: f64,
+        mask: Option<&[bool]>,
+        obs: &mut (dyn FnMut(Phase) + Send),
+    ) -> Result<Vec<[f64; 2]>, Error> {
         let n = self.grid.len();
-        // Net force on the solid of each node's dual cell, then shared out to the control
-        // volumes that hold it.
-        let mut raw = vec![[0.0f64; 2]; n];
-        // 1. Faces.
+        // 1. The flux through each face with solid on it (k, d), from k to its +d neighbour: the
+        // faces between full cells by the compact stencil, the others through the map.
+        let structure = st.structure.clone();
+        let faces = &structure.faces;
+        let state: &CutState = st;
+        let touched = |k: usize, d: usize| match mask {
+            Some(m) => m[k] || self.along(k, d, 1).is_some_and(|b| m[b]),
+            None => true,
+        };
+        let interior = par::try_map(n, |k| -> Result<[Option<P2>; 2], Error> {
+            let mut out = [None; 2];
+            for (d, slot) in out.iter_mut().enumerate() {
+                let Some(Face::Full(nodes)) = faces.get(k).map(|f| f[d]) else {
+                    continue;
+                };
+                if !touched(k, d) {
+                    continue;
+                }
+                let nodes = nodes.map(|m| m as usize);
+                let b = nodes[0];
+                let (Some(sk), Some(sb)) = (state.share[k], state.share[b]) else {
+                    continue;
+                };
+                // Inside one control volume: no net effect.
+                if sk[1].1 == 0.0 && sb[1].1 == 0.0 && sk[0].0 == sb[0].0 {
+                    continue;
+                }
+                let e = self.compact_edge_at(k, d, nodes, mu_e)?;
+                let s = face_components(d, [e.stress[0] + e.viscous[0], e.stress[1] + e.viscous[1], e.stress[2] + e.viscous[2]]);
+                *slot = Some([s[0] * self.grid.h(), s[1] * self.grid.h()]);
+            }
+            Ok(out)
+        })?;
+        obs(Phase::InteriorFaces);
+        let others: Vec<(usize, usize)> =
+            par::filter(2 * n, |f| faces.get(f / 2).is_some_and(|fs| fs[f % 2] == Face::Mapped) && touched(f / 2, f % 2))
+                .into_iter()
+                .map(|f| (f / 2, f % 2))
+                .collect();
+        let other_fluxes = par::try_map_items(others.len(), |j| {
+            let (k, d) = others.get(j).copied().unwrap_or((0, 0));
+            self.face_flux(state, k, d, mu_e)
+        })?;
+        let mut flux = interior;
         let mut stats = st.stats.clone();
         stats.mapped_faces = 0;
         stats.fallback_points = 0;
-        stats.max_flux = 0.0;
-        let h = self.grid.h();
-        let structure = st.structure.clone();
-        for &(k, d, full) in &structure.faces {
-            if let Some(m) = mask
-                && !m[k]
-                && self.along(k, d, 1).is_none_or(|b| !m[b])
-            {
-                continue;
+        for (&(k, d), f) in others.iter().zip(other_fluxes) {
+            if let Some((f, fallback, mapped)) = f {
+                flux[k][d] = Some(f);
+                stats.fallback_points += fallback;
+                stats.mapped_faces += usize::from(mapped);
             }
-            let Some(nodes) = full else {
-                self.face_force(st, k, d, mu_e, &mut raw, &mut stats)?;
-                continue;
-            };
-            // Between two full cells: the compact stencil (as in face_force).
-            let b = nodes[0];
-            let (Some(sk), Some(sb)) = (st.share[k], st.share[b]) else {
-                continue;
-            };
-            if sk[1].1 == 0.0 && sb[1].1 == 0.0 && sk[0].0 == sb[0].0 {
-                continue;
-            }
-            let e = self.compact_edge_at(k, d, nodes, mu_e)?;
-            let sv = [e.stress[0] + e.viscous[0], e.stress[1] + e.viscous[1], e.stress[2] + e.viscous[2]];
-            let s = if d == 0 { [sv[0], sv[2]] } else { [sv[2], sv[1]] };
-            let f = [s[0] * h, s[1] * h];
-            stats.max_flux = stats.max_flux.max(f[0].abs()).max(f[1].abs());
-            raw[k][0] += f[0];
-            raw[k][1] += f[1];
-            raw[b][0] -= f[0];
-            raw[b][1] -= f[1];
         }
+        stats.max_flux = flux.iter().flatten().flatten().fold(0.0f64, |m, f| m.max(f[0].abs()).max(f[1].abs()));
         st.stats = stats;
-        self.add_loads(st, &mut raw);
-        let mut force = vec![[0.0f64; 2]; n];
-        for k in 0..n {
-            for (o, w) in st.share[k].into_iter().flatten() {
-                force[o][0] += w * raw[k][0];
-                force[o][1] += w * raw[k][1];
+        obs(Phase::MappedFaces);
+        // Net force on the solid of each node's dual cell: each face adds its flux to the node
+        // behind it and takes it from the node ahead, summed at a node in face order (the order
+        // of the sequential scatter: by node, then by direction).
+        let mut raw = par::map(n, |k| {
+            let mut terms: [(usize, bool, Option<P2>); 4] = [(usize::MAX, true, None); 4];
+            for d in 0..2 {
+                terms[d] = (2 * k + d, true, flux[k][d]);
+                if let Some(a) = self.along(k, d, -1)
+                    && self.along(a, d, 1) == Some(k)
+                {
+                    terms[2 + d] = (2 * a + d, false, flux[a][d]);
+                }
             }
-        }
+            terms.sort_unstable_by_key(|t| t.0);
+            let mut r = [0.0f64; 2];
+            for (_, behind, f) in terms {
+                let Some(f) = f else {
+                    continue;
+                };
+                if behind {
+                    r[0] += f[0];
+                    r[1] += f[1];
+                } else {
+                    r[0] -= f[0];
+                    r[1] -= f[1];
+                }
+            }
+            r
+        });
+        // 2. The traction on the curved surface and the body force.
+        self.add_loads(st, &mut raw);
+        let force = share_sum(&st.share, &|k| raw[k]);
+        obs(Phase::SurfaceForces);
         Ok(force)
     }
 
     /// The external load on every control volume (at the node that holds it): the traction on
     /// the curved surface and the body force.
     pub(crate) fn mapped_loads(&self, st: &CutState) -> Vec<[f64; 2]> {
-        let n = self.grid.len();
-        let mut raw = vec![[0.0f64; 2]; n];
+        let mut raw = vec![[0.0f64; 2]; self.grid.len()];
         self.add_loads(st, &mut raw);
-        let mut force = vec![[0.0f64; 2]; n];
-        for k in 0..n {
-            for (o, w) in st.share[k].into_iter().flatten() {
-                force[o][0] += w * raw[k][0];
-                force[o][1] += w * raw[k][1];
-            }
-        }
-        force
+        share_sum(&st.share, &|k| raw[k])
     }
 
     /// Adds the traction on the curved surface and the body force to the dual cells' forces.
     fn add_loads(&self, st: &CutState, raw: &mut [[f64; 2]]) {
-        let n = self.grid.len();
-        for (c0, cell) in st.cells.iter() {
+        let arcs = par::map_items(st.cells.len(), |i| {
+            let mut out: Vec<(usize, P2)> = Vec::new();
+            let Some((c0, cell)) = st.cells.get(i) else {
+                return out;
+            };
             let Some(c) = self.cell_corners(*c0) else {
-                continue;
+                return out;
             };
             let o = self.grid.position(*c0);
             for q in 0..4 {
                 for arc in &cell.quarter_arcs[q] {
-                    let f = self.arc_traction(arc, o, *c0);
-                    raw[c[q]][0] += f[0];
-                    raw[c[q]][1] += f[1];
+                    out.push((c[q], self.arc_traction(arc, o, *c0)));
                 }
             }
+            out
+        });
+        for (k, f) in arcs.into_iter().flatten() {
+            raw[k][0] += f[0];
+            raw[k][1] += f[1];
         }
         if let Some(b) = &self.body {
-            for k in 0..n {
+            par::update(raw, |k, r| {
                 if st.area[k] > 0.0 {
                     let c = [st.moment[k][0] / st.area[k], st.moment[k][1] / st.area[k]];
                     let f = (b.0)(c);
-                    raw[k][0] += self.load * f[0] * st.area[k];
-                    raw[k][1] += self.load * f[1] * st.area[k];
+                    r[0] += self.load * f[0] * st.area[k];
+                    r[1] += self.load * f[1] * st.area[k];
                 }
-            }
+            });
         }
     }
 
-    /// Adds the flux through the face between node k and its +d neighbour to both control
-    /// volumes.
-    fn face_force(&self, st: &CutState, k: usize, d: usize, mu_e: f64, force: &mut [[f64; 2]], stats: &mut CutStats) -> Result<(), Error> {
-        let Some(b) = self.along(k, d, 1) else {
-            return Ok(());
-        };
-        // The two cells holding the halves of the face and the half-face index in each.
+    /// The two cells holding the halves of the face between node k and its +d neighbour, with
+    /// the half-face index in each.
+    fn face_halves(&self, k: usize, d: usize) -> [Option<(usize, usize)>; 2] {
         let lower = if d == 0 { self.grid.neighbour(k, 0, -1).map(|c| (c, 2)) } else { self.grid.neighbour(k, -1, 0).map(|c| (c, 1)) };
-        let upper = Some((k, if d == 0 { 0 } else { 3 }));
-        let halves = [lower, upper];
+        [lower, Some((k, if d == 0 { 0 } else { 3 }))]
+    }
+
+    /// The flux through the face between node k and its +d neighbour when a cut cell (or a
+    /// coarse–fine interface) is next to it, with the Gauss points that fell back to the
+    /// compact stencil and whether it went through the map; `None` when it moves nothing.
+    fn face_flux(&self, st: &CutState, k: usize, d: usize, mu_e: f64) -> Result<Option<(P2, usize, bool)>, Error> {
+        let Some(b) = self.along(k, d, 1) else {
+            return Ok(None);
+        };
+        let halves = self.face_halves(k, d);
         let classes = halves.map(|hf| hf.map_or(CellClass::Empty, |(c, _)| st.class[c]));
         if classes.iter().all(|c| matches!(c, CellClass::Empty | CellClass::Foreign)) {
-            return Ok(());
+            return Ok(None);
         }
         let (Some(sk), Some(sb)) = (st.share[k], st.share[b]) else {
-            return Ok(());
+            return Ok(None);
         };
         // Inside one control volume: no net effect.
         if sk[1].1 == 0.0 && sb[1].1 == 0.0 && sk[0].0 == sb[0].0 {
-            return Ok(());
+            return Ok(None);
         }
         let h = self.grid.h();
-        let comps = |s: [f64; 3]| if d == 0 { [s[0], s[2]] } else { [s[2], s[1]] };
         let edge = self.compact_edge(k, d, mu_e)?;
-        let mut f = [0.0; 2];
         if classes.iter().all(|c| *c == CellClass::Full) {
             let Some(e) = edge else {
-                return Ok(());
+                return Ok(None);
             };
-            let s = comps([e.stress[0] + e.viscous[0], e.stress[1] + e.viscous[1], e.stress[2] + e.viscous[2]]);
-            f = [s[0] * h, s[1] * h];
-        } else if classes.iter().all(|c| matches!(c, CellClass::Full | CellClass::Foreign)) {
+            let s = face_components(d, [e.stress[0] + e.viscous[0], e.stress[1] + e.viscous[1], e.stress[2] + e.viscous[2]]);
+            return Ok(Some(([s[0] * h, s[1] * h], 0, false)));
+        }
+        if classes.iter().all(|c| matches!(c, CellClass::Full | CellClass::Foreign)) {
             // Half of the face on this level (a coarse–fine interface runs along the edge): the
             // midpoint rule on that half, the stress at its middle (a quarter of a cell from the
             // edge) interpolated between the edge and the parallel edge on the same side.
             let Some(e) = edge else {
-                return Ok(());
+                return Ok(None);
             };
             let side: isize = if classes[1] == CellClass::Full { 1 } else { -1 };
-            let par = self.along(k, 1 - d, side);
-            let e2 = match par {
+            let e2 = match self.along(k, 1 - d, side) {
                 Some(p) => self.compact_edge(p, d, mu_e)?,
                 None => None,
             };
@@ -1599,55 +1752,118 @@ impl Solid {
             for c in 0..3 {
                 s3[c] = 0.75 * (e.stress[c] + e.viscous[c]) + 0.25 * (e2.stress[c] + e2.viscous[c]);
             }
-            let s = comps(s3);
-            f = [0.5 * s[0] * h, 0.5 * s[1] * h];
-        } else {
-            stats.mapped_faces += 1;
-            let visc = edge.map_or([0.0; 3], |e| e.viscous);
-            for (half, class) in halves.iter().zip(classes) {
-                let Some((c0, hf)) = *half else {
-                    continue;
-                };
-                let o = self.grid.position(c0);
-                let pieces: Vec<(P2, P2)> = match class {
-                    CellClass::Empty | CellClass::Foreign => continue,
-                    CellClass::Full => vec![cut::half_face(h, hf)],
-                    CellClass::Cut(i) => st.cells[i].1.faces[hf].clone(),
-                };
-                for (a, bb) in pieces {
-                    let (a, bb) = ([o[0] + a[0], o[1] + a[1]], [o[0] + bb[0], o[1] + bb[1]]);
-                    let len = (bb[0] - a[0]).hypot(bb[1] - a[1]);
-                    for (t, w) in GAUSS2 {
-                        let x = lerp(a, bb, t);
-                        let s = match self.reconstruct(st, x) {
-                            Some(g) => {
-                                let fdef = invert(&identity_plus(&g))
-                                    .ok_or_else(|| Error::Diverged(format!("the reference map folded near node {k} at t = {}", self.time)))?;
-                                let s = self.material.cauchy(&fdef).map_err(|e| Error::Diverged(format!("{e} near node {k}, t = {}", self.time)))?;
-                                [s[0], s[1], s[2]]
+            let s = face_components(d, s3);
+            return Ok(Some(([0.5 * s[0] * h, 0.5 * s[1] * h], 0, false)));
+        }
+        let visc = edge.map_or([0.0; 3], |e| e.viscous);
+        let mut f = [0.0; 2];
+        let mut fallback = 0;
+        for (half, class) in halves.iter().zip(classes) {
+            let Some((c0, hf)) = *half else {
+                continue;
+            };
+            let o = self.grid.position(c0);
+            let pieces: Vec<(P2, P2)> = match class {
+                CellClass::Empty | CellClass::Foreign => continue,
+                CellClass::Full => vec![cut::half_face(h, hf)],
+                CellClass::Cut(i) => st.cells[i].1.faces[hf].clone(),
+            };
+            for (a, bb) in pieces {
+                let (a, bb) = ([o[0] + a[0], o[1] + a[1]], [o[0] + bb[0], o[1] + bb[1]]);
+                let len = (bb[0] - a[0]).hypot(bb[1] - a[1]);
+                for (t, w) in GAUSS2 {
+                    let x = lerp(a, bb, t);
+                    let s = match self.reconstruct(st, x) {
+                        Some(g) => {
+                            let fdef = invert(&identity_plus(&g))
+                                .ok_or_else(|| Error::Diverged(format!("the reference map folded near node {k} at t = {}", self.time)))?;
+                            let s = self.material.cauchy(&fdef).map_err(|e| Error::Diverged(format!("{e} near node {k}, t = {}", self.time)))?;
+                            [s[0], s[1], s[2]]
+                        }
+                        None => {
+                            fallback += 1;
+                            match edge {
+                                Some(e) => e.stress,
+                                None => continue,
                             }
-                            None => {
-                                stats.fallback_points += 1;
-                                match edge {
-                                    Some(e) => e.stress,
-                                    None => continue,
-                                }
-                            }
-                        };
-                        let sv = comps([s[0] + visc[0], s[1] + visc[1], s[2] + visc[2]]);
-                        f[0] += w * len * sv[0];
-                        f[1] += w * len * sv[1];
-                    }
+                        }
+                    };
+                    let sv = face_components(d, [s[0] + visc[0], s[1] + visc[1], s[2] + visc[2]]);
+                    f[0] += w * len * sv[0];
+                    f[1] += w * len * sv[1];
                 }
             }
         }
-        stats.max_flux = stats.max_flux.max(f[0].abs()).max(f[1].abs());
-        force[k][0] += f[0];
-        force[k][1] += f[1];
-        force[b][0] -= f[0];
-        force[b][1] -= f[1];
-        Ok(())
+        Ok(Some((f, fallback, true)))
     }
+}
+
+/// The traction components a face of normal +d carries: (σxx, σxy) on x faces, (σxy, σyy) on
+/// y faces.
+fn face_components(d: usize, s: [f64; 3]) -> P2 {
+    if d == 0 { [s[0], s[2]] } else { [s[2], s[1]] }
+}
+
+/// A value that the shares of [`CutState::share`] distribute.
+trait Shared: Copy + Default + Send + Sync {
+    /// `self + w · v`, component by component.
+    fn add_weighted(self, w: f64, v: Self) -> Self;
+}
+
+impl Shared for f64 {
+    fn add_weighted(self, w: f64, v: f64) -> f64 {
+        self + w * v
+    }
+}
+
+impl Shared for P2 {
+    fn add_weighted(self, w: f64, v: P2) -> P2 {
+        [self[0] + w * v[0], self[1] + w * v[1]]
+    }
+}
+
+/// At every node o, the sum of w · value(k) over the share entries (o, w) of every node k, in
+/// the order of k and then of the entries (the order of the sequential scatter).
+fn share_sum<T: Shared>(share: &[Option<[(usize, f64); 2]>], value: &(dyn Fn(usize) -> T + Sync)) -> Vec<T> {
+    let n = share.len();
+    // (o, k) for the entries of k naming another node o, ordered by o then k.
+    let mut foreign: Vec<(usize, usize)> = par::filter(n, |k| share[k].is_some_and(|sh| sh.iter().any(|e| e.0 != k)))
+        .into_iter()
+        .flat_map(|k| share[k].into_iter().flatten().filter(move |e| e.0 != k).map(move |e| (e.0, k)))
+        .collect();
+    foreign.sort_unstable();
+    foreign.dedup();
+    let mut named = vec![false; n];
+    for &(o, _) in &foreign {
+        if let Some(m) = named.get_mut(o) {
+            *m = true;
+        }
+    }
+    par::map(n, |o| {
+        let mut acc = T::default();
+        if !named[o] {
+            // Only its own entries (most nodes).
+            for (t, w) in share[o].into_iter().flatten() {
+                if t == o {
+                    acc = acc.add_weighted(w, value(o));
+                }
+            }
+            return acc;
+        }
+        let from = foreign.partition_point(|e| e.0 < o);
+        let to = foreign.partition_point(|e| e.0 <= o);
+        let own = share[o].is_some_and(|sh| sh.iter().any(|e| e.0 == o)).then_some(o);
+        let mut ks: Vec<usize> = foreign.get(from..to).unwrap_or(&[]).iter().map(|e| e.1).chain(own).collect();
+        ks.sort_unstable();
+        for k in ks {
+            for (t, w) in share[k].into_iter().flatten() {
+                if t == o {
+                    acc = acc.add_weighted(w, value(k));
+                }
+            }
+        }
+        acc
+    })
 }
 
 /// The node holding the larger share.
