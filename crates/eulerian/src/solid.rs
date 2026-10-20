@@ -241,6 +241,23 @@ pub struct Solid {
     /// What the solid needs as one level of a refined hierarchy (`crate::refine`); `None` on a
     /// plain grid.
     pub(crate) level: Option<Box<LevelHooks>>,
+    /// The nodes stepped elsewhere ([`Solid::set_remote`]).
+    pub(crate) remote: Option<Remote>,
+}
+
+/// The nodes a device steps ([`Solid::set_remote`]).
+#[derive(Debug, Clone)]
+pub(crate) struct Remote {
+    pub(crate) nodes: Vec<bool>,
+    /// Every known node is remote: the CPU step only advances the clock.
+    pub(crate) all: bool,
+}
+
+impl Solid {
+    /// Whether node k is stepped elsewhere.
+    pub(crate) fn is_remote(&self, k: usize) -> bool {
+        self.remote.as_ref().is_some_and(|r| r.nodes.get(k).copied().unwrap_or(false))
+    }
 }
 
 /// A level of a refined hierarchy as the solid sees it. The hierarchy owns the nodes it sets
@@ -347,6 +364,7 @@ impl Solid {
             linear_fills: 0,
             load: 1.0,
             level: None,
+            remote: None,
         };
         if settings.boundary == Boundary::Mapped && (s.grid.periodic()[0] || s.grid.periodic()[1]) && shape != Shape::Everywhere {
             return Err(Error::Invalid("not supported yet: a mapped surface on a periodic grid".into()));
@@ -387,6 +405,7 @@ impl Solid {
         self.extrapolate_velocity();
         self.started = false;
         self.cut = None;
+        self.remote = None;
         Ok(())
     }
 
@@ -467,6 +486,7 @@ impl Solid {
             }
         }
         self.cut = None;
+        self.remote = None;
     }
 
     /// The grid.
@@ -721,7 +741,7 @@ impl Solid {
     /// ζ ← ζ − Δt (v + (v·∇)ζ) at the solid nodes.
     pub(crate) fn advect_reference(&mut self) -> Result<(), Error> {
         let z_new = par::map(self.grid.len(), |k| {
-            if self.kind[k] != NodeKind::Solid {
+            if self.kind[k] != NodeKind::Solid || self.is_remote(k) {
                 return self.zeta[k];
             }
             let v = self.v[k];
@@ -897,7 +917,8 @@ impl Solid {
             match self.kind[k] {
                 NodeKind::Solid | NodeKind::Fixed => {
                     let phi = self.shape.phi0(self.xi(k));
-                    let leaves = self.kind[k] == NodeKind::Solid && !(phi < 0.0);
+                    // A node stepped elsewhere is deep inside (its ζ here may be some steps old).
+                    let leaves = self.kind[k] == NodeKind::Solid && !(phi < 0.0) && !self.is_remote(k);
                     (if leaves { NodeKind::Empty } else { self.kind[k] }, phi)
                 }
                 NodeKind::Band | NodeKind::Empty => (NodeKind::Empty, self.phi[k]),

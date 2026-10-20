@@ -1443,6 +1443,11 @@ impl Solid {
         let kick = if self.started { dt } else { 0.5 * dt };
         self.started = true;
         let mu_e = self.settings.viscosity * rho0 * self.material.p_wave_speed() * h;
+        if self.remote.as_ref().is_some_and(|r| r.all) {
+            // Every node is stepped elsewhere.
+            self.time += dt;
+            return Ok(());
+        }
 
         // The cut state of the current configuration: kept from the end of the last step, or
         // built now after a change from outside.
@@ -1468,7 +1473,7 @@ impl Solid {
             if !kind.source() {
                 return None;
             }
-            if kind == NodeKind::Fixed || st.owner[k] != Some(k) || !(cv[k] > 0.0) {
+            if kind == NodeKind::Fixed || st.owner[k] != Some(k) || !(cv[k] > 0.0) || self.is_remote(k) {
                 return Some(self.v[k]);
             }
             let det = self.node_gradient(k).map(|g| {
@@ -1570,9 +1575,15 @@ impl Solid {
         let structure = st.structure.clone();
         let faces = &structure.faces;
         let state: &CutState = st;
-        let touched = |k: usize, d: usize| match mask {
-            Some(m) => m[k] || self.along(k, d, 1).is_some_and(|b| m[b]),
-            None => true,
+        // Faces in the mask (when given) that are not between two nodes stepped elsewhere.
+        let touched = |k: usize, d: usize| {
+            let b = self.along(k, d, 1);
+            let remote = self.is_remote(k) && b.is_some_and(|b| self.is_remote(b));
+            !remote
+                && match mask {
+                    Some(m) => m[k] || b.is_some_and(|b| m[b]),
+                    None => true,
+                }
         };
         let interior = par::try_map(n, |k| -> Result<[Option<P2>; 2], Error> {
             let mut out = [None; 2];

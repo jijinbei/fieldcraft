@@ -13,6 +13,7 @@
 //! - [`extrapolate`]: weighted least-squares linear extrapolation into the band outside the solid.
 //! - `sharp`: a sharp traction boundary by traction-constrained ghost values, [`Boundary::Ghost`].
 //! - [`solid`]: the state and the explicit time step.
+//! - [`remote`]: the hooks for stepping the deep interior on a device.
 //! - [`cut`] and [`mapped`]: the default surface, [`Boundary::Mapped`] — sharp cut cells with
 //!   the traction imposed on the curved surface and the deformation gradient near it from a
 //!   surface-fitted map.
@@ -83,6 +84,7 @@ pub mod material;
 pub mod multigrid;
 mod par;
 pub mod refine;
+pub mod remote;
 pub mod shape;
 mod sharp;
 pub mod solid;
@@ -93,6 +95,7 @@ pub use mapped::{CutStats, CutView, SurfaceSample};
 pub use material::Material;
 pub use multigrid::MultigridStats;
 pub use refine::{Hierarchy, NodeRef, Refinement, ResidualEntry, Role};
+pub use remote::{CPU_RINGS, StepConstants};
 pub use shape::Shape;
 pub use solid::{Boundary, NodeKind, Phase, Relaxation, Settings, Solid};
 pub use statics::{LinearTest, NewtonStep, PreconditionerMatrix, StaticReport, StaticSettings, StaticTimes};
