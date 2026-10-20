@@ -6,6 +6,10 @@
 //! - **Neo-Hookean** (compressible, Bonet & Wood 2008):
 //!   σ = (μ/J)(B − I) + (λ ln J / J) I, so σ₃₃ = λ ln J / J. Stress free under any rotation;
 //!   tends to linear elasticity with Lamé constants λ, μ at small strain.
+//! - **Decoupled neo-Hookean** (the form of FieldCraft's FEM, after Simo & Hughes /
+//!   Holzapfel): W = μ/2 (Ī₁ − 3) + κ/2 (J − 1)² with Ī₁ = J^(−2/3) tr B, so
+//!   σ = μ J^(−5/3) dev B + κ (J − 1) I. Same small-strain limit as the above (λ = κ − 2μ/3),
+//!   different at finite strain; for comparing with the FEM's nonlinear solutions.
 //! - **Linear elastic** (small strain): ε = sym(F − I), σ = λ tr ε I + 2 μ ε, σ₃₃ = λ tr ε.
 //!   Not objective: for checks of the small-strain limit only.
 
@@ -24,6 +28,8 @@ pub enum Material {
     NeoHookean { lambda: f64, mu: f64, density: f64 },
     /// Small-strain linear elasticity.
     LinearElastic { lambda: f64, mu: f64, density: f64 },
+    /// Decoupled neo-Hookean with shear modulus μ and bulk modulus κ.
+    NeoHookeanDecoupled { mu: f64, bulk: f64, density: f64 },
 }
 
 impl Material {
@@ -39,10 +45,17 @@ impl Material {
         Ok(Material::LinearElastic { lambda, mu, density: positive("density", density)? })
     }
 
-    /// (λ, μ, ρ₀).
+    /// A decoupled neo-Hookean material from Young's modulus and Poisson's ratio (κ = E / (3 (1 − 2ν))).
+    pub fn neo_hookean_decoupled(young: f64, poisson: f64, density: f64) -> Result<Material, Error> {
+        let (lambda, mu) = lame(young, poisson)?;
+        Ok(Material::NeoHookeanDecoupled { mu, bulk: lambda + 2.0 * mu / 3.0, density: positive("density", density)? })
+    }
+
+    /// (λ, μ, ρ₀); λ = κ − 2μ/3 for the decoupled law (its small-strain value).
     pub fn constants(&self) -> (f64, f64, f64) {
         match *self {
             Material::NeoHookean { lambda, mu, density } | Material::LinearElastic { lambda, mu, density } => (lambda, mu, density),
+            Material::NeoHookeanDecoupled { mu, bulk, density } => (bulk - 2.0 * mu / 3.0, mu, density),
         }
     }
 
@@ -72,6 +85,20 @@ impl Material {
                 let vol = lambda * j.ln() / j;
                 let m = mu / j;
                 Ok([m * (bxx - 1.0) + vol, m * (byy - 1.0) + vol, m * bxy, vol])
+            }
+            Material::NeoHookeanDecoupled { mu, bulk, .. } => {
+                let j = f[0][0] * f[1][1] - f[0][1] * f[1][0];
+                if !(j > 0.0) {
+                    return Err(Error::Diverged(format!("inverted or degenerate deformation, J = {j}")));
+                }
+                let bxx = f[0][0] * f[0][0] + f[0][1] * f[0][1];
+                let byy = f[1][0] * f[1][0] + f[1][1] * f[1][1];
+                let bxy = f[0][0] * f[1][0] + f[0][1] * f[1][1];
+                // Plane strain: B₃₃ = 1.
+                let mean = (bxx + byy + 1.0) / 3.0;
+                let m = mu * j.powf(-5.0 / 3.0);
+                let vol = bulk * (j - 1.0);
+                Ok([m * (bxx - mean) + vol, m * (byy - mean) + vol, m * bxy, m * (1.0 - mean) + vol])
             }
             Material::LinearElastic { lambda, mu, .. } => {
                 let exx = f[0][0] - 1.0;
@@ -124,6 +151,28 @@ mod tests {
         let g = 0.4;
         let st = m.cauchy(&[[1.0, g], [0.0, 1.0]]).unwrap();
         assert!(close(st[0], mu * g * g) && close(st[2], mu * g) && st[1].abs() < 1e-12 && st[3].abs() < 1e-12);
+    }
+
+    #[test]
+    fn decoupled_neo_hookean_limits() {
+        let m = Material::neo_hookean_decoupled(1000.0, 0.3, 1.0).unwrap();
+        let lin = Material::linear_elastic(1000.0, 0.3, 1.0).unwrap();
+        let (c, s) = (0.7_f64.cos(), 0.7_f64.sin());
+        assert!(m.cauchy(&[[c, -s], [s, c]]).unwrap().iter().all(|x| x.abs() < 1e-10));
+        // Small strain: the linear law.
+        let e = 1e-7;
+        let a = m.cauchy(&[[1.0 + e, 0.3 * e], [-0.2 * e, 1.0 - 0.5 * e]]).unwrap();
+        let b = lin.cauchy(&[[1.0 + e, 0.3 * e], [-0.2 * e, 1.0 - 0.5 * e]]).unwrap();
+        for k in 0..4 {
+            assert!((a[k] - b[k]).abs() < 1e-6 * 1000.0 * e, "{a:?} {b:?}");
+        }
+        // Equibiaxial in-plane stretch s, plane strain: J = s², σzz = μ J^(−5/3)(1 − (2s² + 1)/3) + κ (J − 1).
+        let st: f64 = 1.2;
+        let (l, mu, _) = m.constants();
+        let k = l + 2.0 * mu / 3.0;
+        let j = st * st;
+        let r = m.cauchy(&[[st, 0.0], [0.0, st]]).unwrap();
+        assert!(close(r[3], mu * j.powf(-5.0 / 3.0) * (1.0 - (2.0 * j + 1.0) / 3.0) + k * (j - 1.0)));
     }
 
     #[test]
