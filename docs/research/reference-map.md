@@ -168,6 +168,7 @@ keeps velocity and ξ at grid nodes for that reason.
 - **Cost vs FEM** for a solid alone: an RMT grid resolves the whole bounding box and needs a
   dynamic relaxation to reach a static answer; it is not a substitute for the FEM solver for
   statics, only a route to FSI with large solid motion.
+  §11 replaces the relaxation by a static solve; the FEM still wins.
 
 ## 7. The prototype and its verification
 
@@ -510,6 +511,203 @@ the two studies' own runs on one core):
 | static answer, γ × 0.5 against × 4 | 1 / 0.5 | −7.9 / −20.9 % (h = 1) | equal to 2e-5 (h = 1) | 0.00022 / 0.00041 % (h = 0.5) |
 | order of the surface stress | | none (σθ(a) does not converge) | 2.2 | 2.0–2.3 |
 | ms per step, h = 0.125 | | 9.8–13.8 | 34.4 | 26.6 |
+
+## 11. Statics without relaxation: Newton–Krylov with multigrid
+
+Dynamic relaxation needs a number of steps that grows as 1/h (the explicit step is bounded by
+h/c_P while the slowest mode's period is fixed), so its cost is O(n h⁻¹) = O(h⁻³) on n grid
+nodes: 661 s of CPU for the Lamé cylinder at h = 0.125. `Solid::solve_static`
+(`crates/eulerian/src/{statics,multigrid}.rs`) solves the equilibrium of the mapped boundary
+directly. In statics the reference map is the inverse motion, ξ(x) = X(x); nothing is advected.
+
+**The problem.** Unknowns: ζ = ξ − x at the body nodes that hold a control volume (a merged
+node moves with the node it joined). Residual R(ζ): the net force on every control volume of
+§10 (face fluxes of σ(F), the traction on the curved surface, the body force) at a load factor
+λ, with the surface values ζ_S solved from their traction conditions and the band refilled from
+the body inside every evaluation. R = 0 is exactly the rest state of the dynamic scheme.
+
+**The body depends on the unknown.** {φ₀(ξ) < 0} moves while Newton converges, so the unknown
+set and the cut structure change. Each linearisation and its line search *hold the topology*:
+the node kinds, which surface points carry values and how they are matched, the merged control
+volumes. With it held, crossings, areas, normals and surface values move continuously with ζ.
+A trial step that moves the surface across a node is judged on the rebuilt topology (a node
+that entered the body starts from its extrapolated ζ); the topology is also re-derived at
+every converged state, and convergence counts only when the two agree. The load is ramped by a
+load factor with a secant predictor; an increment whose Newton fails (line search below 1/64)
+is halved. The structure that depends only on the node kinds (cut-cell list, crossing edges,
+full-cell areas, face list, the band fill as a linear map) is built once per topology; a held
+evaluation recomputes only the near-surface geometry.
+
+**Rigid motions.** The four bodies are free in the plane. The equilibrium the relaxation reaches
+is R ∈ span(MΦ) (Φ: two translations and the rotation about the centre of mass; M: lumped
+masses), because the discrete net load drives a rigid drift. The solver measures QR with
+Q = I − MΦ(ΦᵀMΦ)⁻¹Φᵀ (inertia relief) and keeps updates free of rigid motion with
+P = I − Φ(ΦᵀMΦ)⁻¹ΦᵀM, so GMRES solves the consistent singular system QJP δ = −QR.
+
+**Jacobian: matrix-free (JFNK).** J v ≈ (R(ζ + εv) − R(ζ))/ε with ε‖v‖∞ = 10⁻⁷ h. The residual
+contains an implicit solve (the surface values), root finds (crossings, arc midpoints) and
+least-squares fits (the band); an analytic Jacobian would have to differentiate all of them,
+the surface values through the implicit function theorem, and follow every change of the
+discretisation. The difference quotient is the exact Jacobian's action at one residual
+evaluation per Krylov iteration, so Newton keeps its quadratic convergence; only the
+preconditioner needs a matrix, and an approximate one does. Krylov: restarted GMRES(60), right
+preconditioned (the operator is not symmetric near the surface), Eisenstat–Walker forcing
+(choice 2, η ≤ 10⁻²). Converged when ‖QR‖∞ ≤ 10⁻⁹ times the larger of the largest external
+force on a control volume and the largest force through a face.
+
+**Preconditioner.** A geometric V-cycle on Galerkin coarse operators A_{l+1} = Pᵀ A_l P over the
+grid hierarchy (every second node), point-block Gauss–Seidel (2 sweeps forward before, 2
+backward after), a dense LU on the coarsest level (≤ 400 nodes) bordered with the rigid
+motions. *Coarsening rule at the cut cells:* a coarse node is a coarse unknown when the fine
+node on it is a fine unknown, plus, for a fine unknown left without one among its bilinear
+parents, its parent of largest weight; each fine unknown interpolates from the parents it has,
+weights renormalised. Constants are reproduced everywhere, linear fields exactly in the
+interior and to O(h) at the surface, and P has full column rank. (Taking every parent of a fine
+unknown keeps linear fields exact but makes P rank deficient where several coarse nodes outside
+the body parent only the same cut-cell node: the first version's Galerkin operator had a fourth
+null vector and its coarse LU failed.) Geometric multigrid works at the cut cells; neither AMG
+nor ILU was needed. The fine matrix A₀ is a *ghost-cell* approximation of the Jacobian,
+assembled in O(n) without a residual evaluation: every face with solid on it carries the
+tangent of its compact-stencil flux (∂f/∂(∇ζ) by differences of the constitutive law) times its
+solid fraction, ζ at band nodes expanded through the band fill, and each dual cell's rows go to
+the control volumes holding its solid with their shares. Away from the surface that is the
+exact Jacobian; at the surface it ignores the cut geometry, the surface map and the surface
+values. The alternative implemented beside it probes the rows near the surface (2 s²
+residual evaluations perturbing one colour of unknowns at a time, s = 5 or 7, interior rows
+from the tangent). It is closer at the surface but costs 50–100 evaluations per build, and the
+ghost cells give the same iteration counts (table below), so they are the default.
+
+**Reuse.** The hierarchy is kept while the topology is unchanged, across Newton steps and load
+increments, and rebuilt when it is stale (GMRES needs more than twice the iterations it took
+when fresh). The factorised banded Jacobian of every surface chain is kept the same way, and
+the surface solve inside each residual evaluation becomes a chord iteration (refactorised when
+it contracts slowly). A kept hierarchy *adapted* to a changed topology (unknowns matched by
+node, new ones on their probed diagonal blocks) cost 45–225 GMRES iterations instead of about
+20 even for 12–19 new nodes, growing with 1/h, so a topology change always rebuilds; with the
+ghost-cell matrix a rebuild is cheap.
+
+Verification (static against relaxed; relaxed with the §10 settings and tolerance, then
+compared node by node; "non-rigid" removes the best-fit rigid motion of the difference, which
+the free relaxed body accumulates):
+
+| case | h | max \|ξ_static − ξ_relaxed\| | non-rigid | rigid drift | max \|u\| | body nodes differing |
+|---|---|---|---|---|---|---|
+| Lamé | 2 / 1 / 0.5 / 0.25 | 2.7e-7 / 7.7e-7 / 1.8e-6 / 5.8e-7 | 2.6e-7 / 7.7e-7 / 1.8e-6 / 5.3e-7 | ≤ 2e-8 | 9.1e-3 | 0 |
+| rotating disc | 2 / 1 / 0.5 / 0.25 | 4.3e-7 / 7.6e-7 / 1.8e-6 / 1.0e-6 | 2.6e-7 / 7.6e-7 / 1.8e-6 / 1.0e-6 | ≤ 2e-7 | 7.7e-3 | 0 |
+| Kirsch | 2 / 1 / 0.5 / 0.25 | 3.4e-7 / 7.8e-6 / 8.4e-6 / 9.8e-8 | 1.4e-7 / 1.6e-7 / 7.8e-8 / 8.7e-8 | up to 6e-6 | 1.0e-2 | 0 |
+| neo-Hookean, p = 8000 | 2 | 2.0e-2 | 9.9e-4 | 1.1e-2, turn 4.4e-4 | 0.79 | 0 |
+
+The differences fall with the relaxation's tolerance (Lamé, h = 1: 7.7e-7, 1.1e-7, 3.9e-9 for
+the tolerance × 1, 0.1, 0.01), so the static solution is the relaxation's limit; the tests
+(`crates/eulerian/tests/statics.rs`) check Lamé at h = 1 against a relaxation ten times
+tighter than §10's (max |Δu| below 10⁻⁴ of max |u|) and a finite homogeneous stretch to 10⁻⁹.
+
+Neo-Hookean cylinder (decoupled law, p = 8000, FEM u_r(a) = 0.815032), static solve:
+
+| h | 1 | 0.5 | 0.25 | 0.125 | 0.0625 |
+|---|---|---|---|---|---|
+| u_r(a) | 0.811736 | 0.814304 | 0.814869 | 0.814995 | 0.815024 |
+| error | −4.0e-3 | −8.9e-4 | −2.0e-4 | −4.5e-5 | −9.8e-6 |
+
+(observed order 2.1–2.2). The static/relaxed comparison of this case exists only at h = 2,
+and it is weak there: the relaxed body turned rigidly by 4.4e-4 rad and moved 1.1e-2, and a
+body turned on the grid has a discrete equilibrium that differs by about the discretisation
+error (the non-rigid difference, 1.3e-3 of u, is of that size at h = 2). The ramped relaxation
+(ten increments, at most 300 000 steps each) took 303 240 steps at h = 2 and had not finished
+at h = 1 after more than 20 min of CPU, so the finer grids are unverified against it; the
+static answers converge to the FEM's at second order instead.
+
+**Iterations** (one core, CPU s; N Newton steps; K GMRES iterations, mean and largest per step):
+
+| h | nodes | Lamé N / K | disc N / K | Kirsch N / K | NH N / K (increments) |
+|---|---|---|---|---|---|
+| 2 | 676 | 3 / 16, 25 | 3 / 17, 25 | 4 / 11, 15 | 10 / 14, 26 (3) |
+| 1 | 2601 | 4 / 13, 23 | 4 / 13, 21 | 3 / 15, 21 | 11 / 9, 20 (3) |
+| 0.5 | 10201 | 3 / 15, 22 | 3 / 15, 20 | 3 / 14, 21 | 12 / 10, 20 (3) |
+| 0.25 | 40401 | 3 / 15, 23 | 3 / 12, 20 | 3 / 14, 22 | 17 / 10, 24 (4) |
+| 0.125 | 160801 | 3 / 13, 18 | 3 / 14, 20 | 3 / 13, 19 | 20 / 10, 23 (4 + 1 failed) |
+| 0.0625 | 641601 | 4 / 12, 22 | 3 / 15, 22 | 3 / 11, 18 | 27 / 9, 19 (5 + 2 failed) |
+
+GMRES iterations to 10⁻⁸ on the first Newton system (Lamé; the other cases with the ghost-cell
+matrix within 20–28 at every h):
+
+| h | 2 | 1 | 0.5 | 0.25 | 0.125 | 0.0625 |
+|---|---|---|---|---|---|---|
+| unknown nodes | 236 | 928 | 3756 | 15044 | 60288 | 241264 |
+| multigrid, ghost-cell matrix (default) | 24 | 20 | 26 | 23 | 24 | 25 |
+| multigrid, probed matrix, s = 5 | 15 | 21 | 19 | 26 | 27 | 31 |
+| multigrid, probed matrix, s = 7 | 14 | 18 | 17 | 17 | 18 | 21 |
+| probed matrix as the operator (the V-cycle alone) | 11 | 20 | 17 | 22 | 22 | 25 |
+| no preconditioner | 181 | 360 | 756 | 3107 | – | – |
+
+GMRES counts per Newton step are h-independent, and so are the Newton counts of the
+linear-load cases; the neo-Hookean cylinder's total grows (10 → 27) because finer grids see
+more topology changes and failed increments during the ramp (about 5 Newton steps per accepted
+increment throughout). With the probed matrix the counts creep up with s = 5 (its lumping of
+the surface coupling) and much less with s = 7; the V-cycle alone on its own matrix creeps up
+slowly too (11 → 25), mostly from the coarse levels at the surface (a W-cycle gave 14, 14, 19
+at h = 1, 0.25, 0.0625; stopping the coarsening at about 240 instead of 60 nodes took h =
+0.0625 from 28 to 25).
+
+**Cost** (CPU s, one core, Apple M4 Max with other jobs running; the relaxation is the §10
+driver to its default tolerance):
+
+| h | Lamé static | relaxation | ratio | disc static | relaxation | Kirsch static | relaxation | NH static |
+|---|---|---|---|---|---|---|---|---|
+| 2 | 0.04 | 0.85 | 21 | 0.05 | 0.92 | 0.04 | 0.78 | 0.13 |
+| 1 | 0.09 | 3.6 | 40 | 0.10 | 4.4 | 0.09 | 3.9 | 0.24 |
+| 0.5 | 0.18 | 16.3 | 91 | 0.20 | 17.7 | 0.20 | 21.9 | 0.61 |
+| 0.25 | 0.56 | 102 | 182 | 0.46 | 105 | 0.54 | – | 2.5 |
+| 0.125 | 1.55 | 661 | 426 | 1.60 | – | 1.62 | – | 9.4 |
+| 0.0625 | 6.2 | – | | 5.6 | – | 5.0 | – | 37 |
+
+The static cost is O(n) = O(h⁻²): × 2.8 and × 4.0 per halving for Lamé, × 3.8 and × 4.0 for
+the neo-Hookean cylinder from h = 0.25; the relaxation is × 6.3 to × 6.5 per halving, O(h^−2.7)
+here (steps ∝ h⁻¹ times O(n) per step, the surface work making up the rest). The FEM still wins
+by orders of magnitude: the quad8 quarter reaches u_r(a) within 4e-5 on 4 × 8 elements in about
+1 ms; the static RMT matches that at h = 0.5 (§10's small-strain error) in 0.18 s, about 200 ×
+the FEM, and the bore stress to 0.3 % only from h = 0.25. The neo-Hookean cylinder takes the
+FEM 0.04–0.9 s (8 × 16 to 32 × 64); the static RMT 9.4 s at h = 0.125 for −4.5e-5.
+
+**Reuse, measured.** Keeping the surface chains' factorisations cuts the chain factorisations
+15–20 × and the traction evaluations 4–5 ×, about halving the cut-and-surface stage of an
+evaluation; with the ghost-cell matrix, keeping the hierarchy saves one build of two or three.
+Together they change the total by up to 20 % (Lamé h = 0.125: 1.40 s rebuilding everything,
+1.28 keeping the hierarchy, 1.46 keeping the LUs, 1.50 keeping both; the neo-Hookean cylinder:
+10.6, 10.2, 11.9, 9.1 s); the spread between runs of a different Newton path is as large. With
+the probed matrix (50 evaluations per build) keeping the hierarchy matters: Lamé 0.60 / 1.60 /
+5.38 s rebuilding against 0.46 / 1.32 / 4.01 s keeping it at h = 0.5 / 0.25 / 0.125 (−25 %),
+the neo-Hookean cylinder 6.1 / 10.4 / 63.8 s against 3.7 / 7.9 s at h = 0.5 / 0.25 (−25 to
+−40 %). The ghost-cell matrix made that reuse mostly unnecessary.
+
+**Where the time goes** (share of the solve at h = 0.125 / 0.0625): face forces (the interior's
+compact fluxes and the surface map at the cut faces) 26–37 %; V-cycles 15–24 %; the ghost-cell
+assembly and multigrid setup 15–24 %; the cut cells and surface solve 6–16 %, falling with h;
+topology rebuilds 4–8 % (16 % for the neo-Hookean cylinder, whose bore moves 6.5 cells at
+h = 0.125 and changes the topology 12–16 times); the rest is GMRES orthogonalisation and vector
+work. Every residual evaluation costs O(n) (interior fluxes) plus O(h⁻¹) with a large constant
+(the surface map, the cut cells, the surface solve), and a solve takes 40–60 of them for the
+linear cases and 120–310 for the neo-Hookean cylinder.
+
+Where it falls short:
+- **Not faster than the FEM.** The cost order is now that of the FEM's iterative solvers, but
+  the constant is not: a residual evaluation does the cut geometry, the surface solve and the
+  surface map, and a solve needs 40–300 of them. For a solid alone the FEM remains the tool; the
+  static solve matters for the RMT inside a fluid grid (an initial equilibrium, quasi-static
+  loading, an implicit solid step) and as a fast verification path.
+- **Finite strain.** The surface sweeps over nodes during the load ramp, so the topology changes
+  every few Newton steps (16 times at h = 0.0625) and each change rebuilds the preconditioner.
+  Right after such a change the line search sometimes stalls (step below 1/64 with ‖QR‖ flat),
+  most likely at surface points a node only just behind the surface (depth s → 0, map weights
+  ∝ 1/s); the increment is then halved (1–2 failures per solve at h ≤ 0.125). A surface stencil
+  that skips nodes too close to the surface would remove it, but changes the discretisation.
+- **The neo-Hookean cylinder is verified against the FEM, not against the relaxation**, below
+  h = 2 (the ramped relaxation did not finish at h = 1); the three linear-load cases are
+  verified against it to h = 0.25.
+- **Multigrid at the surface** is good, not perfect: the V-cycle alone creeps from 11 to 25
+  iterations over 1000 × more unknowns; GMRES absorbs it.
+- Not done: 3D, a held (Dirichlet) part beside the free bodies (supported, untested here beyond
+  the code path).
 
 ## Papers
 
