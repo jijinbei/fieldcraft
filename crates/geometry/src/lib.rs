@@ -35,6 +35,7 @@ pub use edges::{EDGE_TOLERANCE, Edge, Vertex};
 pub use features::{BodyFeatures, Curve, FeatureNode, ProfileGeometry, SketchGeometry};
 pub use partition::{Cut, CutReport};
 pub use virtual_faces::Merge;
+pub mod snapshot;
 pub mod tagged_mesh;
 #[cfg(feature = "scripts")]
 pub use script::{MAX_SCRIPT_BYTES, script_design};

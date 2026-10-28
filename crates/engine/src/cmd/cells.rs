@@ -333,7 +333,7 @@ fn cells(s: &mut Session, p: &Value) -> Result<Value> {
                 if let Some(o) = info.as_object_mut() {
                     o.insert("no_pyramids".into(), json!(why));
                 }
-                let t = mesh_body(Some(&design), &tet_params, input, &cdt, &tet_options, quality, true)?;
+                let t = mesh_body(Some(&design), &tet_params, input, &cdt, &tet_options, quality, true, &[])?;
                 add_tets(model, &t.name, &t.face_names, &t.mesh)?;
                 (t.mesh.kind, t.mesh.elements.len(), t.mesh.points.len())
             }
