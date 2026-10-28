@@ -111,12 +111,12 @@ pub(super) fn inputs<'a>(s: &'a Session, p: &Value) -> Result<Vec<Input<'a>>> {
                     hi[k] = hi[k].max(q[k]);
                 }
             }
-            // Faces named by index, as mesh.tet.generate names them.
-            let face_names = (0..t.faces).map(|f| f.to_string()).collect();
+            // Faces named by index, as mesh.tet.generate names them, unless the surface names them.
+            let face_names = if t.face_names.is_empty() { (0..t.faces).map(|f| f.to_string()).collect() } else { t.face_names.clone() };
             Ok(vec![Input {
                 name,
                 mesh: Cow::Borrowed(&t.mesh),
-                surfaces: Vec::new(),
+                surfaces: t.surfaces.iter().map(|f| f.map(analytic)).collect(),
                 face_names,
                 diagonal: diagonal(lo, hi),
                 seeds: Vec::new(),

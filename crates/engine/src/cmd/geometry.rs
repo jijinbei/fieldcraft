@@ -548,7 +548,8 @@ fn import_mesh(s: &mut Session, p: &Value) -> Result<Value> {
     }
     let bytes = super::file::read_file(&path, tagged_mesh::MAX_FILE_BYTES as u64)?;
     let source = SourceFile::of(super::file::absolute(&path), &bytes)?;
-    let surfaces = tagged_mesh::read_3mf(&bytes)?;
+    // EXPERIMENT: a SolidCraft exchange snapshot (JSON) reads as surfaces with face names and exact surfaces.
+    let surfaces = if bytes.first() == Some(&b'{') { fieldcraft_geometry::snapshot::read_snapshot(&bytes)? } else { tagged_mesh::read_3mf(&bytes)? };
     let first = s.surfaces.len();
     let added: Vec<Value> = surfaces
         .iter()

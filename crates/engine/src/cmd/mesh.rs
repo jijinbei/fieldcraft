@@ -292,12 +292,15 @@ pub(super) fn mesh_body(
     options: &QualityOptions,
     quality: bool,
     several: bool,
+    surface_surfaces: &[Option<fieldcraft_geometry::FaceSurface>],
 ) -> Result<BodyTets> {
+    // An imported surface's exact faces, when it carries them (a SolidCraft exchange snapshot).
+    let surface_analytic: Vec<Option<AnalyticSurface>> = surface_surfaces.iter().map(|f| f.map(analytic_surface)).collect();
     let mesh = || -> Result<BodyTets> {
         // The exact faces of a design body; an imported surface keeps to its triangles.
         let analytic = match p.get("surface") {
             None => design.and_then(|d| d.body(&input.name)).map(analytic_surfaces).unwrap_or_default(),
-            Some(_) => Vec::new(),
+            Some(_) => surface_analytic.clone(),
         };
         fieldcraft_model::progress::stage(&format!("{}: boundary", input.name), None, "");
         // The mesh depends on the geometry only, not on the order the kernel lists it in.
@@ -350,10 +353,14 @@ fn tet_generate(s: &mut Session, p: &Value) -> Result<Value> {
     let inputs = super::hex::inputs(s, p)?;
     let sizing = super::sizes::sizing(s)?;
     let several = inputs.len() > 1;
+    let exact = match p.get("surface") {
+        Some(_) => super::hex::surface(s, p)?.1.surfaces.clone(),
+        None => Vec::new(),
+    };
     let mut meshed = Vec::with_capacity(inputs.len());
     for input in inputs {
         let options = sizing.tet_options(&input.name, p, &options);
-        meshed.push(mesh_body(s.design.as_deref(), p, input, &cdt_options, &options, quality, several)?);
+        meshed.push(mesh_body(s.design.as_deref(), p, input, &cdt_options, &options, quality, several, &exact)?);
     }
 
     // Replace the bodies' meshes (replace.rs); other bodies and the definitions stay.
@@ -1142,7 +1149,7 @@ mod tests {
             SurfaceMesh { positions: p.clone(), triangles: t.clone(), tri_face: vec![0, 1, 1, 1], weld_distance: 0.0, ..SurfaceMesh::default() };
         let open = SurfaceMesh { positions: p, triangles: t[..3].to_vec(), tri_face: vec![0, 1, 1], weld_distance: 0.0, ..SurfaceMesh::default() };
         for mesh in [tet, open] {
-            s.surfaces.push(Arc::new(TaggedSurface { name: "Tet".into(), mesh, faces: 2, original: None }));
+            s.surfaces.push(Arc::new(TaggedSurface { name: "Tet".into(), mesh, faces: 2, original: None, ..TaggedSurface::default() }));
         }
         let r = s.execute("mesh.surface.check", &json!({"surface": 0, "feature_angle": 180})).unwrap();
         assert_eq!((r["valid"].clone(), r["feature_edges"].clone()), (json!(true), json!({"face_boundary": 3, "sharp": 0})));
@@ -1375,7 +1382,7 @@ mod tests {
         let open = SurfaceMesh { positions: p, triangles: t[..3].to_vec(), tri_face: vec![0, 1, 1], weld_distance: 0.0, ..SurfaceMesh::default() };
         let mut s = Session::default();
         for mesh in [tet, open] {
-            s.surfaces.push(Arc::new(TaggedSurface { name: "Tet".into(), mesh, faces: 2, original: None }));
+            s.surfaces.push(Arc::new(TaggedSurface { name: "Tet".into(), mesh, faces: 2, original: None, ..TaggedSurface::default() }));
         }
         let r = s.execute("mesh.tet.generate", &json!({"surface": 0, "quality": false})).unwrap();
         assert_eq!((r["elements"].clone(), r["nodes"].clone(), r["boundary_faces"].clone()), (json!(1), json!(4), json!(4)));
@@ -1408,7 +1415,7 @@ mod tests {
         let originals = [seam, flipped];
         let mut s = Session::default();
         for mesh in &originals {
-            s.surfaces.push(Arc::new(TaggedSurface { name: "Cube".into(), mesh: mesh.clone(), faces: 6, original: None }));
+            s.surfaces.push(Arc::new(TaggedSurface { name: "Cube".into(), mesh: mesh.clone(), faces: 6, original: None, ..TaggedSurface::default() }));
         }
         s.execute("model.units", &json!({"system": "in-lbf-s-psi"})).unwrap();
         let params = json!({"surface": 0, "quality": false});
