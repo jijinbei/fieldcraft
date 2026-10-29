@@ -281,10 +281,16 @@ pub fn run_case(dir: &Path, expected: &Expected) -> Result<Vec<Result<f64, Strin
         session.design = Some(Arc::new(opened));
     }
     let recipe = read_json(&dir.join("recipe.json"))?;
+    run_recipe(&mut session, &recipe, expected)
+}
+
+/// Run a recipe in a session already holding its geometry and measure the case's quantities.
+pub fn run_recipe(session: &mut Session, recipe: &Value, expected: &Expected) -> Result<Vec<Result<f64, String>>, String> {
+    let recipe = recipe.clone();
     let results = session.run_script(&recipe).map_err(|e| format!("recipe.json: {e}"))?;
     let outputs: BTreeMap<String, Value> =
         recipe.as_array().into_iter().flatten().zip(results).filter_map(|(step, out)| Some((step.get("id")?.as_str()?.to_string(), out))).collect();
-    Ok(expected.quantities.iter().map(|q| measure(&mut session, &outputs, &q.measure)).collect())
+    Ok(expected.quantities.iter().map(|q| measure(session, &outputs, &q.measure)).collect())
 }
 
 /// Read one number: from a recipe step's output (`"from": id`) or a command run now
