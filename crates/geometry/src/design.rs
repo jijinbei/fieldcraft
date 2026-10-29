@@ -1,20 +1,23 @@
 //! Opening SolidCraft designs (`.solidcraft`): read the design, rebuild its parametric timeline
-//! with SolidCraft, and hand back its bodies with persistent face names.
+//! with SolidCraft (through its exchange crate), and hand back its bodies with persistent face
+//! names.
 //!
 //! The design is rebuilt from its authoritative inputs (sketches, features, parameters); cached
 //! display meshes in the file are never used. [`open_design`] takes the file's bytes (reading
 //! files is `fieldcraft_io::fs`'s job, which in the browser holds the page's files).
 
-use solidcraft_doc::{Document, Model, naming};
-use solidcraft_kernel::{KernelError, guard};
+use std::sync::Arc;
 
+use solidcraft_exchange::{Edit, Tolerance};
+
+use crate::source::{DesignSource, Source};
 use crate::{Face, Result, Shape};
 
 /// The grid centres are matched on, relative to their spread.
 const GRID: f64 = 1e-6; // unit-factors: relative to the spread
 
 /// Largest design file opened (SolidCraft's own limit).
-pub const MAX_DESIGN_BYTES: usize = solidcraft_io::MAX_DESIGN_BYTES;
+pub const MAX_DESIGN_BYTES: usize = solidcraft_exchange::MAX_DESIGN_BYTES;
 
 /// A rebuilt design.
 #[derive(Debug, Clone)]
@@ -65,20 +68,10 @@ fn quoted(bodies: &[String]) -> String {
     }
 }
 
-/// The bodies of `bodies` that `feature` names anywhere in its saved form (targets, tools,
-/// selections); all of them when it names none.
-fn bodies_of(feature: Option<&solidcraft_doc::Feature>, bodies: &[Shape]) -> Vec<String> {
-    fn strings<'a>(v: &'a serde_json::Value, out: &mut Vec<&'a str>) {
-        match v {
-            serde_json::Value::String(s) => out.push(s),
-            serde_json::Value::Array(a) => a.iter().for_each(|v| strings(v, out)),
-            serde_json::Value::Object(o) => o.values().for_each(|v| strings(v, out)),
-            _ => {}
-        }
-    }
-    let value = feature.and_then(|f| serde_json::to_value(f).ok()).unwrap_or_default();
-    let mut named = Vec::new();
-    strings(&value, &mut named);
+/// The bodies of `bodies` that `feature` names (the bodies it changes, makes or made faces of);
+/// all of them when it names none.
+fn bodies_of(feature: Option<&solidcraft_exchange::Feature>, bodies: &[Shape]) -> Vec<String> {
+    let named: Vec<&str> = feature.map(|f| f.bodies.iter().chain(&f.creates).map(|b| b.as_ref()).collect()).unwrap_or_default();
     let hit: Vec<String> = bodies.iter().filter(|b| named.contains(&b.name.as_str())).map(|b| b.name.clone()).collect();
     if hit.is_empty() { bodies.iter().map(|b| b.name.clone()).collect() } else { hit }
 }
@@ -105,17 +98,16 @@ impl Design {
 }
 
 /// The newest design format the pinned SolidCraft reads (and the one it writes).
-pub const DESIGN_FORMAT: u32 = solidcraft_doc::format::FORMAT;
+pub const DESIGN_FORMAT: u32 = solidcraft_exchange::DESIGN_FORMAT;
 
 /// Open a design from its file bytes (a `.solidcraft` container or a JSON design) and rebuild it.
 /// A design of a newer format than [`DESIGN_FORMAT`] is [`crate::Error::NewerDesign`].
 pub fn open_design(bytes: &[u8]) -> Result<Design> {
-    let doc = guard("read design", || solidcraft_io::read_design(bytes).map_err(|e| KernelError::Invalid(format!("not a readable design: {e}"))))
-        .map_err(|e| match saved_format(bytes) {
-            Some(format) if format > DESIGN_FORMAT => crate::Error::NewerDesign { format, reads: DESIGN_FORMAT },
-            _ => e.into(),
-        })?;
-    rebuild(&doc)
+    let design = solidcraft_exchange::open(bytes).map_err(|e| match saved_format(bytes) {
+        Some(format) if format > DESIGN_FORMAT => crate::Error::NewerDesign { format, reads: DESIGN_FORMAT },
+        _ => crate::Error::Invalid(format!("not a readable design: {e}")),
+    })?;
+    rebuild(&DesignSource::new(design), &Arc::new(Vec::new()))
 }
 
 /// The format a design file says it has (`"format": "solidcraft/N"`), in a JSON design or in a
@@ -130,7 +122,7 @@ fn saved_format(bytes: &[u8]) -> Option<u32> {
     if bytes.len() > MAX_DESIGN_BYTES {
         return None;
     }
-    let json = if solidcraft_io::is_design_container(bytes) {
+    let json = if bytes.starts_with(b"PK\x03\x04") {
         let mut zip = zip::ZipArchive::new(std::io::Cursor::new(bytes)).ok()?;
         let mut out = Vec::new();
         zip.by_name("document.json").ok()?.take(MAX_DESIGN_BYTES as u64).read_to_end(&mut out).ok()?;
@@ -139,47 +131,37 @@ fn saved_format(bytes: &[u8]) -> Option<u32> {
         std::borrow::Cow::Borrowed(bytes)
     };
     let head: Head = serde_json::from_slice(&json).ok()?;
-    solidcraft_doc::format::version_of(&head.format)
+    head.format.strip_prefix("solidcraft/")?.parse().ok()
 }
 
-/// Rebuild an in-memory document (the design half of [`open_design`]).
-pub(crate) fn rebuild(doc: &Document) -> Result<Design> {
-    let model = guard("rebuild design", || {
-        let mut m = Model::new();
-        m.evaluate(doc);
-        Ok(m)
-    })?;
+/// The design `source` with `edits` applied, evaluated (the design half of [`open_design`]).
+pub(crate) fn rebuild(source: &Arc<DesignSource>, edits: &Arc<Vec<Edit>>) -> Result<Design> {
+    let snapshot = source.snapshot(edits, None, Tolerance::Relative(crate::source::INFO_TOLERANCE), false)?;
     let history = crate::features::History {
-        doc: doc.clone(),
-        state: model.state(),
-        errors: model.results.iter().filter(|r| !r.skipped).filter_map(|r| Some((r.id, r.error.clone()?))).collect(),
+        source: Arc::clone(source),
+        edits: Arc::clone(edits),
+        features: snapshot.features.clone(),
+        errors: snapshot.failures.iter().map(|f| (f.feature.0, f.message.clone())).collect(),
     };
     // Placed in the world: a component's bodies through every occurrence of it (an instance is a
     // body of its own, named after its occurrence path), as SolidCraft displays and exports them.
-    let state = guard("place components", || Ok(solidcraft_doc::world_state(doc, &model.state())))?;
-    let mut bodies = Vec::with_capacity(state.bodies.len());
-    for b in &state.bodies {
-        let faces = guard("name faces", || {
-            let names = naming::face_names(b);
-            Ok(names
-                .iter()
-                .enumerate()
-                .map(|(i, name)| Face { name: name.clone(), exact: naming::face_name_exact(b, i), members: Vec::new() })
-                .collect())
-        })?;
-        bodies.push(Shape { name: b.name.clone(), body: b.body.clone(), faces, face_map: Vec::new(), cuts: Vec::new() });
-    }
+    let mut bodies: Vec<Shape> = snapshot
+        .bodies
+        .iter()
+        .map(|b| Shape {
+            name: b.name.0.clone(),
+            source: Source::Design { design: Arc::clone(source), edits: Arc::clone(edits), body: b.name.0.clone() },
+            faces: b.faces.iter().map(|f| Face { name: f.name.0.clone(), exact: !f.inferred, members: Vec::new() }).collect(),
+            face_map: Vec::new(),
+            cuts: Vec::new(),
+        })
+        .collect();
     // A feature that failed leaves a different solid than SolidCraft's: each one names the bodies
     // it would have changed, so opening never hands back a silently different solid.
-    let errors: Vec<FeatureError> = model
-        .results
+    let errors: Vec<FeatureError> = snapshot
+        .failures
         .iter()
-        .filter(|r| !r.skipped)
-        .filter_map(|r| {
-            let message = r.error.clone()?;
-            let bodies = bodies_of(doc.features.iter().find(|f| f.id == r.id), &bodies);
-            Some(FeatureError { feature: r.name.clone(), message, bodies })
-        })
+        .map(|f| FeatureError { feature: f.name.clone(), message: f.message.clone(), bodies: bodies_of(snapshot.feature(f.feature), &bodies) })
         .collect();
     // The errors name the bodies as SolidCraft does; they follow the pieces' new names.
     let renamed = number_split_bodies(&mut bodies);
@@ -195,7 +177,7 @@ pub(crate) fn rebuild(doc: &Document) -> Result<Design> {
         })
         .collect();
     Ok(Design {
-        name: doc.name.clone(),
+        name: snapshot.design.clone(),
         source: std::sync::Arc::new(bodies.clone()),
         opened: std::sync::Arc::new(bodies.clone()),
         bodies,

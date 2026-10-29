@@ -1499,9 +1499,9 @@ dependencies = [
  "serde_json",
  "solidcraft-doc",
  "solidcraft-engine",
+ "solidcraft-exchange",
  "solidcraft-geom",
  "solidcraft-io",
- "solidcraft-kernel",
  "thiserror 2.0.21",
  "zip",
 ]
@@ -2443,7 +2443,6 @@ checksum = "f9f8bd3e56ce4dfc153cf470fffbfa98c7620958b312ca5c3a4b8d5181fd13c6"
 [[package]]
 name = "matext4cgmath"
 version = "0.1.0"
-source = "git+https://github.com/tangency-labs/solidcraft?rev=37a586dd61d4873842604c2036c05a2890e7d773#37a586dd61d4873842604c2036c05a2890e7d773"
 dependencies = [
  "cgmath",
  "katexit",
@@ -4188,8 +4187,7 @@ dependencies = [
 
 [[package]]
 name = "solidcraft-derive"
-version = "0.25.1"
-source = "git+https://github.com/tangency-labs/solidcraft?rev=37a586dd61d4873842604c2036c05a2890e7d773#37a586dd61d4873842604c2036c05a2890e7d773"
+version = "0.26.1"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -4198,8 +4196,7 @@ dependencies = [
 
 [[package]]
 name = "solidcraft-doc"
-version = "0.25.1"
-source = "git+https://github.com/tangency-labs/solidcraft?rev=37a586dd61d4873842604c2036c05a2890e7d773#37a586dd61d4873842604c2036c05a2890e7d773"
+version = "0.26.1"
 dependencies = [
  "log",
  "serde",
@@ -4216,8 +4213,7 @@ dependencies = [
 
 [[package]]
 name = "solidcraft-engine"
-version = "0.25.1"
-source = "git+https://github.com/tangency-labs/solidcraft?rev=37a586dd61d4873842604c2036c05a2890e7d773#37a586dd61d4873842604c2036c05a2890e7d773"
+version = "0.26.1"
 dependencies = [
  "image",
  "log",
@@ -4237,9 +4233,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "solidcraft-exchange"
+version = "0.26.1"
+dependencies = [
+ "serde",
+ "serde_json",
+ "solidcraft-doc",
+ "solidcraft-geom",
+ "solidcraft-io",
+ "solidcraft-kernel",
+ "thiserror 2.0.21",
+]
+
+[[package]]
 name = "solidcraft-geom"
-version = "0.25.1"
-source = "git+https://github.com/tangency-labs/solidcraft?rev=37a586dd61d4873842604c2036c05a2890e7d773#37a586dd61d4873842604c2036c05a2890e7d773"
+version = "0.26.1"
 dependencies = [
  "serde",
  "thiserror 2.0.21",
@@ -4247,8 +4255,7 @@ dependencies = [
 
 [[package]]
 name = "solidcraft-io"
-version = "0.25.1"
-source = "git+https://github.com/tangency-labs/solidcraft?rev=37a586dd61d4873842604c2036c05a2890e7d773#37a586dd61d4873842604c2036c05a2890e7d773"
+version = "0.26.1"
 dependencies = [
  "cadmpeg-core",
  "cadmpeg-ir",
@@ -4272,8 +4279,7 @@ dependencies = [
 
 [[package]]
 name = "solidcraft-kernel"
-version = "0.25.1"
-source = "git+https://github.com/tangency-labs/solidcraft?rev=37a586dd61d4873842604c2036c05a2890e7d773#37a586dd61d4873842604c2036c05a2890e7d773"
+version = "0.26.1"
 dependencies = [
  "log",
  "rayon",
@@ -4292,8 +4298,7 @@ dependencies = [
 
 [[package]]
 name = "solidcraft-render"
-version = "0.25.1"
-source = "git+https://github.com/tangency-labs/solidcraft?rev=37a586dd61d4873842604c2036c05a2890e7d773#37a586dd61d4873842604c2036c05a2890e7d773"
+version = "0.26.1"
 dependencies = [
  "image",
  "moxcms",
@@ -4306,13 +4311,14 @@ dependencies = [
 
 [[package]]
 name = "solidcraft-sketch"
-version = "0.25.1"
-source = "git+https://github.com/tangency-labs/solidcraft?rev=37a586dd61d4873842604c2036c05a2890e7d773#37a586dd61d4873842604c2036c05a2890e7d773"
+version = "0.26.1"
 dependencies = [
+ "harfrust",
  "serde",
  "solidcraft-geom",
  "thiserror 2.0.21",
  "ttf-parser",
+ "unicode-bidi",
 ]
 
 [[package]]
@@ -4645,7 +4651,6 @@ dependencies = [
 [[package]]
 name = "truck-geometry"
 version = "0.5.0"
-source = "git+https://github.com/tangency-labs/solidcraft?rev=37a586dd61d4873842604c2036c05a2890e7d773#37a586dd61d4873842604c2036c05a2890e7d773"
 dependencies = [
  "serde",
  "thiserror 1.0.69",
@@ -4669,7 +4674,6 @@ dependencies = [
 [[package]]
 name = "truck-meshalgo"
 version = "0.4.0"
-source = "git+https://github.com/tangency-labs/solidcraft?rev=37a586dd61d4873842604c2036c05a2890e7d773#37a586dd61d4873842604c2036c05a2890e7d773"
 dependencies = [
  "array-macro",
  "derive_more",
@@ -4720,7 +4724,6 @@ dependencies = [
 [[package]]
 name = "truck-shapeops"
 version = "0.4.0"
-source = "git+https://github.com/tangency-labs/solidcraft?rev=37a586dd61d4873842604c2036c05a2890e7d773#37a586dd61d4873842604c2036c05a2890e7d773"
 dependencies = [
  "derive_more",
  "itertools 0.13.0",
@@ -4735,7 +4738,6 @@ dependencies = [
 [[package]]
 name = "truck-stepio"
 version = "0.3.0"
-source = "git+https://github.com/tangency-labs/solidcraft?rev=37a586dd61d4873842604c2036c05a2890e7d773#37a586dd61d4873842604c2036c05a2890e7d773"
 dependencies = [
  "chrono",
  "truck-geometry",
@@ -4803,6 +4805,12 @@ dependencies = [
  "tempfile",
  "windows-sys 0.61.2",
 ]
+
+[[package]]
+name = "unicode-bidi"
+version = "0.3.18"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5c1cb5db39152898a79168971543b1cb5020dff7fe43c8dc468b0885f5e29df5"
 
 [[package]]
 name = "unicode-general-category"

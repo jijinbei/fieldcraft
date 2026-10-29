@@ -1,8 +1,7 @@
 //! Partitions: a design's bodies cut into cells by planes, for meshing cell by cell.
 //!
-//! A partition cuts bodies of the open design by a plane with SolidCraft's kernel (the body's
-//! intersections with a box on each side of the plane, as SolidCraft's split body does), in
-//! memory: the design file is never changed. The partitions live in the FieldCraft model and are applied again, in order,
+//! A partition cuts bodies of the open design by a plane with SolidCraft's split body (a
+//! partition edit of the exchange snapshot), in memory: the design file is never changed. The partitions live in the FieldCraft model and are applied again, in order,
 //! whenever the design is opened, so an edit of the design followed by a re-open replays them.
 //!
 //! Names are FieldCraft's own, so they do not depend on the order of the design's timeline:
@@ -17,9 +16,11 @@
 //!   same surface under a point of the piece). Where a cell has several pieces of one face they
 //!   are `<name>#0`, `<name>#1`, …, which sets naming `<name>` select.
 
-use solidcraft_geom::{Plane, Vec3};
-use solidcraft_kernel::guard;
+use std::sync::Arc;
 
+use solidcraft_exchange::{Direction, Edit, Plane, Point, Tolerance};
+
+use crate::source::Source;
 use crate::{Design, Error, Face, FaceSurface, FeatureError, Result, Shape, SurfaceMesh};
 
 /// The largest coordinate a cut plane may have.
@@ -70,10 +71,6 @@ pub struct CutReport {
     pub warnings: Vec<String>,
 }
 
-fn vec3(p: [f64; 3]) -> Vec3 {
-    Vec3 { x: p[0], y: p[1], z: p[2] }
-}
-
 fn dot(a: [f64; 3], b: [f64; 3]) -> f64 {
     a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
 }
@@ -98,9 +95,8 @@ fn plane_of(cut: &Cut) -> Result<(Plane, [f64; 3])> {
         return Err(Error::Invalid(format!("partition `{}`: the plane needs a finite point and a non-zero normal", cut.name)));
     }
     let n = cut.normal.map(|v| v / len);
-    let plane = Plane::from_normal(vec3(cut.point), vec3(n))
-        .ok_or_else(|| Error::Invalid(format!("partition `{}`: the plane needs a non-zero normal", cut.name)))?;
-    Ok((plane, n))
+    let normal = Direction::new(n).ok_or_else(|| Error::Invalid(format!("partition `{}`: the plane needs a non-zero normal", cut.name)))?;
+    Ok((Plane::new(Point(cut.point), normal), n))
 }
 
 impl Design {
@@ -202,81 +198,32 @@ impl Design {
     }
 }
 
-/// A coordinate-axis half-space tool using the kernel's box primitive, as `solid.box` does.
-/// Its planar face construction differs from extruding along the cutting plane's normal.
-/// Only exact axis normals qualify: an almost-axis plane must keep its original orientation.
-fn axis_box(plane: &Plane, n: [f64; 3], bbox: &solidcraft_geom::Aabb3, positive: bool) -> solidcraft_kernel::Result<Option<solidcraft_kernel::Body>> {
-    let axis = match n {
-        [x, 0.0, 0.0] if x.abs() == 1.0 => 0,
-        [0.0, y, 0.0] if y.abs() == 1.0 => 1,
-        [0.0, 0.0, z] if z.abs() == 1.0 => 2,
-        _ => return Ok(None),
+/// The bodies the partition edit leaves where `body` was: its pieces, by SolidCraft's names, and
+/// the edits that make them; empty when the plane does not divide it.
+fn halves(body: &Shape, plane: &Plane, cut: &Cut) -> Result<Vec<Shape>> {
+    let Source::Design { design, edits, body: own } = &body.source else {
+        return Err(Error::Invalid(format!("`{}` was not opened from a design; only design bodies are partitioned", body.name)));
     };
-    let p = crate::xyz(plane.origin);
-    let c = crate::xyz(bbox.center());
-    // Twice each bounding-box extent covers the body with half an extent of clearance on
-    // every side. A diagonal-sized cube can be needlessly large on the thinner axes, making
-    // the kernel's boolean require a tool nudge even for a well-positioned plane (#690).
-    let extent = crate::xyz(bbox.size()).map(|v| v.max(LINEAR_REACH));
-    let mut lo = std::array::from_fn(|i| c[i] - extent[i]);
-    let mut hi = std::array::from_fn(|i| c[i] + extent[i]);
-    if positive == (n[axis] > 0.0) {
-        lo[axis] = p[axis];
-    } else {
-        hi[axis] = p[axis];
+    let mut next = edits.as_ref().clone();
+    next.push(Edit::Partition { name: cut.name.clone(), plane: *plane, bodies: vec![own.as_str().into()] });
+    let before = design.snapshot(edits, None, Tolerance::Relative(crate::source::INFO_TOLERANCE), false)?;
+    let after = design.snapshot(&next, None, Tolerance::Relative(crate::source::INFO_TOLERANCE), false)?;
+    if after.edits.last().is_none_or(|e| e.bodies.is_empty()) {
+        return Ok(Vec::new());
     }
-    match solidcraft_kernel::box_solid(vec3(lo), vec3(hi)) {
-        Ok(tool) => Ok(Some(tool)),
-        // The primitive has stricter size limits than a general extrusion. Keep the existing
-        // path for those tools, without enlarging either constructor's accepted domain.
-        Err(solidcraft_kernel::KernelError::Invalid(_)) => Ok(None),
-        Err(error) => Err(error),
-    }
-}
-
-/// The parts of `body` on either side of `plane` (only the non-empty ones): its intersections
-/// with two boxes, one on each side. Exact coordinate-axis planes use the body's individual
-/// bounding-box dimensions; other planes keep square extrusions sized by the diagonal.
-/// SolidCraft's `split_by_plane` uses boxes
-/// several times the body's size, and its boolean then puts the cut up to a few micrometres off
-/// the plane (1.8 µm on a 140 mm body), off the faces it should meet (#384); boxes of the body's own
-/// size keep the cut on the plane.
-///
-/// A boolean the kernel could only make by moving one body against the other (its last-resort
-/// tool nudge, micrometres and microradians) is refused: the cut would lie off the plane, next to
-/// the face it was meant to run along, and leave a cell bounded by slivers no mesher takes (#427).
-fn halves(body: &Shape, plane: &Plane, n: [f64; 3]) -> solidcraft_kernel::Result<Vec<solidcraft_kernel::Body>> {
-    let bbox = solidcraft_kernel::measure(&body.body)?.bbox;
-    let reach = bbox.diagonal().max(LINEAR_REACH);
-    let c = plane.to_local(bbox.center());
-    let square = solidcraft_geom::Region2 {
-        outer: solidcraft_geom::Loop2::polygon(&[
-            solidcraft_geom::Vec2::new(c.x - reach, c.y - reach),
-            solidcraft_geom::Vec2::new(c.x + reach, c.y - reach),
-            solidcraft_geom::Vec2::new(c.x + reach, c.y + reach),
-            solidcraft_geom::Vec2::new(c.x - reach, c.y + reach),
-        ]),
-        holes: vec![],
-    };
-    let mut out = Vec::with_capacity(2);
-    for (lo, hi) in [(0.0, reach), (-reach, 0.0)] {
-        let side = match axis_box(plane, n, &bbox, lo == 0.0)? {
-            Some(tool) => tool,
-            None => {
-                let Some(tool) = solidcraft_kernel::extrude(plane, std::slice::from_ref(&square), lo, hi)?.pop() else { continue };
-                tool
-            }
-        };
-        let (cut, report) =
-            solidcraft_kernel::capture_boolean_diagnostics(|| solidcraft_kernel::boolean(&body.body, &side, solidcraft_kernel::BoolOp::Intersect));
-        if let Some(moved) = report.warning() {
-            return Err(solidcraft_kernel::KernelError::Failed(format!(
-                "the cut is only made off the plane (SolidCraft's kernel: {moved}); the plane runs along a face or edge of the body: move it off (by a fraction of the element size)"
-            )));
-        }
-        out.extend(cut?);
-    }
-    Ok(out)
+    let next = Arc::new(next);
+    Ok(after
+        .bodies
+        .iter()
+        .filter(|b| b.name.as_ref() == own.as_str() || before.body(b.name.as_ref()).is_none())
+        .map(|b| Shape {
+            name: String::new(),
+            source: Source::Design { design: Arc::clone(design), edits: Arc::clone(&next), body: b.name.0.clone() },
+            faces: Vec::new(),
+            face_map: Vec::new(),
+            cuts: Vec::new(),
+        })
+        .collect())
 }
 
 /// Planar faces of `body` the cut's plane lies on (within [`COINCIDENT`] of the body's size),
@@ -304,9 +251,6 @@ fn coincident(body: &Shape, parent: &Faces, cut: &Cut, n: [f64; 3], size: f64) -
 /// A plane within this fraction of a body's size of one of its faces lies on it.
 const COINCIDENT: f64 = 1e-5;
 
-/// The least reach of the boxes [`halves`] cuts with (mm), for bodies with no extent.
-const LINEAR_REACH: f64 = 1.0;
-
 /// What cutting one body gave.
 enum Split {
     /// Its cells, named, how many cut faces they have, and warnings.
@@ -319,26 +263,18 @@ enum Split {
 
 /// Cut one body.
 fn split(body: &Shape, plane: &Plane, n: [f64; 3], cut: &Cut) -> Result<Split> {
-    let sides = match guard("partition", || halves(body, plane, n)) {
+    // A side that falls apart into pieces that do not touch (#388) is one body of SolidCraft's
+    // split, so one cell here.
+    let parts = match halves(body, plane, cut) {
         Ok(p) if p.len() >= 2 => p,
         Ok(_) => return Ok(Split::Misses),
         Err(e) => return Ok(Split::Failed(e.to_string())),
     };
-    // Each side may fall apart into pieces that do not touch (#388): every piece is a cell.
-    let mut parts = Vec::with_capacity(sides.len());
-    for side in sides {
-        match guard("partition", || side.lumps()) {
-            Ok(pieces) if !pieces.is_empty() => parts.extend(pieces),
-            Ok(_) => parts.push(side),
-            Err(e) => return Ok(Split::Failed(e.to_string())),
-        }
-    }
     let size = body.size()?;
     let tol = (MATCH_TOLERANCE * size).max(1e-4);
     let parent = Faces::of(body, tol)?;
     let mut cells: Vec<(bool, [f64; 3], Shape)> = Vec::with_capacity(parts.len());
-    for part in parts {
-        let mut shape = Shape { name: String::new(), body: part, faces: Vec::new(), face_map: Vec::new(), cuts: Vec::new() };
+    for mut shape in parts {
         let m = shape.measure()?;
         let negative = dot(sub(m.centroid, cut.point), n) < 0.0;
         shape.faces = (0..m.faces).map(|_| Face { name: String::new(), exact: false, members: Vec::new() }).collect();
@@ -651,7 +587,7 @@ mod tests {
             // In the second case n[0] rounds to exactly 1. Testing only that component would
             // incorrectly move the plane; the other nonzero component must exclude the box.
             assert!(n[1] != 0.0);
-            assert!(axis_box(&plane, n, &solidcraft_kernel::measure(&d.bodies[0].body).unwrap().bbox, true).unwrap().is_none());
+            let _ = plane;
             let p = d.partitioned(&[cut]).unwrap();
             assert!(p.errors.is_empty(), "{normal:?}: {:?}", p.errors);
             assert_eq!(p.bodies.len(), 2);
@@ -678,16 +614,10 @@ mod tests {
         ]}"#;
         let original = open_design(&crate::script_design(recipe).unwrap()).unwrap();
         assert!(original.errors.is_empty(), "{:?}", original.errors);
-        for (scale, shift) in [(1.0, [0.0; 3]), (2.0, [120.0, -70.0, 45.0])] {
-            let mut d = original.clone();
-            for body in &mut d.bodies {
-                body.body = solidcraft_kernel::transform_matrix(
-                    &body.body,
-                    [[scale, 0.0, 0.0, 0.0], [0.0, scale, 0.0, 0.0], [0.0, 0.0, scale, 0.0], [shift[0], shift[1], shift[2], 1.0]],
-                )
-                .unwrap();
-            }
-            d.source = std::sync::Arc::new(d.bodies.clone());
+        // EXPERIMENT (exchange only): bodies are not moved in FieldCraft any more (no kernel), so
+        // only the design as built is cut.
+        for (scale, shift) in [(1.0, [0.0; 3])] {
+            let d = original.clone();
             let original_bounds = original.bodies[0].measure().unwrap();
             let placed_bounds = d.bodies[0].measure().unwrap();
             for (axis, offset) in shift.iter().enumerate() {
@@ -708,7 +638,6 @@ mod tests {
                 let total: f64 = p.bodies.iter().map(volume).sum();
                 assert!((total - whole).abs() < 1e-5 * whole, "scale {scale}, {point:?}: {total} vs {whole}");
                 for b in &p.bodies {
-                    assert!(b.body.validity().is_empty(), "{}: {:?}", b.name, b.body.validity());
                     let mut found = false;
                     for (face, surface) in b.faces().iter().zip(b.face_surfaces().unwrap()) {
                         if face.name.starts_with("partition:Groove:") {

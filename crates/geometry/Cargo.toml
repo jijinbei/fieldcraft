@@ -1,6 +1,6 @@
 [package]
 name = "fieldcraft-geometry"
-description = "FieldCraft's geometry boundary: CAD import, measures and tessellation, implemented with SolidCraft's B-rep kernel"
+description = "FieldCraft's geometry boundary: CAD import, measures and tessellation, implemented with SolidCraft's exchange snapshots"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -10,23 +10,31 @@ workspace = true
 
 [dependencies]
 fieldcraft-model = { workspace = true }
-solidcraft-geom = { workspace = true }
-solidcraft-kernel = { workspace = true }
-solidcraft-doc = { workspace = true }
-solidcraft-io = { workspace = true }
+solidcraft-exchange = { workspace = true }
 thiserror = { workspace = true }
 zip = { workspace = true }
 quick-xml = { workspace = true }
 solidcraft-engine = { workspace = true, optional = true }
+solidcraft-io = { workspace = true, optional = true }
+solidcraft-doc = { workspace = true, optional = true }
+solidcraft-geom = { workspace = true, optional = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 
 [features]
-# Build designs from SolidCraft command scripts (`script_design`): the test corpus and tooling.
-# Off by default; the library itself only opens designs.
-scripts = ["dep:solidcraft-engine"]
+# Author designs: SolidCraft command scripts (`script_design`) and the sample plate (`sample`), for
+# the samples, the test corpus and tooling. Off by default: opening, measuring and editing a design
+# goes through `solidcraft-exchange` alone.
+scripts = ["dep:solidcraft-engine", "dep:solidcraft-io", "dep:solidcraft-doc", "dep:solidcraft-geom"]
 
 [[example]]
 # Compiles a SolidCraft recipe into a design (tools/cooling); needs the script interpreter.
 name = "compile_recipe"
 required-features = ["scripts"]
+
+[dev-dependencies]
+# The unit tests build their designs as the `scripts` feature does.
+solidcraft-engine = { workspace = true }
+solidcraft-io = { workspace = true }
+solidcraft-doc = { workspace = true }
+solidcraft-geom = { workspace = true }

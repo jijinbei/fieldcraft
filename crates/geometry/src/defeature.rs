@@ -23,7 +23,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use serde::Serialize;
-use solidcraft_doc::FeatureKind;
+use solidcraft_exchange::{Edit, FeatureId, FeatureKind, Operation};
 
 use crate::features::FeatureNode;
 use crate::virtual_faces::Merge;
@@ -151,7 +151,7 @@ impl Design {
         let mut order = Vec::new();
         for d in defeatures {
             for &id in &d.features {
-                let refused = match base.history.as_deref().map(|h| h.doc.feature(id)) {
+                let refused = match base.history.as_deref().map(|h| h.feature(id)) {
                     None => Some("the design has no feature timeline".to_string()),
                     Some(None) => Some(format!("the design has no feature F{id}")),
                     Some(Some(f)) if !suppressible(&f.kind) => {
@@ -232,16 +232,11 @@ impl Design {
     }
 }
 
-/// Whether a feature of this kind may be taken out without taking a body or a sketch with it.
+/// Whether a feature of this kind may be taken out without taking a body with it (sketches and
+/// reference geometry are not among the snapshot's features).
 fn suppressible(kind: &FeatureKind) -> bool {
-    use solidcraft_doc::Operation::NewBody;
     match kind {
-        FeatureKind::Sketch { .. }
-        | FeatureKind::ConstructionPlane { .. }
-        | FeatureKind::ConstructionAxis { .. }
-        | FeatureKind::ConstructionPoint { .. }
-        | FeatureKind::Combine { .. }
-        | FeatureKind::Split { .. } => false,
+        FeatureKind::Combine { .. } | FeatureKind::Split { .. } => false,
         FeatureKind::Extrude { operation, .. }
         | FeatureKind::Revolve { operation, .. }
         | FeatureKind::Sweep { operation, .. }
@@ -249,7 +244,7 @@ fn suppressible(kind: &FeatureKind) -> bool {
         | FeatureKind::Box { operation, .. }
         | FeatureKind::Cylinder { operation, .. }
         | FeatureKind::Sphere { operation, .. }
-        | FeatureKind::Torus { operation, .. } => *operation != NewBody,
+        | FeatureKind::Torus { operation, .. } => *operation != Operation::NewBody,
         _ => true,
     }
 }
@@ -258,13 +253,12 @@ fn suppressible(kind: &FeatureKind) -> bool {
 /// `base` or loses one of its bodies.
 fn rebuild_without(base: &Design, ids: &BTreeSet<u64>) -> Result<std::result::Result<Design, String>> {
     let history = base.history.as_deref().ok_or_else(|| Error::Invalid("the design has no feature timeline".into()))?;
-    let mut doc = history.doc.clone();
-    for &id in ids {
-        if let Some(f) = doc.feature_mut(id) {
-            f.suppressed = true;
-        }
-    }
-    let design = crate::design::rebuild(&doc)?;
+    let mut edits = history.edits.as_ref().clone();
+    edits.extend(ids.iter().map(|&id| Edit::Suppress(FeatureId(id))));
+    let design = match crate::design::rebuild(&history.source, &Arc::new(edits)) {
+        Ok(d) => d,
+        Err(e) => return Ok(Err(e.to_string())),
+    };
     let failed: Vec<String> = design
         .errors
         .iter()

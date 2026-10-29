@@ -72,16 +72,16 @@ craft-ui = { git = "https://github.com/storytold/craft-libs", rev = "5c874d51eeb
 # native file pickers (the desktop app only; the UI crate takes them as services)
 rfd = "0.17"
 
-# Geometry: SolidCraft's B-rep kernel (MIT OR Apache-2.0), pinned at a release tag's commit (v0.25.1;
-# docs/architecture.md, "SolidCraft pin"). Only crates/geometry uses it
-# (plan/adr/0001-libraries.md).
-solidcraft-geom = { git = "https://github.com/tangency-labs/solidcraft", rev = "37a586dd61d4873842604c2036c05a2890e7d773" }
-solidcraft-kernel = { git = "https://github.com/tangency-labs/solidcraft", rev = "37a586dd61d4873842604c2036c05a2890e7d773" }
-solidcraft-doc = { git = "https://github.com/tangency-labs/solidcraft", rev = "37a586dd61d4873842604c2036c05a2890e7d773" }
-solidcraft-io = { git = "https://github.com/tangency-labs/solidcraft", rev = "37a586dd61d4873842604c2036c05a2890e7d773" }
-# Runs SolidCraft command scripts (the test corpus recipes); only behind fieldcraft-geometry's
-# `scripts` feature.
-solidcraft-engine = { git = "https://github.com/tangency-labs/solidcraft", rev = "37a586dd61d4873842604c2036c05a2890e7d773" }
+# Geometry: SolidCraft (MIT OR Apache-2.0) through its exchange crate alone: a design opened and
+# evaluated as plain, typed data (EXPERIMENT: a path to the branch of tangency-labs/solidcraft#8845).
+# Only crates/geometry uses it (plan/adr/0001-libraries.md).
+solidcraft-exchange = { path = "/home/jijinbei/solidcraft/.claude/worktrees/exchange/crates/exchange" }
+# Authoring designs: runs SolidCraft command scripts and builds the sample plate (the samples and
+# the test corpus recipes) and saves the design; only behind fieldcraft-geometry's `scripts` feature.
+solidcraft-engine = { path = "/home/jijinbei/solidcraft/.claude/worktrees/exchange/crates/engine" }
+solidcraft-io = { path = "/home/jijinbei/solidcraft/.claude/worktrees/exchange/crates/io" }
+solidcraft-doc = { path = "/home/jijinbei/solidcraft/.claude/worktrees/exchange/crates/doc" }
+solidcraft-geom = { path = "/home/jijinbei/solidcraft/.claude/worktrees/exchange/crates/geom" }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
@@ -145,11 +145,11 @@ debug = "line-tables-only"
 # reach a dependent workspace, so FieldCraft applies the same ones from the same pinned commit;
 # keep this list and the rev in step with SolidCraft's [patch.crates-io].
 [patch.crates-io]
-truck-geometry = { git = "https://github.com/tangency-labs/solidcraft", rev = "37a586dd61d4873842604c2036c05a2890e7d773" }
-truck-shapeops = { git = "https://github.com/tangency-labs/solidcraft", rev = "37a586dd61d4873842604c2036c05a2890e7d773" }
-truck-stepio = { git = "https://github.com/tangency-labs/solidcraft", rev = "37a586dd61d4873842604c2036c05a2890e7d773" }
-truck-meshalgo = { git = "https://github.com/tangency-labs/solidcraft", rev = "37a586dd61d4873842604c2036c05a2890e7d773" }
-matext4cgmath = { git = "https://github.com/tangency-labs/solidcraft", rev = "37a586dd61d4873842604c2036c05a2890e7d773" }
+truck-geometry = { path = "/home/jijinbei/solidcraft/.claude/worktrees/exchange/vendor/truck-geometry" }
+truck-shapeops = { path = "/home/jijinbei/solidcraft/.claude/worktrees/exchange/vendor/truck-shapeops" }
+truck-stepio = { path = "/home/jijinbei/solidcraft/.claude/worktrees/exchange/vendor/truck-stepio" }
+truck-meshalgo = { path = "/home/jijinbei/solidcraft/.claude/worktrees/exchange/vendor/truck-meshalgo" }
+matext4cgmath = { path = "/home/jijinbei/solidcraft/.claude/worktrees/exchange/vendor/matext4cgmath" }
 # egui-wgpu with SolidCraft's fixes (vendor/egui-wgpu there): MSAA clamped to what the device
 # supports and 1x on OpenGL adapters, so the requested 4x never fails pipeline validation at start.
 egui-wgpu = { git = "https://github.com/tangency-labs/solidcraft", rev = "37a586dd61d4873842604c2036c05a2890e7d773" }

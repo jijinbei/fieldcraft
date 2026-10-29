@@ -5,8 +5,6 @@
 //! a SolidCraft session and saves the result as `.solidcraft` file bytes, which then open through
 //! [`crate::open_design`] like any design a person saved in SolidCraft.
 
-use solidcraft_kernel::{KernelError, guard};
-
 use crate::{Error, Result};
 
 /// Largest script read (SolidCraft's design limit is far larger than any recipe needs).
@@ -19,14 +17,14 @@ pub fn script_design(script: &str) -> Result<Vec<u8>> {
         return Err(Error::Invalid(format!("script is larger than {MAX_SCRIPT_BYTES} bytes")));
     }
     let value: serde_json::Value = serde_json::from_str(script).map_err(|e| Error::Invalid(format!("script is not JSON: {e}")))?;
-    // A failing command is the recipe's error; only a panic is the kernel's.
-    let doc = guard("run script", || {
+    // A failing command is the recipe's error; a panic in SolidCraft is caught and reported.
+    let run = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let mut session = solidcraft_engine::Session::default();
-        Ok(session.run_script(&value).map(|_| session.doc.clone()))
-    })?
-    .map_err(|e| Error::Invalid(format!("script: {e}")))?;
-    guard("save design", || solidcraft_io::write_design_container(&doc).map_err(|e| KernelError::Internal(format!("save design: {e}"))))
-        .map_err(Error::from)
+        session.run_script(&value).map(|_| session.doc.clone())
+    }));
+    let doc = run.map_err(|_| Error::Failed("SolidCraft panicked running the script".into()))?.map_err(|e| Error::Invalid(format!("script: {e}")))?;
+    let saved = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| solidcraft_io::write_design_container(&doc)));
+    saved.map_err(|_| Error::Failed("SolidCraft panicked saving the design".into()))?.map_err(|e| Error::Failed(format!("save design: {e}")))
 }
 
 #[cfg(test)]

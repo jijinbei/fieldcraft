@@ -13,39 +13,41 @@
 //! later cut swallowed) is left out.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 
-use fieldcraft_model::units::Typed;
 use serde::Serialize;
-use solidcraft_doc::expr::Kind;
-use solidcraft_doc::{Document, FeatureKind, ModelState, Operation, SolvedSketch, plain};
-use solidcraft_geom::{Seg2, Vec3};
-use solidcraft_kernel::guard;
+use solidcraft_exchange::{Feature, FeatureKind, Operation, Quantity, SketchCurve};
 
+use crate::source::DesignSource;
 use crate::{Design, Result, Shape};
 
 /// A vector shorter than this has no direction.
 const MIN_NORM: f64 = 1e-12; // unit-factors: the length of a direction vector
 /// A unit vector's component this small is zero.
 const ZERO_COMPONENT: f64 = 1e-12; // unit-factors: a component of a unit vector
-/// Arcs whose centres and radii agree within this are of one circle.
-const SAME_ARC: Typed = Typed::new(1e-9, "mm"); // unit-factors: an absolute amount, in the geometry frame's millimetres
-/// Arcs that turn a full circle within this close it.
-const FULL_TURN: f64 = 1e-6; // unit-factors: an angle in radians
 
 /// Most features listed per body (a design's timeline is capped far above any real part).
 pub const MAX_FEATURES_PER_BODY: usize = 10_000;
 
-/// The timeline a design was rebuilt from, kept with the design for [`Design::features`].
+/// The timeline a design was rebuilt from, kept with the design for [`Design::features`]: the
+/// snapshot's features, and the design and edits it was taken with.
 pub(crate) struct History {
-    pub(crate) doc: Document,
-    pub(crate) state: std::sync::Arc<ModelState>,
+    pub(crate) source: Arc<DesignSource>,
+    pub(crate) edits: Arc<Vec<solidcraft_exchange::Edit>>,
+    pub(crate) features: Vec<Feature>,
     /// Error per feature id, from the rebuild.
     pub(crate) errors: BTreeMap<u64, String>,
 }
 
 impl std::fmt::Debug for History {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("History").field("features", &self.doc.features.len()).field("errors", &self.errors).finish()
+        f.debug_struct("History").field("features", &self.features.len()).field("errors", &self.errors).finish()
+    }
+}
+
+impl History {
+    pub(crate) fn feature(&self, id: u64) -> Option<&Feature> {
+        self.features.iter().find(|f| f.id.0 == id)
     }
 }
 
@@ -201,10 +203,6 @@ impl BodyFeatures {
     }
 }
 
-fn xyz(v: Vec3) -> [f64; 3] {
-    [v.x, v.y, v.z]
-}
-
 /// `v` scaled to unit length, components within 1e-12 of zero made zero (a drilling direction
 /// found from the geometry carries round-off).
 fn unit(v: [f64; 3]) -> Option<[f64; 3]> {
@@ -244,90 +242,103 @@ fn operation_name(op: Operation) -> &'static str {
         Operation::Join => "join",
         Operation::Cut => "cut",
         Operation::Intersect => "intersect",
+        _ => "other",
     }
 }
 
-fn curves(segs: &[Seg2]) -> Vec<Curve> {
-    // A loop of arcs about one centre and radius that turns a full circle is a circle.
-    let arcs: Vec<(solidcraft_geom::Vec2, f64, f64)> =
-        segs.iter().filter_map(|s| if let Seg2::Arc { center, radius, sweep, .. } = s { Some((*center, *radius, *sweep)) } else { None }).collect();
-    if !arcs.is_empty() && arcs.len() == segs.len() {
-        let (c0, r0, _) = arcs[0];
-        let tol = fieldcraft_model::units::geometry_amount(fieldcraft_model::units::Quantity::Length, SAME_ARC);
-        let same = arcs.iter().all(|(c, r, _)| (c.x - c0.x).abs() < tol && (c.y - c0.y).abs() < tol && (r - r0).abs() < tol);
-        let turn: f64 = arcs.iter().map(|a| a.2).sum();
-        if same && (turn.abs() - std::f64::consts::TAU).abs() < FULL_TURN {
-            return vec![Curve::Circle { center: [c0.x, c0.y], radius: r0 }];
-        }
-    }
+fn curves(segs: &[SketchCurve]) -> Vec<Curve> {
     segs.iter()
         .map(|s| match s {
-            Seg2::Line { a, b } => Curve::Line { a: [a.x, a.y], b: [b.x, b.y] },
-            Seg2::Arc { center, radius, start, sweep } => Curve::Arc { center: [center.x, center.y], radius: *radius, start: *start, sweep: *sweep },
-            other => Curve::Other { kind: format!("{other:?}").split(['{', ' ', '(']).next().unwrap_or("curve").to_ascii_lowercase() },
+            SketchCurve::Line { a, b } => Curve::Line { a: a.0, b: b.0 },
+            SketchCurve::Arc { center, radius, start, sweep } => Curve::Arc { center: center.0, radius: radius.0, start: start.0, sweep: sweep.0 },
+            SketchCurve::Circle { center, radius } => Curve::Circle { center: center.0, radius: radius.0 },
+            _ => Curve::Other { kind: "curve".into() },
         })
         .collect()
 }
 
-fn sketch_geometry(ss: &SolvedSketch, sel: Option<&solidcraft_doc::ProfileSel>) -> SketchGeometry {
-    let indices: Vec<usize> = match sel {
-        Some(sel) => solidcraft_doc::profile_selection_indices(ss, sel).unwrap_or_else(|_| (0..ss.profiles.len()).collect()),
-        None => (0..ss.profiles.len()).collect(),
-    };
-    let profiles = indices
-        .into_iter()
-        .filter_map(|i| {
-            let p = ss.profiles.get(i)?;
-            Some(ProfileGeometry {
-                index: i,
-                area: p.area,
-                outer: curves(&p.region.outer.segs),
-                holes: p.region.holes.iter().map(|h| curves(&h.segs)).collect(),
-                outer_curves: p.outer_curves.clone(),
-                hole_curves: p.hole_curves.clone(),
-            })
-        })
-        .collect();
+fn sketch_geometry(sk: &solidcraft_exchange::Sketch) -> SketchGeometry {
     SketchGeometry {
-        id: ss.feature,
-        name: ss.name.clone(),
-        origin: xyz(ss.plane.origin),
-        x_dir: xyz(ss.plane.x),
-        y_dir: xyz(ss.plane.y),
-        normal: xyz(ss.plane.normal()),
-        profiles,
+        id: sk.id.0,
+        name: sk.name.clone(),
+        origin: sk.frame.origin.0,
+        x_dir: sk.frame.x.get(),
+        y_dir: sk.frame.y.get(),
+        normal: sk.frame.normal.get(),
+        profiles: sk
+            .profiles
+            .iter()
+            .map(|p| ProfileGeometry {
+                index: p.index as usize,
+                area: p.area,
+                outer: curves(&p.outer),
+                holes: p.holes.iter().map(|h| curves(h)).collect(),
+                // The exchange snapshot does not carry sketch curve ids.
+                outer_curves: Vec::new(),
+                hole_curves: p.holes.iter().map(|_| Vec::new()).collect(),
+            })
+            .collect(),
     }
 }
 
+fn plain(names: &[solidcraft_exchange::BodyName]) -> Vec<String> {
+    names.iter().map(|n| n.0.clone()).collect()
+}
+
+fn rows(t: &solidcraft_exchange::Transform) -> [[f64; 4]; 4] {
+    t.0
+}
+
+/// A feature's own body-name mentions: the bodies it changes and those it makes.
+fn mentions(f: &Feature) -> Vec<String> {
+    let mut out = plain(&f.creates);
+    match &f.kind {
+        FeatureKind::Extrude { targets, .. }
+        | FeatureKind::Revolve { targets, .. }
+        | FeatureKind::Sweep { targets, .. }
+        | FeatureKind::Loft { targets, .. } => out.extend(plain(targets)),
+        FeatureKind::Combine { target, .. } => out.push(target.0.clone()),
+        FeatureKind::Fillet { bodies, .. }
+        | FeatureKind::Chamfer { bodies, .. }
+        | FeatureKind::Shell { bodies, .. }
+        | FeatureKind::Pattern { bodies, .. }
+        | FeatureKind::Mirror { bodies, .. } => out.extend(plain(bodies)),
+        FeatureKind::Split { body } => out.push(body.0.clone()),
+        _ => {}
+    }
+    out
+}
+
 impl History {
-    /// The feature `id` of the timeline, described against `body` (its faces and edges).
-    fn node(&self, f: &solidcraft_doc::Feature, faces: Vec<String>, edges: Vec<String>) -> FeatureNode {
-        let (vals, _) = self.doc.param_values();
-        let eval = |e: &str, k: Kind| Document::eval_in(&vals, e, k).ok().filter(|v| v.is_finite());
+    /// The feature `f` of the timeline, described against a body (its faces and edges).
+    fn node(&self, f: &Feature, faces: Vec<String>, edges: Vec<String>) -> FeatureNode {
         let mut values = BTreeMap::new();
         let mut lengths = BTreeSet::new();
-        for (label, e, k) in f.kind.inputs() {
-            if let Some(v) = eval(&e, k) {
-                let mut key = snake(label);
-                let mut n = 2;
-                while values.contains_key(&key) {
-                    key = format!("{}_{n}", snake(label));
-                    n += 1;
-                }
-                if k == Kind::Length {
-                    lengths.insert(key.clone());
-                }
-                values.insert(key, v);
+        for input in &f.inputs {
+            let (v, length) = match input.value {
+                Quantity::Length(l) => (l.0, true),
+                Quantity::Angle(a) => (a.0, false),
+                Quantity::Number(n) => (n, false),
+                _ => continue,
+            };
+            if !v.is_finite() {
+                continue;
             }
+            let mut key = snake(&input.label);
+            let mut n = 2;
+            while values.contains_key(&key) {
+                key = format!("{}_{n}", snake(&input.label));
+                n += 1;
+            }
+            if length {
+                lengths.insert(key.clone());
+            }
+            values.insert(key, v);
         }
-        let point = |p: &[solidcraft_doc::Expr; 3]| -> Option<[f64; 3]> {
-            Some([eval(&p[0], Kind::Length)?, eval(&p[1], Kind::Length)?, eval(&p[2], Kind::Length)?])
-        };
-        let sketch_of = |id: solidcraft_doc::SketchId| self.state.sketch(*id);
         let mut node = FeatureNode {
-            id: f.id,
+            id: f.id.0,
             name: f.name.clone(),
-            kind: String::new(),
+            kind: if f.kind_name.is_empty() { "feature".into() } else { f.kind_name.clone() },
             operation: None,
             values,
             lengths,
@@ -338,87 +349,64 @@ impl History {
             transforms: Vec::new(),
             targets: Vec::new(),
             tools: Vec::new(),
-            creates: f.body_names.clone(),
+            creates: plain(&f.creates),
             definition: serde_json::to_value(&f.kind).unwrap_or_default(),
             faces,
             edges,
-            error: self.errors.get(&f.id).cloned(),
+            error: self.errors.get(&f.id.0).cloned(),
         };
-        node.kind = node.definition.get("type").and_then(serde_json::Value::as_str).unwrap_or("feature").to_string();
         match &f.kind {
-            FeatureKind::Extrude { sketch, profiles, extent, operation, targets, .. } => {
+            FeatureKind::Extrude { operation, sketch, direction, two_sided, targets, .. } => {
                 node.operation = Some(operation_name(*operation).into());
                 node.targets = plain(targets);
-                if let Some(ss) = sketch_of(*sketch) {
-                    let n = xyz(ss.plane.normal());
-                    let negative = matches!(extent.direction, solidcraft_doc::Direction::Negative);
-                    node.direction = unit(if negative { n.map(|c| -c) } else { n });
-                    node.two_sided = matches!(extent.direction, solidcraft_doc::Direction::Symmetric) || extent.distance2.is_some();
-                    node.sketch = Some(sketch_geometry(ss, Some(profiles)));
-                }
+                node.direction = direction.and_then(|d| unit(d.get()));
+                node.two_sided = *two_sided;
+                node.sketch = sketch.as_ref().map(sketch_geometry);
             }
-            FeatureKind::Revolve { sketch, profiles, operation, targets, .. } | FeatureKind::Sweep { sketch, profiles, operation, targets, .. } => {
+            FeatureKind::Revolve { operation, sketch, targets, .. } | FeatureKind::Sweep { operation, sketch, targets } => {
                 node.operation = Some(operation_name(*operation).into());
                 node.targets = plain(targets);
-                node.sketch = sketch_of(*sketch).map(|ss| sketch_geometry(ss, Some(profiles)));
+                node.sketch = sketch.as_ref().map(sketch_geometry);
             }
-            FeatureKind::Loft { operation, targets, .. } => {
+            FeatureKind::Loft { operation, targets } => {
                 node.operation = Some(operation_name(*operation).into());
                 node.targets = plain(targets);
             }
-            FeatureKind::Box { corner, operation, .. } => {
+            FeatureKind::Box { operation, corner, .. } => {
                 node.operation = Some(operation_name(*operation).into());
-                node.placement = point(corner);
+                node.placement = corner.map(|p| p.0);
                 node.direction = Some([0.0, 0.0, 1.0]);
             }
-            FeatureKind::Cylinder { base, axis, operation, .. } => {
+            FeatureKind::Cylinder { operation, base, axis, .. } => {
                 node.operation = Some(operation_name(*operation).into());
-                node.placement = point(base);
-                node.direction = unit(xyz(**axis));
+                node.placement = base.map(|p| p.0);
+                node.direction = axis.and_then(|d| unit(d.get()));
             }
-            FeatureKind::Sphere { center, operation, .. } | FeatureKind::Torus { center, operation, .. } => {
+            FeatureKind::Sphere { operation, center, .. } | FeatureKind::Torus { operation, center } => {
                 node.operation = Some(operation_name(*operation).into());
-                node.placement = point(center);
+                node.placement = center.map(|p| p.0);
             }
             FeatureKind::Hole { position, direction, .. } => {
                 node.operation = Some("cut".into());
-                node.placement = Some(xyz(**position));
-                node.direction = unit(xyz(**direction));
+                node.placement = Some(position.0);
+                node.direction = direction.and_then(|d| unit(d.get()));
             }
-            FeatureKind::Combine { target, tools, operation, .. } => {
+            FeatureKind::Combine { operation, target, tools } => {
                 node.operation = Some(operation_name(*operation).into());
-                node.targets = vec![target.to_string()];
+                node.targets = vec![target.0.clone()];
                 node.tools = plain(tools);
             }
-            FeatureKind::Shell { body, .. } | FeatureKind::Fillet { body, .. } | FeatureKind::Chamfer { body, .. } => {
-                node.targets = body.iter().map(ToString::to_string).collect();
-            }
-            FeatureKind::Split { body, .. } => node.targets = vec![body.to_string()],
-            FeatureKind::Pattern { pattern, bodies, .. } => {
+            FeatureKind::Fillet { bodies, .. } | FeatureKind::Chamfer { bodies, .. } | FeatureKind::Shell { bodies, .. } => {
                 node.targets = plain(bodies);
-                if let Ok(m) = solidcraft_doc::pattern_matrices(&self.doc, &self.state, pattern) {
-                    // SolidCraft's matrices are column-major (`m[3]` the translation); the graph's are row-major.
-                    let rows = |m: [[f64; 4]; 4]| std::array::from_fn(|i| std::array::from_fn(|j| m[j][i]));
-                    node.transforms = m.into_iter().filter(|m| *m != solidcraft_doc::IDENTITY).map(rows).collect();
-                }
             }
-            FeatureKind::Mirror { plane, bodies, .. } => {
+            FeatureKind::Split { body } => node.targets = vec![body.0.clone()],
+            FeatureKind::Pattern { bodies, transforms } => {
                 node.targets = plain(bodies);
-                if let Ok(p) = self.doc.resolve_plane_in(&vals, plane, 0, Some(&self.state))
-                    && let Some(n) = unit(xyz(p.normal()))
-                {
-                    // x' = x − 2 ((x − o)·n) n
-                    let o = xyz(p.origin);
-                    let d = 2.0 * (o[0] * n[0] + o[1] * n[1] + o[2] * n[2]);
-                    let mut m = solidcraft_doc::IDENTITY;
-                    for (i, row) in m.iter_mut().take(3).enumerate() {
-                        for (j, c) in row.iter_mut().take(3).enumerate() {
-                            *c -= 2.0 * n[i] * n[j];
-                        }
-                        row[3] = d * n[i];
-                    }
-                    node.transforms = vec![m];
-                }
+                node.transforms = transforms.iter().map(rows).filter(|m| *m != solidcraft_exchange::Transform::default().0).collect();
+            }
+            FeatureKind::Mirror { bodies, transform } => {
+                node.targets = plain(bodies);
+                node.transforms = transform.iter().map(rows).collect();
             }
             _ => {}
         }
@@ -439,7 +427,7 @@ impl Design {
             }
             None => self.opened.iter().collect(),
         };
-        shapes.into_iter().map(|shape| guard("feature graph", || Ok(body_features(history, shape))).map_err(crate::Error::from)?).collect()
+        shapes.into_iter().map(|shape| body_features(history, shape)).collect()
     }
 }
 
@@ -457,37 +445,11 @@ fn body_features(history: &History, shape: &Shape) -> Result<BodyFeatures> {
     // The body as SolidCraft names it before split pieces were numbered (`Bracket.2` was
     // `Bracket (1)`): features name it by its base.
     let base = shape.name.rsplit_once('.').filter(|(_, n)| n.bytes().all(|b| b.is_ascii_digit())).map_or(shape.name.as_str(), |(b, _)| b);
-    let names_body = |f: &solidcraft_doc::Feature| {
-        let mentioned = |n: &str| n == shape.name || n == base || crate::design::split_base(n) == base;
-        // The bodies the feature changes. A combine's tools are not among them: kept tools come
-        // out unchanged, and the others are gone.
-        let targets: Vec<&solidcraft_doc::BodyName> = match &f.kind {
-            FeatureKind::Extrude { targets, .. }
-            | FeatureKind::Revolve { targets, .. }
-            | FeatureKind::Sweep { targets, .. }
-            | FeatureKind::Loft { targets, .. } => targets.iter().collect(),
-            FeatureKind::Combine { target, .. } => vec![target],
-            FeatureKind::Shell { body, .. } | FeatureKind::Fillet { body, .. } | FeatureKind::Chamfer { body, .. } => body.iter().collect(),
-            FeatureKind::Split { body, .. } => vec![body],
-            // A body pattern or mirror: the original is the instance the copies repeat.
-            FeatureKind::Pattern { bodies, .. } | FeatureKind::Mirror { bodies, .. } => bodies.iter().collect(),
-            _ => Vec::new(),
-        };
-        targets.into_iter().map(|b| &**b).chain(f.body_names.iter().map(String::as_str)).any(mentioned)
-    };
+    let mentioned = |n: &str| n == shape.name || n == base || crate::design::split_base(n) == base;
     let mut features = Vec::new();
-    for f in history.doc.features.iter().filter(|f| !f.suppressed) {
-        if matches!(
-            f.kind,
-            FeatureKind::Sketch { .. }
-                | FeatureKind::ConstructionPlane { .. }
-                | FeatureKind::ConstructionAxis { .. }
-                | FeatureKind::ConstructionPoint { .. }
-        ) {
-            continue;
-        }
-        let own = faces.remove(&f.id).unwrap_or_default();
-        if own.is_empty() && !names_body(f) {
+    for f in history.features.iter().filter(|f| !f.suppressed) {
+        let own = faces.remove(&f.id.0).unwrap_or_default();
+        if own.is_empty() && !mentions(f).iter().any(|n| mentioned(n)) {
             continue;
         }
         let tagged: BTreeSet<u32> = own.iter().filter_map(|n| shape.face_index(n)).collect();

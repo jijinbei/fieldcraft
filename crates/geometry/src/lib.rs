@@ -1,12 +1,13 @@
 //! The geometry boundary.
 //!
 //! Meshing in FieldCraft starts from a triangulated boundary surface. This crate produces it:
-//! B-rep bodies come from SolidCraft's kernel (`solidcraft-kernel`, a pinned git dependency;
-//! plan/adr/0001-libraries.md) and leave it as a [`SurfaceMesh`] from SolidCraft's tessellator,
-//! with each triangle tagged by the B-rep face it lies on (for feature edges and for loads and
-//! boundary conditions on faces). No SolidCraft type appears in the public API, so the kernel can
-//! be replaced without touching the rest of the workspace. Only this crate may depend on
-//! `solidcraft-*` (`cargo xtask layers` enforces it).
+//! designs are opened and evaluated by SolidCraft through its exchange crate
+//! (`solidcraft-exchange`: plain, typed snapshots of a design's bodies; plan/adr/0001-libraries.md)
+//! and leave it as a [`SurfaceMesh`] from SolidCraft's tessellator, with each triangle tagged by
+//! the B-rep face it lies on (for feature edges and for loads and boundary conditions on faces).
+//! No SolidCraft type appears in the public API. Only this crate may depend on `solidcraft-*`
+//! (`cargo xtask layers` enforces it); without the `scripts` feature it depends on the exchange
+//! crate alone.
 //!
 //! Geometry enters two ways: shapes built in code (such as [`block`]) and SolidCraft designs
 //! opened with [`open_design`], which rebuilds the design's parametric timeline and gives its
@@ -24,9 +25,11 @@ mod edges;
 pub mod face_split;
 pub mod features;
 pub mod partition;
+#[cfg(any(test, feature = "scripts"))]
 pub mod sample;
-#[cfg(feature = "scripts")]
+#[cfg(any(test, feature = "scripts"))]
 mod script;
+mod source;
 pub mod stitch;
 pub mod virtual_faces;
 
@@ -37,9 +40,9 @@ pub use partition::{Cut, CutReport};
 pub use virtual_faces::Merge;
 pub mod snapshot;
 pub mod tagged_mesh;
-#[cfg(feature = "scripts")]
+#[cfg(any(test, feature = "scripts"))]
 pub use script::{MAX_SCRIPT_BYTES, script_design};
-use solidcraft_kernel::{Body, KernelError, guard};
+use source::{Fixed, Source};
 
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
 pub enum Error {
@@ -58,23 +61,17 @@ pub enum Error {
 
 pub type Result<T> = std::result::Result<T, Error>;
 
-impl From<KernelError> for Error {
-    fn from(e: KernelError) -> Self {
-        match e {
-            KernelError::Invalid(m) => Error::Invalid(m),
-            other => Error::Failed(other.to_string()),
-        }
+impl From<solidcraft_exchange::Error> for Error {
+    fn from(e: solidcraft_exchange::Error) -> Self {
+        source::error(e)
     }
 }
-
-/// SolidCraft's linear modelling tolerance (mm): points closer than this are the same point.
-const LINEAR_TOLERANCE: f64 = solidcraft_geom::LINEAR_TOL;
 
 /// A solid body.
 #[derive(Debug, Clone)]
 pub struct Shape {
     pub name: String,
-    body: Body,
+    source: Source,
     /// By face index (the [`SurfaceMesh::tri_face`] tags); empty for shapes built in code. With
     /// merged faces ([`virtual_faces`]) these are the virtual faces, not the B-rep's.
     faces: Vec<Face>,
@@ -160,15 +157,63 @@ pub struct SurfaceMesh {
     pub edge_faces: Vec<Vec<u32>>,
 }
 
-fn xyz(v: solidcraft_geom::Vec3) -> [f64; 3] {
-    [v.x, v.y, v.z]
-}
+/// The largest coordinate a box built in code may have.
+const MAX_BLOCK: f64 = 1e9; // unit-factors: a cap on hostile input
 
 /// A box between two corners.
 pub fn block(a: [f64; 3], b: [f64; 3]) -> Result<Shape> {
-    let v = |p: [f64; 3]| solidcraft_geom::Vec3 { x: p[0], y: p[1], z: p[2] };
-    let body = guard("block", || solidcraft_kernel::box_solid(v(a), v(b)))?;
-    Ok(Shape { name: "Block".into(), body, faces: Vec::new(), face_map: Vec::new(), cuts: Vec::new() })
+    let lo: [f64; 3] = std::array::from_fn(|k| a[k].min(b[k]));
+    let hi: [f64; 3] = std::array::from_fn(|k| a[k].max(b[k]));
+    let finite = a.iter().chain(&b).all(|v| v.is_finite() && v.abs() <= MAX_BLOCK);
+    if !finite || (0..3).any(|k| !(hi[k] - lo[k] > source::LINEAR_TOLERANCE)) {
+        return Err(Error::Invalid("a box needs finite corners apart along every axis".into()));
+    }
+    // Corner k has x from bit 0, y from bit 1, z from bit 2.
+    let positions: Vec<[f64; 3]> = (0..8).map(|k: usize| std::array::from_fn(|i| if k >> i & 1 == 1 { hi[i] } else { lo[i] })).collect();
+    // Faces -x, +x, -y, +y, -z, +z: corners counter-clockwise seen from outside.
+    let quads: [([u32; 4], [f64; 3]); 6] = [
+        ([0, 4, 6, 2], [-1.0, 0.0, 0.0]),
+        ([1, 3, 7, 5], [1.0, 0.0, 0.0]),
+        ([0, 1, 5, 4], [0.0, -1.0, 0.0]),
+        ([2, 6, 7, 3], [0.0, 1.0, 0.0]),
+        ([0, 2, 3, 1], [0.0, 0.0, -1.0]),
+        ([4, 5, 7, 6], [0.0, 0.0, 1.0]),
+    ];
+    let mut triangles = Vec::with_capacity(12);
+    let mut tri_face = Vec::with_capacity(12);
+    for (f, (q, _)) in (0u32..).zip(&quads) {
+        triangles.extend([[q[0], q[1], q[2]], [q[0], q[2], q[3]]]);
+        tri_face.extend([f, f]);
+    }
+    let mut edges = Vec::with_capacity(12);
+    let mut edge_faces = Vec::with_capacity(12);
+    for (i, (p, _)) in quads.iter().enumerate() {
+        for (j, (q, _)) in quads.iter().enumerate().skip(i + 1) {
+            let shared: Vec<u32> = p.iter().copied().filter(|c| q.contains(c)).collect();
+            if let [c, d] = shared[..] {
+                let at = |c: u32| positions.get(c as usize).copied().unwrap_or_default();
+                edges.push(vec![at(c), at(d)]);
+                edge_faces.push(vec![i as u32, j as u32]);
+            }
+        }
+    }
+    let surfaces = quads
+        .iter()
+        .map(|(q, n)| Some(FaceSurface::Plane { normal: *n, point: positions.get(q[0] as usize).copied().unwrap_or_default() }))
+        .collect();
+    let e: [f64; 3] = std::array::from_fn(|k| hi[k] - lo[k]);
+    let measure = Measure {
+        volume: e[0] * e[1] * e[2],
+        area: 2.0 * (e[0] * e[1] + e[1] * e[2] + e[0] * e[2]),
+        centroid: std::array::from_fn(|k| 0.5 * (lo[k] + hi[k])),
+        bbox_min: lo,
+        bbox_max: hi,
+        faces: 6,
+    };
+    let size = (e[0] * e[0] + e[1] * e[1] + e[2] * e[2]).sqrt();
+    let mesh = SurfaceMesh { positions, triangles, tri_face, weld_distance: 0.0, edges, edge_faces };
+    let fixed = Fixed { mesh, surfaces, measure, size };
+    Ok(Shape { name: "Block".into(), source: Source::Fixed(std::sync::Arc::new(fixed)), faces: Vec::new(), face_map: Vec::new(), cuts: Vec::new() })
 }
 
 impl Shape {
@@ -217,51 +262,23 @@ impl Shape {
 
     /// [`Shape::face_surfaces`] by B-rep face index (the pieces of [`Shape::tessellate_pieces`]).
     pub fn brep_face_surfaces(&self) -> Result<Vec<Option<FaceSurface>>> {
-        guard("face surfaces", || {
-            Ok((0..self.body.face_count())
-                .map(|f| {
-                    solidcraft_kernel::face_surface(&self.body, f).map(|s| match s {
-                        solidcraft_kernel::FaceSurface::Plane { normal, point } => {
-                            FaceSurface::Plane { normal: xyz(normal.vec()), point: xyz(point) }
-                        }
-                        solidcraft_kernel::FaceSurface::Cylinder { origin, axis, radius } => {
-                            FaceSurface::Cylinder { origin: xyz(origin), axis: xyz(axis.vec()), radius }
-                        }
-                        solidcraft_kernel::FaceSurface::Cone { apex, axis, half_angle } => {
-                            FaceSurface::Cone { apex: xyz(apex), axis: xyz(axis.vec()), half_angle }
-                        }
-                        solidcraft_kernel::FaceSurface::Sphere { center, radius } => FaceSurface::Sphere { center: xyz(center), radius },
-                        solidcraft_kernel::FaceSurface::Torus { center, axis, major, minor } => {
-                            FaceSurface::Torus { center: xyz(center), axis: xyz(axis.vec()), major, minor }
-                        }
-                    })
-                })
-                .collect())
-        })
-        .map_err(Error::from)
+        self.source.surfaces()
     }
 
     /// A characteristic size: the diagonal of the bounding box of the body's B-rep vertices
     /// (cached by the kernel; curved faces may bulge past it). For default tolerances and sizes.
     pub fn size(&self) -> Result<f64> {
-        Ok(guard("size", || Ok(self.body.size()))?)
+        self.source.size()
     }
 
     /// The boundary shells of the body: one for a solid in one piece without voids.
     pub fn shells(&self) -> Result<usize> {
-        Ok(guard("shells", || Ok(self.body.shell_count()))?)
+        self.source.shells()
     }
 
     pub fn measure(&self) -> Result<Measure> {
-        let m = guard("measure", || solidcraft_kernel::measure(&self.body))?;
-        Ok(Measure {
-            volume: m.volume,
-            area: m.area,
-            centroid: xyz(m.centroid),
-            bbox_min: xyz(m.bbox.min),
-            bbox_max: xyz(m.bbox.max),
-            faces: if self.face_map.is_empty() && self.cuts.is_empty() { m.faces } else { self.faces.len() },
-        })
+        let m = self.source.measure()?;
+        Ok(Measure { faces: if self.face_map.is_empty() && self.cuts.is_empty() { m.faces } else { self.faces.len() }, ..m })
     }
 
     /// Triangulate the boundary within `tolerance` (chordal deviation, mm). Triangles are tagged
@@ -286,15 +303,7 @@ impl Shape {
             // Its value is in the geometry's millimetres, which the caller may not show: not named.
             return Err(Error::Invalid("the tessellation tolerance must be a finite, positive length".into()));
         }
-        let m = guard("tessellate", || self.body.tessellate(tolerance))?;
-        Ok(SurfaceMesh {
-            positions: m.positions.into_iter().map(xyz).collect(),
-            triangles: m.triangles,
-            tri_face: m.tri_face,
-            weld_distance: 2.0 * LINEAR_TOLERANCE,
-            edges: m.edges.into_iter().map(|e| e.into_iter().map(xyz).collect()).collect(),
-            edge_faces: m.edge_faces,
-        })
+        self.source.tessellate(tolerance)
     }
 
     /// Whether some face is made of several B-rep faces ([`virtual_faces`]).

@@ -260,7 +260,7 @@ impl Shape {
         }
         let brep = if self.face_map.is_empty() { (0..u32::try_from(self.faces.len()).unwrap_or(0)).collect() } else { self.face_map.clone() };
         let face_map = brep.iter().map(|&v| renumber.get(v as usize).copied().unwrap_or(v)).collect();
-        Ok(Shape { name: self.name.clone(), body: self.body.clone(), faces: kept, face_map, cuts: Vec::new() })
+        Ok(Shape { name: self.name.clone(), source: self.source.clone(), faces: kept, face_map, cuts: Vec::new() })
     }
 
     /// The neighbour face `face` shares the longest edges with (by name): where a tiny or sliver
