@@ -88,6 +88,59 @@ into `target/exchange-snapshot/` and runs the four bracket recipes, then the six
 ways and the five perturbed runs. Build with `cargo +stable` (the
 `branches` crate SolidCraft depends on does not build on current nightly).
 
+## FieldCraft on `solidcraft-exchange` alone (branch `exp/exchange-only`)
+
+The comparisons above put the snapshot beside FieldCraft's own design path. This branch goes
+further: `crates/geometry` opens, measures, defeatures and partitions designs through
+`solidcraft-exchange` and nothing else.
+
+- **Dependencies.** The product code of `fieldcraft-geometry` depends on `solidcraft-exchange`
+  only. `solidcraft-engine`, `-io`, `-doc` and `-geom` remain behind the `scripts` feature, which
+  runs SolidCraft command scripts to author designs (the engine's samples, the test corpus, the
+  oracle's `design.json`). The engine enables `scripts` for its samples, so the app still links
+  them. The truck `[patch]` entries are still repeated here (Cargo applies patches only from the
+  root workspace).
+- **What goes through exchange.** A `Shape` is an exchange `Design` with its edits and a body name;
+  every query takes a snapshot of that body at the tolerance asked (cached per tolerance).
+  - opening: bodies, persistent face names (`exact` = not inferred), features that failed;
+  - `measure`, `size` and `shells`: the kernel's mass properties through the snapshot;
+  - the feature graph: from the snapshot's typed features;
+  - defeaturing: `Edit::Suppress`; partitioning: `Edit::Partition`, with FieldCraft's own cell and
+    face names (`Body/a`, `partition:<name>:a`) kept;
+  - `block` (a box built in code): a mesh built directly, no kernel.
+- **Exchange additions this needed** (pushed to the pull request's branch): mass properties on
+  request, size and shell count, whether a face name was inferred, and snapshots that list failed
+  features instead of refusing them.
+- **Size.** `crates/geometry`: +503 / −436 lines, with a new `source.rs` (185 lines).
+
+### Results
+
+The six design-built oracle cases: 20 of 20 quantities pass, and every frozen quantity matches its
+fixture (the same numbers as the snapshot column above).
+
+Tests (`fieldcraft-geometry`, `-engine`, `-testkit`): 7 that pass on `exp/exchange-snapshot-poc`
+fail here (two more only assumed the kernel's unwelded tessellation or a fixed unit, and were
+updated). The 7 are real changes, left failing on purpose:
+
+| test | cause |
+|---|---|
+| `datum::pieces_that_do_not_touch_are_separate_cells` | SolidCraft's split keeps disjoint pieces as one body (two shells); exchange has no way to separate them |
+| `datum::cuts_stay_on_the_plane_and_risky_ones_are_named` | no cut face named `partition:PX:*` on the Pi 5 enclosure's air: most likely the split puts the cut off the plane (#384, which FieldCraft's body-sized boxes fixed); not measured |
+| `sample::a_cut_the_kernel_can_only_nudge_off_its_plane_is_refused` | SolidCraft's split does not refuse a cut the kernel can only nudge (#427) |
+| `sample::the_crank_half_divides_where_its_mirror_does` | "the plane does not divide `CrankArm/b`" through SolidCraft's split |
+| `partition::coordinate_axis_tools_…`, `partition::oblique_planes_…` | they partition a `block` built in code; only design bodies can be partitioned now (an error, not a panic) |
+| `runner::cdt_meshes_corpus_parts` | the raw CDT of `analytic-plate-hole` from the welded snapshot mesh leaves one flat tet |
+
+So opening, measuring, meshing and defeaturing through exchange keep FieldCraft's results;
+partitioning does not yet. SolidCraft's split is less robust than FieldCraft's own boolean cut. The
+fix belongs in SolidCraft's split (body-sized half-space tools, one body per disjoint piece) or in a
+partition edit of the exchange that does that.
+
+Other differences: the exchange's finest chord tolerance (1e-3 mm) clamps the 1e-4 mm FieldCraft
+asked for face centres; sketch curve ids in `ProfileGeometry` are empty; a feature's `definition`
+is the exchange's typed kind. Performance was not measured (a new edit list re-evaluates the
+design).
+
 ## The other downstream tool: EMCraft
 
 EMCraft is an open-source electromagnetic field simulator written in Rust, being developed by
