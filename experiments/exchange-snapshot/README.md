@@ -98,14 +98,24 @@ action is a command, nothing panics, and every solver result is checked against 
 solutions or published benchmarks.
 
 EMCraft imports SolidCraft geometry and, without the snapshot, has to fit planes and cylinders
-back onto 3MF triangles. Through the snapshot (a metal post in a WR-90 waveguide at 10 GHz,
-against the closed-form reference):
+back onto 3MF triangles. An experimental EMCraft branch reads SolidCraft designs through
+`solidcraft-exchange` and was run against EMCraft's own oracle cases for imported geometry, both
+ways (the 3MF files regenerated with the same SolidCraft build; at 3 mm it is byte-identical to
+the oracle's file).
 
-| path | \|S11\| error | phase error |
-|---|---|---|
-| 3MF + surface fitting | 5.6e-5 | 0.020° |
-| exchange snapshot | 5.0e-5 | 0.018° |
+- Metal post across a WR-90 waveguide at 10 GHz, adaptive mesh, against the closed-form
+  reference. The 3MF path needs one export per diameter; the snapshot path reads one design file
+  with the diameter parameter overridden.
 
-Same accuracy, because fitting already recovers the cylinder. What is new is a sweep of a design
-parameter from one file, with no re-export: post diameter 2.5 / 3 / 4 mm gives |S11| errors
-6.6e-5 / 5.0e-5 / 2.9e-5, phase within 0.019°.
+  | post diameter | 3MF + fitting: \|S11\| / phase error | snapshot: \|S11\| / phase error |
+  |---|---|---|
+  | 2.5 mm | +7.3e-5 / +0.024° | +6.6e-5 / +0.018° |
+  | 3 mm | +5.6e-5 / +0.020° | +5.0e-5 / +0.018° |
+  | 4 mm | +2.5e-5 / +0.019° | +2.9e-5 / +0.019° |
+
+  2 mm stops on EMCraft's direct-solver size limit either way (a frontal matrix over 20 000 rows).
+- Two inductive irises (separate bodies touching the guide's walls; the air a block's metal
+  encloses): identical S-parameters both ways.
+
+Same accuracy: fitting already recovers the cylinder exactly enough. What the snapshot adds is the
+parameter sweep from one file without re-exporting, and exact surfaces without fitting.
