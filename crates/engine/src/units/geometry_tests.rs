@@ -282,11 +282,12 @@ fn geometry_and_mesh_sources_name_no_fixed_unit() {
             }
         }
     }
-    // The geometry crate, but for its 3MF unit table and the SolidCraft scripts of its samples.
+    // The geometry crate, but for its 3MF unit table, the exchange snapshot's declared unit and the
+    // SolidCraft scripts of its samples.
     for e in std::fs::read_dir(root.join("geometry/src")).unwrap() {
         let p = e.unwrap().path();
         let name = p.file_name().unwrap().to_string_lossy().to_string();
-        if p.extension().is_some_and(|x| x == "rs") && !["tagged_mesh.rs", "sample.rs"].contains(&name.as_str()) {
+        if p.extension().is_some_and(|x| x == "rs") && !["tagged_mesh.rs", "snapshot.rs", "sample.rs"].contains(&name.as_str()) {
             files.push(p);
         }
     }
