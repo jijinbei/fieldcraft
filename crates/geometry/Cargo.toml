@@ -18,6 +18,7 @@ solidcraft-engine = { workspace = true, optional = true }
 solidcraft-io = { workspace = true, optional = true }
 solidcraft-doc = { workspace = true, optional = true }
 solidcraft-geom = { workspace = true, optional = true }
+solidcore-record = { workspace = true, optional = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 
@@ -25,7 +26,7 @@ serde_json = { workspace = true }
 # Author designs: SolidCraft command scripts (`script_design`) and the sample plate (`sample`), for
 # the samples, the test corpus and tooling. Off by default: opening, measuring and editing a design
 # goes through `solidcraft-exchange` alone.
-scripts = ["dep:solidcraft-engine", "dep:solidcraft-io", "dep:solidcraft-doc", "dep:solidcraft-geom"]
+scripts = ["dep:solidcraft-engine", "dep:solidcraft-io", "dep:solidcraft-doc", "dep:solidcraft-geom", "dep:solidcore-record"]
 
 [[example]]
 # Compiles a SolidCraft recipe into a design (tools/cooling); needs the script interpreter.
@@ -38,3 +39,4 @@ solidcraft-engine = { workspace = true }
 solidcraft-io = { workspace = true }
 solidcraft-doc = { workspace = true }
 solidcraft-geom = { workspace = true }
+solidcore-record = { workspace = true }

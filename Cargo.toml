@@ -75,13 +75,15 @@ rfd = "0.17"
 # Geometry: SolidCraft (MIT OR Apache-2.0) through its exchange crate alone: a design opened and
 # evaluated as plain, typed data (EXPERIMENT: the branch of tangency-labs/solidcraft#8845, on the jijinbei fork).
 # Only crates/geometry uses it (plan/adr/0001-libraries.md).
-solidcraft-exchange = { git = "https://github.com/jijinbei/solidcraft", rev = "3390d0511e9f97a530114fc845fe26bc424b8fd6" }
+solidcraft-exchange = { git = "https://github.com/jijinbei/solidcraft", rev = "4c9ddde19843e5df2b4e782f8738449bffd59d6d" }
 # Authoring designs: runs SolidCraft command scripts and builds the sample plate (the samples and
 # the test corpus recipes) and saves the design; only behind fieldcraft-geometry's `scripts` feature.
-solidcraft-engine = { git = "https://github.com/jijinbei/solidcraft", rev = "3390d0511e9f97a530114fc845fe26bc424b8fd6" }
-solidcraft-io = { git = "https://github.com/jijinbei/solidcraft", rev = "3390d0511e9f97a530114fc845fe26bc424b8fd6" }
-solidcraft-doc = { git = "https://github.com/jijinbei/solidcraft", rev = "3390d0511e9f97a530114fc845fe26bc424b8fd6" }
-solidcraft-geom = { git = "https://github.com/jijinbei/solidcraft", rev = "3390d0511e9f97a530114fc845fe26bc424b8fd6" }
+solidcraft-engine = { git = "https://github.com/jijinbei/solidcraft", rev = "4c9ddde19843e5df2b4e782f8738449bffd59d6d" }
+solidcraft-io = { git = "https://github.com/jijinbei/solidcraft", rev = "4c9ddde19843e5df2b4e782f8738449bffd59d6d" }
+solidcraft-doc = { git = "https://github.com/jijinbei/solidcraft", rev = "4c9ddde19843e5df2b4e782f8738449bffd59d6d" }
+solidcraft-geom = { git = "https://github.com/jijinbei/solidcraft", rev = "4c9ddde19843e5df2b4e782f8738449bffd59d6d" }
+# The plain vector types SolidCraft's crates take, at the rev SolidCraft pins.
+solidcore-record = { git = "https://github.com/tangency-labs/solidcore", rev = "f5e8e9a29e0c9b7cf6c4040a5bc8878382b3c62f" }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
@@ -141,15 +143,10 @@ lto = "thin"
 codegen-units = 16
 debug = "line-tables-only"
 
-# SolidCraft builds truck, egui-wgpu, winit and accesskit_macos with local fixes (its vendor/ directory). Patches don't
+# SolidCraft builds egui-wgpu, winit and accesskit_macos with local fixes (its vendor/ directory). Patches don't
 # reach a dependent workspace, so FieldCraft applies the same ones from the same pinned commit;
 # keep this list and the rev in step with SolidCraft's [patch.crates-io].
 [patch.crates-io]
-truck-geometry = { git = "https://github.com/jijinbei/solidcraft", rev = "3390d0511e9f97a530114fc845fe26bc424b8fd6" }
-truck-shapeops = { git = "https://github.com/jijinbei/solidcraft", rev = "3390d0511e9f97a530114fc845fe26bc424b8fd6" }
-truck-stepio = { git = "https://github.com/jijinbei/solidcraft", rev = "3390d0511e9f97a530114fc845fe26bc424b8fd6" }
-truck-meshalgo = { git = "https://github.com/jijinbei/solidcraft", rev = "3390d0511e9f97a530114fc845fe26bc424b8fd6" }
-matext4cgmath = { git = "https://github.com/jijinbei/solidcraft", rev = "3390d0511e9f97a530114fc845fe26bc424b8fd6" }
 # egui-wgpu with SolidCraft's fixes (vendor/egui-wgpu there): MSAA clamped to what the device
 # supports and 1x on OpenGL adapters, so the requested 4x never fails pipeline validation at start.
 egui-wgpu = { git = "https://github.com/tangency-labs/solidcraft", rev = "8e2b0cd60d14b4152b12b8f1fdb2bcfdcd8c52f4" }

@@ -3,7 +3,7 @@
 
 use solidcraft_doc::sketch::{ConstraintKind, Sketch};
 use solidcraft_doc::{Direction, Document, Extent, ExtrudeConvention, FeatureKind, Operation, PlaneRef, ProfileSel};
-use solidcraft_geom::Vec2;
+use solidcore_record::Vec2;
 
 use crate::{Error, Result};
 
@@ -49,6 +49,9 @@ fn extrude(sketch: u64, distance: &str, operation: Operation) -> FeatureKind {
             start_offset: None,
             through_all: false,
             taper: None,
+            corner: None,
+            second_follows_first: false,
+            to_body_apart: false,
             to: None,
             to_offset: None,
             from: None,

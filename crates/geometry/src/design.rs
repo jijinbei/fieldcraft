@@ -151,7 +151,7 @@ pub(crate) fn rebuild(source: &Arc<DesignSource>, edits: &Arc<Vec<Edit>>) -> Res
         .map(|b| Shape {
             name: b.name.0.clone(),
             source: Source::Design { design: Arc::clone(source), edits: Arc::clone(edits), body: b.name.0.clone() },
-            faces: b.faces.iter().map(|f| Face { name: f.name.0.clone(), exact: !f.inferred, members: Vec::new() }).collect(),
+            faces: b.faces.iter().map(|f| Face { name: f.name.0.clone(), exact: !f.inferred, members: Vec::new(), kept_surface: None }).collect(),
             face_map: Vec::new(),
             cuts: Vec::new(),
         })
@@ -280,6 +280,7 @@ mod tests {
         assert!(x("Bracket.1") <= x("Bracket.30"));
     }
     use crate::sample::{self, Plate};
+    use solidcraft_geom::prelude::*;
 
     fn face_areas(shape: &Shape) -> Vec<f64> {
         let mesh = shape.tessellate(0.01).unwrap();
@@ -287,7 +288,7 @@ mod tests {
         for (t, f) in mesh.triangles.iter().zip(&mesh.tri_face) {
             let [a, b, c] = t.map(|i| {
                 let [x, y, z] = mesh.positions[i as usize];
-                solidcraft_geom::Vec3 { x, y, z }
+                solidcore_record::Vec3 { x, y, z }
             });
             areas[*f as usize] += 0.5 * (b - a).cross(c - a).len();
         }
