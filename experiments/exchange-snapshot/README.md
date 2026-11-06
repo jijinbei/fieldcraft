@@ -98,8 +98,8 @@ further: `crates/geometry` opens, measures, defeatures and partitions designs th
   only. `solidcraft-engine`, `-io`, `-doc` and `-geom` remain behind the `scripts` feature, which
   runs SolidCraft command scripts to author designs (the engine's samples, the test corpus, the
   oracle's `design.json`). The engine enables `scripts` for its samples, so the app still links
-  them. The truck `[patch]` entries are still repeated here (Cargo applies patches only from the
-  root workspace).
+  them. ~~The truck `[patch]` entries are still repeated here (Cargo applies patches only from the
+  root workspace).~~ No truck patches now: SolidCraft is on its solidcore kernel.
 - **What goes through exchange.** A `Shape` is an exchange `Design` with its edits and a body name;
   every query takes a snapshot of that body at the tolerance asked (cached per tolerance).
   - opening: bodies, persistent face names (`exact` = not inferred), features that failed;
@@ -113,7 +113,37 @@ further: `crates/geometry` opens, measures, defeatures and partitions designs th
   features instead of refusing them.
 - **Size.** `crates/geometry`: +503 / −436 lines, with a new `source.rs` (185 lines).
 
-### Results
+### Update (2026-11-06): SolidCraft on solidcore
+
+Rebased on develop `6b613217` and pinned to #8845's rebuilt head `4c9ddde19` (SolidCraft's
+solidcore kernel, no truck).
+
+- **Oracle:** the six cases pass, 20 of 20 quantities. Six moved from their fixtures, within
+  their references: `cdt-cylinder` volume 6266.5 → 6259.6 mm³ (reference 6267.5),
+  `octree-filleted-bracket` volume 32177 → 32188 mm³ and its four stresses by under 0.05%. The
+  bracket's fillet peak is 208.97 / 211.68 MPa (coarse / fine; reference 213 ±5%).
+- **Tests** (`fieldcraft-geometry`, `-engine`, `-testkit`): 53 failed at first, 20 now. A hole's
+  wall is one cylinder face closed by a seam where truck made two halves, so counts changed (the
+  plate: 7 faces, 15 edges, 10 corners) and were updated. Merge tests use `plate_design_halved`,
+  the plate with a SplitFace feature halving the wall. Two fixes: a face split now cuts an edge
+  at a point of its own on the plane (the new tessellation puts points there), and a newer design
+  is refused before SolidCraft opens it (SolidCraft now opens newer designs). The split
+  bracket's names were re-frozen.
+- **Left failing (20):**
+
+  | kind | count | what |
+  |---|---|---|
+  | hex mesher and one periodic cylinder face | 9 | plan acceptance (enclosure bosses, filleted base, slivers, curved bodies), the crank's sweep, the dome's decompose: a linking face with a seam is refused as periodic |
+  | mesh structure | 2 | `cells` (no ties), `sizes` |
+  | frozen values | 4 | relax fingerprint, 0.7.0 journal replay, `sphere_on_plate` quality, a seed's mesh edges (8, not 7) |
+  | timing | 1 | `transient_heat_stops_between_increments` finishes before its stage |
+  | partition (as below) | 4 | disjoint pieces, cuts off the plane, `block` partitions |
+
+  The first two rows are FieldCraft work for solidcore's topology; the frozen values need a
+  decision to re-freeze.
+- SolidCraft: splitting a cylinder face by a plane off its seam gives three faces, not two.
+
+### Results (previous head, truck kernel)
 
 The six design-built oracle cases: 20 of 20 quantities pass, and every frozen quantity matches its
 fixture (the same numbers as the snapshot column above).
