@@ -501,9 +501,9 @@ mod tests {
         let circle = &hole.sketch.as_ref().unwrap().profiles[0].outer;
         let c = plate.depth / 2.0;
         assert_eq!(circle, &[Curve::Circle { center: [c, c], radius: plate.hole_diameter / 2.0 }]);
-        // Each feature's faces: the outline's four sides and caps, the hole's two halves.
+        // Each feature's faces: the outline's four sides and caps, the hole's wall.
         assert_eq!(outline.faces.len(), 6, "{:?}", outline.faces);
-        assert_eq!(hole.faces.len(), 2, "{:?}", hole.faces);
+        assert_eq!(hole.faces.len(), 1, "{:?}", hole.faces);
         assert!(!hole.edges.is_empty());
         assert!(outline.error.is_none() && hole.error.is_none());
         // Bodies the design lacks are an error, not an empty graph.

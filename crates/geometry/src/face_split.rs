@@ -241,6 +241,10 @@ fn cut(mesh: &mut SurfaceMesh, c: &Cut) {
                     piece.push(x);
                     flush(&mut piece, piece_side);
                     piece.push(x);
+                } else if sp != 0 && sq == 0 && piece_side != 0 && sp != piece_side {
+                    // The edge crosses at a point of its own on the plane: the piece ends there.
+                    flush(&mut piece, piece_side);
+                    piece.push(q);
                 }
             }
             if sp != 0 {
@@ -346,7 +350,7 @@ mod tests {
         let d = d.split(&[split(30.0)]).unwrap();
         assert!(d.errors.is_empty(), "{:?}", d.errors);
         let b = &d.bodies[0];
-        assert_eq!(b.faces().len(), 9);
+        assert_eq!(b.faces().len(), 8);
         let (fa, fb) = (b.face_index("split:S:a").unwrap(), b.face_index("split:S:b").unwrap());
         let s = b.face_surfaces().unwrap();
         assert_eq!(s[fa as usize], s[fb as usize]);
@@ -379,8 +383,9 @@ mod tests {
         assert_eq!(cut.len(), 1, "{:?}", edges.iter().map(|e| &e.name).collect::<Vec<_>>());
         assert!((cut[0].length() - 30.0).abs() < 1e-9 && cut[0].points.iter().all(|p| (p[0] - 30.0).abs() < 1e-9));
         // The top's rim edges along x are cut at x = 30: four pieces where there were two.
-        let rim = edges.iter().filter(|e| e.faces.iter().any(|&f| f == fa || f == fb) && !(e.faces.contains(&fa) && e.faces.contains(&fb))).count();
-        assert_eq!(rim, 2 + 2 + 2 + 2, "four sides, the two along x in two pieces, and the hole's two rim arcs");
+        let rim: Vec<&String> =
+            edges.iter().filter(|e| e.faces.iter().any(|&f| f == fa || f == fb) && !(e.faces.contains(&fa) && e.faces.contains(&fb))).map(|e| &e.name).collect();
+        assert_eq!(rim.len(), 2 + 2 + 2 + 1, "four sides, the two along x in two pieces, and the hole's rim: {rim:?}");
     }
 
     #[test]
@@ -404,6 +409,6 @@ mod tests {
             ])
             .unwrap();
         assert_eq!(d.errors.len(), 4, "{:?}", d.errors);
-        assert_eq!(d.bodies[0].faces().len(), 8);
+        assert_eq!(d.bodies[0].faces().len(), 7);
     }
 }

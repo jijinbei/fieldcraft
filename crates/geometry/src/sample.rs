@@ -2,8 +2,8 @@
 //! file is committed (docs/adr/0001-libraries.md, test geometry).
 
 use solidcraft_doc::sketch::{ConstraintKind, Sketch};
-use solidcraft_doc::{Direction, Document, Extent, ExtrudeConvention, FeatureKind, Operation, PlaneRef, ProfileSel};
-use solidcore_record::Vec2;
+use solidcraft_doc::{Direction, Document, Extent, ExtrudeConvention, FacePick, FeatureKind, Operation, PlaneRef, ProfileSel};
+use solidcore_record::{Vec2, Vec3};
 
 use crate::{Error, Result};
 
@@ -68,6 +68,16 @@ fn sketch_on_xy(doc: &mut Document, sketch: Sketch, name: &str) -> Result<u64> {
 
 /// The plate as `.solidcraft` file bytes.
 pub fn plate_design(p: &Plate) -> Result<Vec<u8>> {
+    plate(p, false)
+}
+
+/// The plate with its hole's wall split in two half-cylinder faces on one surface (the case
+/// virtual faces merge), as `.solidcraft` file bytes.
+pub fn plate_design_halved(p: &Plate) -> Result<Vec<u8>> {
+    plate(p, true)
+}
+
+fn plate(p: &Plate, halved: bool) -> Result<Vec<u8>> {
     let ok = |v: f64| v.is_finite() && v > 0.0 && v <= MAX_DIMENSION;
     if !(ok(p.width) && ok(p.depth) && ok(p.thickness) && ok(p.hole_diameter)) || p.width < p.depth || p.hole_diameter >= p.depth {
         return Err(Error::Invalid(format!("plate dimensions out of range: {p:?}")));
@@ -98,10 +108,24 @@ pub fn plate_design(p: &Plate) -> Result<Vec<u8>> {
 
     let mut sk = Sketch::new();
     let c = p.depth / 2.0;
-    sk.add_circle(Vec2::new(c, c), p.hole_diameter / 2.0, None, None).map_err(failed)?;
+    let r = p.hole_diameter / 2.0;
+    sk.add_circle(Vec2::new(c, c), r, None, None).map_err(failed)?;
     let hole = sketch_on_xy(&mut doc, sk, "Hole sketch")?;
     // Past the top face, so the cut never ends on it.
     doc.add_feature(extrude(hole, "thickness + 1 mm", Operation::Cut), Some("Hole")).map_err(failed)?;
+    if halved {
+        // The wall split by the plane through the hole's axis and its seam (y = depth / 2).
+        use solidcraft_geom::PlaneGeom as _;
+        let plane = solidcore_record::Plane::from_normal(Vec3::new(c, c, 0.0), Vec3::new(0.0, 1.0, 0.0)).ok_or_else(|| failed("the halving plane"))?;
+        let kind = FeatureKind::SplitFace {
+            faces: vec![FacePick(Vec3::new(c, c + r, p.thickness / 2.0))],
+            body: None,
+            plane: PlaneRef::Custom { plane },
+            tool: None,
+            sketch: None,
+        };
+        doc.add_feature(kind, Some("Halves")).map_err(failed)?;
+    }
 
     solidcraft_io::write_design_container(&doc).map_err(failed)
 }

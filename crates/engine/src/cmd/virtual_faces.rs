@@ -287,7 +287,7 @@ mod tests {
     /// it is saved with the model and applied again when the model and its design are opened.
     #[test]
     fn a_merge_is_one_face_undone_saved_and_replayed() {
-        let (mut s, dir) = super::super::datum::tests::plate();
+        let (mut s, dir) = super::super::datum::tests::halved_plate();
         let before = faces(&s);
         assert_eq!(before.len(), 8);
         let r = merge_hole(&mut s);
@@ -333,14 +333,15 @@ mod tests {
         s.model.nodes().values().filter(|n| on(crate::units::to_geometry_point(n.xyz))).count()
     }
 
-    /// The sample plate made square (30 × 30 × 10, the Ø10 hole in the middle): no layout of the
+    /// The sample plate made square (30 × 30 × 10, the Ø10 hole in the middle, its wall two
+    /// halves): no layout of the
     /// cross-section has a reason to cut along the seams.
     fn square_plate() -> (Session, std::path::PathBuf) {
         let dir = std::env::temp_dir().join(format!("fieldcraft-merge-{}-{:?}", std::process::id(), std::thread::current().id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("square.solidcraft");
         let plate = fieldcraft_geometry::sample::Plate { width: 30.0, ..Default::default() };
-        std::fs::write(&path, fieldcraft_geometry::sample::plate_design(&plate).unwrap()).unwrap();
+        std::fs::write(&path, fieldcraft_geometry::sample::plate_design_halved(&plate).unwrap()).unwrap();
         let mut s = Session::default();
         s.execute("geometry.open", &json!({"path": path.to_str().unwrap()})).unwrap();
         (s, dir)
@@ -405,7 +406,7 @@ mod tests {
     /// project onto `merge:Hole` (still a cylinder), not the halves.
     #[test]
     fn the_plan_sees_a_merged_face_as_one() {
-        let (mut s, dir) = super::super::datum::tests::plate();
+        let (mut s, dir) = super::super::datum::tests::halved_plate();
         let body = s.design.as_ref().unwrap().bodies[0].name.clone();
         let hole = halves(&s);
         let before = s.execute("mesh.plan", &json!({"body": body})).unwrap();
@@ -427,7 +428,7 @@ mod tests {
     /// The viewport draws a merged face in one colour: the hole's triangles, and only those.
     #[test]
     fn a_merged_face_is_drawn_in_one_colour() {
-        let (mut s, dir) = super::super::datum::tests::plate();
+        let (mut s, dir) = super::super::datum::tests::halved_plate();
         let p = crate::view::Palette::LIGHT;
         let merged = |s: &Session| crate::view::scene(s, &p).0.tris.into_iter().filter(|t| t.color == p.merged).collect::<Vec<_>>();
         assert!(merged(&s).is_empty());
@@ -446,7 +447,7 @@ mod tests {
     /// Sets naming a merged face go stale (and are named); bad merges change nothing.
     #[test]
     fn bad_merges_change_nothing() {
-        let (mut s, dir) = super::super::datum::tests::plate();
+        let (mut s, dir) = super::super::datum::tests::halved_plate();
         let body = s.design.as_ref().unwrap().bodies[0].name.clone();
         let names = faces(&s);
         let hole = halves(&s);
@@ -587,7 +588,7 @@ mod tests {
         let r = s.execute("geometry.face.split", &json!({"name": "Band", "face": face, "datum": "Cut"})).unwrap();
         assert_eq!(r["faces"], json!(["split:Band:a", "split:Band:b"]), "{r}");
         assert!(r["replaced"].is_array(), "{r}");
-        assert_eq!(faces(&s).len(), 9);
+        assert_eq!(faces(&s).len(), 8);
         s.execute("mesh.tet.generate", &mesh).unwrap();
         let after = nodes_along(&s, 30.3);
         assert!(after >= 10 && after > before, "a node row along the 30 mm cut: {before} -> {after}");
@@ -619,9 +620,9 @@ mod tests {
         }
         assert_eq!(s.journal.len(), journal);
         s.execute("geometry.face.split.delete", &json!({"name": "Band"})).unwrap();
-        assert_eq!(faces(&s).len(), 8);
+        assert_eq!(faces(&s).len(), 7);
         s.execute("edit.undo", &json!({})).unwrap();
-        assert_eq!(faces(&s).len(), 9);
+        assert_eq!(faces(&s).len(), 8);
         std::fs::remove_dir_all(dir).ok();
     }
 }

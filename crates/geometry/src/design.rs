@@ -101,18 +101,21 @@ impl Design {
 pub const DESIGN_FORMAT: u32 = solidcraft_exchange::DESIGN_FORMAT;
 
 /// Open a design from its file bytes (a `.solidcraft` container or a JSON design) and rebuild it.
-/// A design of a newer format than [`DESIGN_FORMAT`] is [`crate::Error::NewerDesign`].
+/// A design of a newer format than [`DESIGN_FORMAT`] is [`crate::Error::NewerDesign`]:
+/// SolidCraft opens one, keeping what it does not know, but a solver must not mesh a solid that
+/// may lack the newer features.
 pub fn open_design(bytes: &[u8]) -> Result<Design> {
-    let design = solidcraft_exchange::open(bytes).map_err(|e| match saved_format(bytes) {
-        Some(format) if format > DESIGN_FORMAT => crate::Error::NewerDesign { format, reads: DESIGN_FORMAT },
-        _ => crate::Error::Invalid(format!("not a readable design: {e}")),
-    })?;
+    if let Some(format) = saved_format(bytes)
+        && format > DESIGN_FORMAT
+    {
+        return Err(crate::Error::NewerDesign { format, reads: DESIGN_FORMAT });
+    }
+    let design = solidcraft_exchange::open(bytes).map_err(|e| crate::Error::Invalid(format!("not a readable design: {e}")))?;
     rebuild(&DesignSource::new(design), &Arc::new(Vec::new()))
 }
 
 /// The format a design file says it has (`"format": "solidcraft/N"`), in a JSON design or in a
-/// container's `document.json`; `None` when the file doesn't say. Read only when SolidCraft
-/// refused the file, to tell a newer design from a broken one.
+/// container's `document.json`; `None` when the file doesn't say.
 fn saved_format(bytes: &[u8]) -> Option<u32> {
     use std::io::Read;
     #[derive(serde::Deserialize)]
@@ -306,20 +309,20 @@ mod tests {
         let r = plate.hole_diameter / 2.0;
         let expect = (plate.width * plate.depth - std::f64::consts::PI * r * r) * plate.thickness;
         assert!((m.volume - expect).abs() < 1e-3 * expect, "{} vs {expect}", m.volume);
-        // Four sides, top, bottom and the hole (a cylinder is two half faces).
-        assert_eq!(m.faces, 8);
-        assert_eq!(body.faces().len(), 8);
+        // Four sides, top, bottom and the hole (one cylinder face, closed by a seam).
+        assert_eq!(m.faces, 7);
+        assert_eq!(body.faces().len(), 7);
         let mesh = body.tessellate(0.01).unwrap();
         let mut tags = mesh.tri_face.clone();
         tags.sort_unstable();
         tags.dedup();
-        assert_eq!(tags.len(), 8);
+        assert_eq!(tags.len(), 7);
         assert!(tags.iter().all(|&t| (t as usize) < body.faces().len()));
         // Every face has its own name.
         let mut names: Vec<&str> = body.faces().iter().map(|f| f.name.as_str()).collect();
         names.sort_unstable();
         names.dedup();
-        assert_eq!(names.len(), 8, "{names:?}");
+        assert_eq!(names.len(), 7, "{names:?}");
     }
 
     #[test]
@@ -331,8 +334,8 @@ mod tests {
         let (a, b) = (&a.bodies[0], &b.bodies[0]);
         let (area_a, area_b) = (face_areas(a), face_areas(b));
         let pi = std::f64::consts::PI;
-        // Each half of the hole.
-        let hole = |p: &Plate| pi * p.hole_diameter * p.thickness / 2.0;
+        // The hole's wall.
+        let hole = |p: &Plate| pi * p.hole_diameter * p.thickness;
         let cap = |p: &Plate| p.width * p.depth - pi * p.hole_diameter * p.hole_diameter / 4.0;
         for face in a.faces() {
             let i = a.face_index(&face.name).unwrap() as usize;

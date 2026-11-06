@@ -496,11 +496,13 @@ mod tests {
     use crate::sample::{self, Plate};
     use crate::{FaceSurface, open_design};
 
+    /// The plate with its hole's wall two half-cylinders: two faces on one surface, the case
+    /// merges are for.
     fn plate() -> Design {
-        open_design(&sample::plate_design(&Plate::default()).unwrap()).unwrap()
+        open_design(&sample::plate_design_halved(&Plate::default()).unwrap()).unwrap()
     }
 
-    /// The plate's hole is two half-cylinders.
+    /// The plate's cylindrical faces: the two halves of its hole.
     fn halves(d: &Design) -> Vec<String> {
         let body = &d.bodies[0];
         let s = body.face_surfaces().unwrap();

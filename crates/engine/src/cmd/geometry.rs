@@ -739,15 +739,15 @@ pub(crate) mod tests {
             .filter(|(_, s)| matches!(s, Some(FaceSurface::Cylinder { .. })))
             .map(|(f, _)| json!({"body": body.name, "face": f.name}))
             .collect();
-        assert_eq!(hole.len(), 2);
+        // The hole's wall, one cylinder face.
+        assert_eq!(hole.len(), 1);
         let r = s.execute("geometry.centre", &json!({"geometry": hole})).unwrap();
         near(&r, [15.0, 15.0, 5.0]);
         assert_eq!(r["from"], "circle");
-        let r = s.execute("geometry.centre", &json!({"geometry": [hole[0]]})).unwrap();
-        near(&r, [15.0, 15.0, 5.0]);
-        // A rim arc on top.
+        // The hole's rim on top: the edge between the top and the hole's wall.
+        let wall = hole[0]["face"].as_str().unwrap();
         let edges = body.edges().unwrap();
-        let arc = edges.iter().find(|e| e.points.iter().all(|p| (p[2] - 10.0).abs() < 1e-9) && e.points.len() > 3).unwrap();
+        let arc = edges.iter().find(|e| e.points.iter().all(|p| (p[2] - 10.0).abs() < 1e-9) && e.name.split('|').any(|f| f == wall)).unwrap();
         let r = s.execute("geometry.centre", &json!({"geometry": [{"body": body.name, "edge": arc.name}]})).unwrap();
         near(&r, [15.0, 15.0, 10.0]);
         assert_eq!(r["from"], "circle");

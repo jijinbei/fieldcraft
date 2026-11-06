@@ -612,11 +612,20 @@ pub(crate) mod tests {
 
     /// A session with the sample plate (40 × 30 × 10, Ø10 hole at (15, 15)) open.
     pub(crate) fn plate() -> (Session, std::path::PathBuf) {
+        plate_from(fieldcraft_geometry::sample::plate_design)
+    }
+
+    /// [`plate`] with its hole's wall two half-cylinders.
+    pub(crate) fn halved_plate() -> (Session, std::path::PathBuf) {
+        plate_from(fieldcraft_geometry::sample::plate_design_halved)
+    }
+
+    fn plate_from(design: fn(&fieldcraft_geometry::sample::Plate) -> fieldcraft_geometry::Result<Vec<u8>>) -> (Session, std::path::PathBuf) {
         let dir = std::env::temp_dir().join(format!("fieldcraft-partition-{}-{:?}", std::process::id(), std::thread::current().id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("plate.solidcraft");
         let plate = fieldcraft_geometry::sample::Plate::default();
-        std::fs::write(&path, fieldcraft_geometry::sample::plate_design(&plate).unwrap()).unwrap();
+        std::fs::write(&path, design(&plate).unwrap()).unwrap();
         let mut s = Session::default();
         s.execute("geometry.open", &json!({"path": path.to_str().unwrap()})).unwrap();
         (s, dir)
